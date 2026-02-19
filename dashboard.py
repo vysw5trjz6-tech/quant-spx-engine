@@ -5,11 +5,15 @@ import os
 import time
 from datetime import datetime, timedelta
 import pytz
+import numpy as np
 
-st.set_page_config(page_title="ORB Options Scanner PRO", layout="wide")
+st.set_page_config(page_title="ORB Options Scanner ELITE", layout="wide")
 
 REFRESH_SECONDS = 300
 TICKERS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "META"]
+
+ACCOUNT_SIZE = 30000
+RISK_PER_TRADE_PERCENT = 10  # 1% risk
 
 ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
@@ -23,11 +27,9 @@ HEADERS = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET
 }
 
-# Prevent duplicate alerts
 if "alerted" not in st.session_state:
     st.session_state.alerted = {}
 
-# Market hours check (9:30 - 4:00 EST)
 def market_is_open():
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
@@ -65,9 +67,16 @@ def get_intraday(symbol):
             return None
         df = pd.DataFrame(bars)
         df["t"] = pd.to_datetime(df["t"])
-        df.rename(columns={"t": "Time", "c": "Close", "v": "Volume"}, inplace=True)
+        df.rename(columns={"t": "Time", "c": "Close", "v": "Volume", "h": "High", "l": "Low"}, inplace=True)
         return df
     return None
+
+def calculate_atr(df, period=14):
+    df["TR"] = np.maximum(df["High"] - df["Low"],
+                 np.maximum(abs(df["High"] - df["Close"].shift()),
+                            abs(df["Low"] - df["Close"].shift())))
+    df["ATR"] = df["TR"].rolling(period).mean()
+    return df
 
 def calculate_vwap(df):
     df["CumVol"] = df["Volume"].cumsum()
@@ -85,17 +94,19 @@ def calculate_rsi(df, period=14):
     df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
-def calculate_probability(df):
+def analyze(df):
     df = calculate_vwap(df)
     df = calculate_rsi(df)
+    df = calculate_atr(df)
 
     opening_range = df.iloc[:15]
-    orb_high = opening_range["Close"].max()
-    orb_low = opening_range["Close"].min()
+    orb_high = opening_range["High"].max()
+    orb_low = opening_range["Low"].min()
 
     last_price = df["Close"].iloc[-1]
-    vwap = df["VWAP"].iloc[-1]
+    atr = df["ATR"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
+    vwap = df["VWAP"].iloc[-1]
 
     probability = 50
     bias = None
@@ -110,9 +121,26 @@ def calculate_probability(df):
     if last_price > vwap:
         probability += 10
     if rsi > 60:
-        probability += 15
+        probability += 10
 
-    return min(probability, 95), bias, orb_high, orb_low
+    probability = min(probability, 95)
+
+    return bias, probability, orb_high, orb_low, atr
+
+def generate_trade_plan(price, atr, bias):
+    risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PERCENT / 100)
+
+    if bias == "LONG":
+        stop = price - atr
+        target = price + (2 * atr)
+    else:
+        stop = price + atr
+        target = price - (2 * atr)
+
+    risk_per_share = abs(price - stop)
+    position_size = risk_amount / risk_per_share
+
+    return round(stop,2), round(target,2), int(position_size)
 
 def generate_option_ideas(price, bias):
     strike = round(price)
@@ -121,7 +149,7 @@ def generate_option_ideas(price, bias):
     else:
         return f"{strike}P", f"{strike-5}P (30-45 DTE)"
 
-st.title("🚨 ORB Options Scanner PRO")
+st.title("🚨 ORB Options Scanner ELITE")
 
 if not market_is_open():
     st.warning("Market Closed — Scanner Paused")
@@ -131,29 +159,35 @@ else:
         if df is None or len(df) < 30:
             continue
 
-        probability, bias, orb_high, orb_low = calculate_probability(df)
-        if bias is None:
+        bias, probability, orb_high, orb_low, atr = analyze(df)
+
+        if bias is None or probability < 70:
             continue
 
         last_price = df["Close"].iloc[-1]
+        stop, target, size = generate_trade_plan(last_price, atr, bias)
         zero_dte, thirty_dte = generate_option_ideas(last_price, bias)
 
         st.markdown("---")
         st.subheader(ticker)
         st.write(f"Price: ${round(last_price,2)}")
         st.write(f"Bias: {bias}")
-        st.write(f"ORB High: {round(orb_high,2)} | ORB Low: {round(orb_low,2)}")
         st.write(f"Probability: {probability}%")
+        st.write(f"Stop: {stop}")
+        st.write(f"Target: {target}")
+        st.write(f"Position Size (shares equiv): {size}")
         st.write(f"0DTE: {zero_dte}")
         st.write(f"30DTE: {thirty_dte}")
 
-        if probability >= 75 and ticker not in st.session_state.alerted:
+        if probability >= 80 and ticker not in st.session_state.alerted:
             message = f"""
-🚨 ORB BREAKOUT 🚨
+🚨 ORB ELITE SIGNAL 🚨
 
 Ticker: {ticker}
 Bias: {bias}
 Entry: {round(last_price,2)}
+Stop: {stop}
+Target: {target}
 Probability: {probability}%
 
 0DTE: {zero_dte}
