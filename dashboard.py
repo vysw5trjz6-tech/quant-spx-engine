@@ -14,6 +14,7 @@ REFRESH_SECONDS = 5
 
 ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
+
 BASE_URL = "https://data.alpaca.markets/v2"
 
 HEADERS = {
@@ -32,16 +33,20 @@ if time.time() - st.session_state.last_refresh > REFRESH_SECONDS:
     st.rerun()
 
 # =============================
-# GET LIVE PRICE
+# GET LIVE PRICE (FREE IEX FEED)
 # =============================
 def get_live_price(symbol):
     url = f"{BASE_URL}/stocks/{symbol}/quotes/latest"
-    response = requests.get(url, headers=HEADERS)
+    params = {"feed": "iex"}  # REQUIRED for free accounts
+
+    response = requests.get(url, headers=HEADERS, params=params)
 
     if response.status_code == 200:
         data = response.json()
         return data["quote"]["ap"]
     else:
+        st.write("Error:", response.status_code)
+        st.write(response.text)
         return None
 
 # =============================
@@ -52,21 +57,28 @@ def get_intraday_data(symbol):
     start = end - timedelta(hours=2)
 
     url = f"{BASE_URL}/stocks/{symbol}/bars"
+
     params = {
         "start": start.isoformat() + "Z",
         "end": end.isoformat() + "Z",
-        "timeframe": "1Min"
+        "timeframe": "1Min",
+        "feed": "iex"  # REQUIRED for free accounts
     }
 
     response = requests.get(url, headers=HEADERS, params=params)
 
     if response.status_code == 200:
-        bars = response.json()["bars"]
+        bars = response.json().get("bars", [])
+        if len(bars) == 0:
+            return None
+
         df = pd.DataFrame(bars)
         df["t"] = pd.to_datetime(df["t"])
         df.rename(columns={"t": "Time", "c": "Close"}, inplace=True)
         return df[["Time", "Close"]]
     else:
+        st.write("Error:", response.status_code)
+        st.write(response.text)
         return None
 
 # =============================
@@ -89,13 +101,16 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("Live Price")
 
-    price = get_live_price(symbol)
-
-    if price:
-        st.metric(symbol, f"${round(price,2)}")
-        st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        st.error("API keys not detected in Railway environment variables.")
     else:
-        st.error("Could not fetch live price.")
+        price = get_live_price(symbol)
+
+        if price:
+            st.metric(symbol, f"${round(price,2)}")
+            st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+        else:
+            st.error("Could not fetch live price.")
 
 with col2:
     st.subheader("Run ORB Backtest")
@@ -114,4 +129,7 @@ with col2:
 
                 st.line_chart(df.set_index("Time"))
             else:
-                st.error("Not enough data available.")
+                st.error("Not enough data available or API issue.")
+
+st.markdown("---")
+st.caption("Using Alpaca free IEX data feed.")
