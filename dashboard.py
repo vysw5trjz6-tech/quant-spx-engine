@@ -2,18 +2,23 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-from datetime import datetime, timedelta
 import time
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="ORB Strategy Dashboard", layout="wide")
+st.set_page_config(page_title="ORB Options Scanner", layout="wide")
 
 # =============================
 # CONFIG
 # =============================
-REFRESH_SECONDS = 5
+
+REFRESH_SECONDS = 300  # 5 minute auto scan
+TICKERS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "META"]
 
 ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data.alpaca.markets/v2"
 
@@ -25,6 +30,7 @@ HEADERS = {
 # =============================
 # AUTO REFRESH
 # =============================
+
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = time.time()
 
@@ -33,26 +39,25 @@ if time.time() - st.session_state.last_refresh > REFRESH_SECONDS:
     st.rerun()
 
 # =============================
-# GET LIVE PRICE (FREE IEX FEED)
+# TELEGRAM ALERT
 # =============================
-def get_live_price(symbol):
-    url = f"{BASE_URL}/stocks/{symbol}/quotes/latest"
-    params = {"feed": "iex"}  # REQUIRED for free accounts
 
-    response = requests.get(url, headers=HEADERS, params=params)
-
-    if response.status_code == 200:
-        data = response.json()
-        return data["quote"]["ap"]
-    else:
-        st.write("Error:", response.status_code)
-        st.write(response.text)
-        return None
+def send_telegram_alert(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    requests.post(url, data=payload)
 
 # =============================
 # GET INTRADAY DATA
 # =============================
-def get_intraday_data(symbol):
+
+def get_intraday(symbol):
     end = datetime.utcnow()
     start = end - timedelta(hours=2)
 
@@ -62,74 +67,106 @@ def get_intraday_data(symbol):
         "start": start.isoformat() + "Z",
         "end": end.isoformat() + "Z",
         "timeframe": "1Min",
-        "feed": "iex"  # REQUIRED for free accounts
+        "feed": "iex"
     }
 
-    response = requests.get(url, headers=HEADERS, params=params)
+    r = requests.get(url, headers=HEADERS, params=params)
 
-    if response.status_code == 200:
-        bars = response.json().get("bars", [])
-        if len(bars) == 0:
+    if r.status_code == 200:
+        bars = r.json().get("bars", [])
+        if not bars:
             return None
-
         df = pd.DataFrame(bars)
         df["t"] = pd.to_datetime(df["t"])
-        df.rename(columns={"t": "Time", "c": "Close"}, inplace=True)
-        return df[["Time", "Close"]]
-    else:
-        st.write("Error:", response.status_code)
-        st.write(response.text)
+        df.rename(columns={"t": "Time", "c": "Close", "v": "Volume"}, inplace=True)
+        return df
+    return None
+
+# =============================
+# PROBABILITY MODEL
+# =============================
+
+def calculate_probability(df):
+    if len(df) < 30:
         return None
 
-# =============================
-# ORB STRATEGY
-# =============================
-def run_orb(df):
-    opening_range = df["Close"].iloc[:15].max()
-    breakout = df["Close"].max()
-    return round(opening_range, 2), round(breakout, 2), round(breakout - opening_range, 2)
+    opening_high = df["Close"].iloc[:15].max()
+    session_high = df["Close"].max()
+    session_low = df["Close"].min()
+    last_price = df["Close"].iloc[-1]
+
+    range_expansion = session_high - opening_high
+    trend_strength = (last_price - session_low) / (session_high - session_low)
+
+    probability = 50
+
+    if range_expansion > 0:
+        probability += 15
+
+    if trend_strength > 0.7:
+        probability += 20
+
+    if df["Volume"].iloc[-1] > df["Volume"].mean():
+        probability += 10
+
+    return min(round(probability), 95)
 
 # =============================
-# UI
+# OPTION SUGGESTION
 # =============================
-st.title("📊 ORB Strategy Dashboard (Live via Alpaca)")
 
-symbol = st.text_input("Enter Stock Symbol", "AAPL").upper()
+def generate_option_ideas(symbol, price, bias):
+    strike = round(price)
 
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Live Price")
-
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        st.error("API keys not detected in Railway environment variables.")
+    if bias == "LONG":
+        zero_dte = f"{strike}C"
+        thirty_dte = f"{strike+5}C (30-45 DTE)"
     else:
-        price = get_live_price(symbol)
+        zero_dte = f"{strike}P"
+        thirty_dte = f"{strike-5}P (30-45 DTE)"
 
-        if price:
-            st.metric(symbol, f"${round(price,2)}")
-            st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
-        else:
-            st.error("Could not fetch live price.")
+    return zero_dte, thirty_dte
 
-with col2:
-    st.subheader("Run ORB Backtest")
+# =============================
+# SCANNER
+# =============================
 
-    if st.button("Run ORB Strategy"):
-        with st.spinner("Fetching data & running ORB..."):
-            df = get_intraday_data(symbol)
+st.title("🚨 ORB Multi-Ticker Options Scanner")
 
-            if df is not None and len(df) > 20:
-                opening, breakout, profit = run_orb(df)
+for ticker in TICKERS:
+    df = get_intraday(ticker)
 
-                st.success("ORB Calculated")
-                st.write(f"Opening Range High: ${opening}")
-                st.write(f"Session High: ${breakout}")
-                st.write(f"Breakout Distance: ${profit}")
+    if df is None:
+        continue
 
-                st.line_chart(df.set_index("Time"))
-            else:
-                st.error("Not enough data available or API issue.")
+    probability = calculate_probability(df)
 
-st.markdown("---")
-st.caption("Using Alpaca free IEX data feed.")
+    if probability is None:
+        continue
+
+    last_price = df["Close"].iloc[-1]
+    bias = "LONG" if df["Close"].iloc[-1] > df["Close"].iloc[0] else "SHORT"
+
+    zero_dte, thirty_dte = generate_option_ideas(ticker, last_price, bias)
+
+    st.markdown("---")
+    st.subheader(f"{ticker}")
+    st.write(f"Price: ${round(last_price,2)}")
+    st.write(f"Bias: {bias}")
+    st.write(f"Probability: {probability}%")
+    st.write(f"0DTE Idea: {zero_dte}")
+    st.write(f"30DTE Idea: {thirty_dte}")
+
+    if probability >= 75:
+        message = f"""
+🚨 TRADE IDEA 🚨
+
+Ticker: {ticker}
+Bias: {bias}
+Entry: {round(last_price,2)}
+Probability: {probability}%
+
+0DTE: {zero_dte}
+30DTE: {thirty_dte}
+"""
+        send_telegram_alert(message)
