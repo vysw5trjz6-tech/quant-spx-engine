@@ -1,123 +1,117 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+import requests
+import os
+from datetime import datetime, timedelta
+import time
 
-st.set_page_config(page_title="ORB Trading Dashboard", layout="wide")
+st.set_page_config(page_title="ORB Strategy Dashboard", layout="wide")
 
-st.title("📊 ORB Strategy Dashboard")
+# =============================
+# CONFIG
+# =============================
+REFRESH_SECONDS = 5
 
-# Sidebar controls
-st.sidebar.header("Strategy Settings")
+ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = "https://data.alpaca.markets/v2"
 
-ticker = st.sidebar.text_input("Ticker", "SPY")
-period = st.sidebar.selectbox("Backtest Period", ["3mo", "6mo", "1y"])
-risk_multiple = st.sidebar.slider("Reward (R Multiple)", 1.0, 4.0, 2.0, 0.5)
-vol_filter_threshold = st.sidebar.slider("Volatility Filter %", 0.005, 0.03, 0.01, 0.001)
-account_size = st.sidebar.number_input("Account Size", value=25000)
+HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET
+}
 
-def volatility_filter(day):
-    day_range = day["High"].max() - day["Low"].min()
-    atr_estimate = day_range / day["Close"].mean()
-    return atr_estimate > vol_filter_threshold
+# =============================
+# AUTO REFRESH
+# =============================
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = time.time()
 
-def backtest():
+if time.time() - st.session_state.last_refresh > REFRESH_SECONDS:
+    st.session_state.last_refresh = time.time()
+    st.rerun()
 
-    data = yf.download(ticker, period=period, interval="5m")
-    data = data.dropna()
+# =============================
+# GET LIVE PRICE
+# =============================
+def get_live_price(symbol):
+    url = f"{BASE_URL}/stocks/{symbol}/quotes/latest"
+    response = requests.get(url, headers=HEADERS)
 
-    if data.empty:
-        st.error("No data found.")
-        return None, None
+    if response.status_code == 200:
+        data = response.json()
+        return data["quote"]["ap"]
+    else:
+        return None
 
-    data["Date"] = data.index.date
-    results = []
+# =============================
+# GET INTRADAY DATA
+# =============================
+def get_intraday_data(symbol):
+    end = datetime.utcnow()
+    start = end - timedelta(hours=2)
 
-    grouped = data.groupby("Date")
-
-    for date, day in grouped:
-
-        if len(day) < 20:
-            continue
-
-        if not volatility_filter(day):
-            continue
-
-        orb = day.iloc[:3]
-        orb_high = orb["High"].max()
-        orb_low = orb["Low"].min()
-        range_size = orb_high - orb_low
-
-        position = None
-
-        for i in range(3, len(day)):
-            candle = day.iloc[i]
-
-            if position is None and candle["High"] > orb_high:
-                position = "LONG"
-                entry = orb_high
-                stop = orb_low
-                target = entry + (range_size * risk_multiple)
-
-            elif position is None and candle["Low"] < orb_low:
-                position = "SHORT"
-                entry = orb_low
-                stop = orb_high
-                target = entry - (range_size * risk_multiple)
-
-            if position == "LONG":
-                if candle["Low"] <= stop:
-                    results.append(-1)
-                    break
-                if candle["High"] >= target:
-                    results.append(risk_multiple)
-                    break
-
-            if position == "SHORT":
-                if candle["High"] >= stop:
-                    results.append(-1)
-                    break
-                if candle["Low"] <= target:
-                    results.append(risk_multiple)
-                    break
-
-    if len(results) == 0:
-        return None, None
-
-    results = np.array(results)
-    equity_curve = np.cumsum(results)
-
-    stats = {
-        "Trades": len(results),
-        "Win Rate (%)": round((results > 0).mean() * 100, 2),
-        "Average R": round(results.mean(), 2),
-        "Total R": round(results.sum(), 2),
-        "Max Drawdown (R)": round(np.min(equity_curve - np.maximum.accumulate(equity_curve)), 2)
+    url = f"{BASE_URL}/stocks/{symbol}/bars"
+    params = {
+        "start": start.isoformat() + "Z",
+        "end": end.isoformat() + "Z",
+        "timeframe": "1Min"
     }
 
-    return stats, equity_curve
+    response = requests.get(url, headers=HEADERS, params=params)
 
-if st.button("Run Backtest"):
-
-    stats, equity_curve = backtest()
-
-    if stats is None:
-        st.warning("No trades triggered.")
+    if response.status_code == 200:
+        bars = response.json()["bars"]
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"])
+        df.rename(columns={"t": "Time", "c": "Close"}, inplace=True)
+        return df[["Time", "Close"]]
     else:
-        col1, col2, col3, col4, col5 = st.columns(5)
+        return None
 
-        col1.metric("Trades", stats["Trades"])
-        col2.metric("Win Rate", f'{stats["Win Rate (%)"]}%')
-        col3.metric("Avg R", stats["Average R"])
-        col4.metric("Total R", stats["Total R"])
-        col5.metric("Max DD", stats["Max Drawdown (R)"])
+# =============================
+# ORB STRATEGY
+# =============================
+def run_orb(df):
+    opening_range = df["Close"].iloc[:15].max()
+    breakout = df["Close"].max()
+    return round(opening_range, 2), round(breakout, 2), round(breakout - opening_range, 2)
 
-        st.subheader("Equity Curve")
+# =============================
+# UI
+# =============================
+st.title("📊 ORB Strategy Dashboard (Live via Alpaca)")
 
-        fig, ax = plt.subplots()
-        ax.plot(equity_curve)
-        ax.set_title("Equity Curve (R)")
-        ax.set_xlabel("Trade Number")
-        ax.set_ylabel("Cumulative R")
-        st.pyplot(fig)
+symbol = st.text_input("Enter Stock Symbol", "AAPL").upper()
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Live Price")
+
+    price = get_live_price(symbol)
+
+    if price:
+        st.metric(symbol, f"${round(price,2)}")
+        st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+    else:
+        st.error("Could not fetch live price.")
+
+with col2:
+    st.subheader("Run ORB Backtest")
+
+    if st.button("Run ORB Strategy"):
+        with st.spinner("Fetching data & running ORB..."):
+            df = get_intraday_data(symbol)
+
+            if df is not None and len(df) > 20:
+                opening, breakout, profit = run_orb(df)
+
+                st.success("ORB Calculated")
+                st.write(f"Opening Range High: ${opening}")
+                st.write(f"Session High: ${breakout}")
+                st.write(f"Breakout Distance: ${profit}")
+
+                st.line_chart(df.set_index("Time"))
+            else:
+                st.error("Not enough data available.")
