@@ -78,3 +78,5 @@ def volatility_filter(day):
     day_range = day["High"].max() - day["Low"].min()
     atr_estimate = day_range / day["Close"].mean()
     return atr_estimate > 0.01  # Only trade >1% range days
+if not volatility_filter(day):
+    continue
