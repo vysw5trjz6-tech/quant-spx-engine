@@ -2,7 +2,7 @@ from flask import Flask
 import yfinance as yf
 import requests
 import os
-import math
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -59,23 +59,48 @@ def calculate_contracts(premium, score):
 
 
 # =========================
-# INSTRUMENT SWITCH
+# GET REAL ATM OPTION
 # =========================
-def choose_instrument(spx_price):
-    # Rough synthetic ATM premium estimate
-    estimated_spx_premium = spx_price * 0.002
+def get_atm_option(ticker_symbol, direction):
+    ticker = yf.Ticker(ticker_symbol)
 
-    if estimated_spx_premium <= 12:
-        return "SPX", estimated_spx_premium
+    expirations = ticker.options
+    if not expirations:
+        return None, None
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Try today expiration first (0DTE)
+    expiration = None
+    for exp in expirations:
+        if exp >= today:
+            expiration = exp
+            break
+
+    if not expiration:
+        return None, None
+
+    chain = ticker.option_chain(expiration)
+
+    underlying_price = ticker.history(period="1d")["Close"].iloc[-1]
+
+    if direction == "CALL":
+        options = chain.calls
     else:
-        # SPY premium estimated lower
-        spy_price = spx_price / 10
-        estimated_spy_premium = spy_price * 0.002
-        return "SPY", estimated_spy_premium
+        options = chain.puts
+
+    # Find closest strike to underlying price
+    options["distance"] = abs(options["strike"] - underlying_price)
+    atm_option = options.sort_values("distance").iloc[0]
+
+    premium = atm_option["lastPrice"]
+    strike = atm_option["strike"]
+
+    return premium, strike
 
 
 # =========================
-# SCORE ENGINE (Simple Expansion Model)
+# SCORE ENGINE
 # =========================
 def calculate_score(price, orb_high, orb_low, day_range):
     score = 50
@@ -115,16 +140,24 @@ def get_signal():
 
         if price > orb_high:
             direction = "CALL"
-
         elif price < orb_low:
             direction = "PUT"
-
         else:
             return "NO TRADE"
 
         score = calculate_score(price, orb_high, orb_low, day_range)
 
-        instrument, premium = choose_instrument(price)
+        # Try SPX first
+        premium, strike = get_atm_option("^SPX", direction)
+        instrument = "SPX"
+
+        # Fallback to SPY if SPX fails
+        if not premium or premium == 0:
+            premium, strike = get_atm_option("SPY", direction)
+            instrument = "SPY"
+
+        if not premium or premium == 0:
+            return "OPTION DATA UNAVAILABLE"
 
         contracts, stop_price, take_profit = calculate_contracts(premium, score)
 
@@ -137,7 +170,8 @@ def get_signal():
 {instrument} 0DTE {direction}
 
 Underlying Price: {round(price,2)}
-Estimated Premium: ${round(premium,2)}
+Strike: {strike}
+Premium: ${round(premium,2)}
 
 Score: {score}
 Probability: {probability}%
