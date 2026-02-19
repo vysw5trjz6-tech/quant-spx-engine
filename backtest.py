@@ -74,3 +74,7 @@ def backtest_orb():
 
 if __name__ == "__main__":
     backtest_orb()
+def volatility_filter(day):
+    day_range = day["High"].max() - day["Low"].min()
+    atr_estimate = day_range / day["Close"].mean()
+    return atr_estimate > 0.01  # Only trade >1% range days
