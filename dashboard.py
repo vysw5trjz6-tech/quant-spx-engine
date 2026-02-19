@@ -2,18 +2,16 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-import time
 from datetime import datetime, timedelta
 import pytz
 import numpy as np
+from database import init_db, log_trade
 
-st.set_page_config(page_title="ORB Options Scanner ELITE", layout="wide")
+st.set_page_config(page_title="Quant Engine Scanner", layout="wide")
 
-REFRESH_SECONDS = 300
+init_db()
+
 TICKERS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "META"]
-
-ACCOUNT_SIZE = 30000
-RISK_PER_TRADE_PERCENT = 10  # 1% risk
 
 ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
@@ -41,157 +39,129 @@ def market_is_open():
         return False
     return True
 
-def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+def send_telegram(message):
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message}
+        )
 
-def get_intraday(symbol):
+def get_data(symbol):
     end = datetime.utcnow()
     start = end - timedelta(hours=6)
 
-    url = f"{BASE_URL}/stocks/{symbol}/bars"
-    params = {
-        "start": start.isoformat() + "Z",
-        "end": end.isoformat() + "Z",
-        "timeframe": "1Min",
-        "feed": "iex"
-    }
+    r = requests.get(
+        f"{BASE_URL}/stocks/{symbol}/bars",
+        headers=HEADERS,
+        params={
+            "start": start.isoformat()+"Z",
+            "end": end.isoformat()+"Z",
+            "timeframe": "1Min",
+            "feed": "iex"
+        }
+    )
 
-    r = requests.get(url, headers=HEADERS, params=params)
+    if r.status_code != 200:
+        return None
 
-    if r.status_code == 200:
-        bars = r.json().get("bars", [])
-        if not bars:
-            return None
-        df = pd.DataFrame(bars)
-        df["t"] = pd.to_datetime(df["t"])
-        df.rename(columns={"t": "Time", "c": "Close", "v": "Volume", "h": "High", "l": "Low"}, inplace=True)
-        return df
-    return None
+    bars = r.json().get("bars", [])
+    if not bars:
+        return None
 
-def calculate_atr(df, period=14):
-    df["TR"] = np.maximum(df["High"] - df["Low"],
-                 np.maximum(abs(df["High"] - df["Close"].shift()),
-                            abs(df["Low"] - df["Close"].shift())))
-    df["ATR"] = df["TR"].rolling(period).mean()
+    df = pd.DataFrame(bars)
+    df.rename(columns={"c":"Close","h":"High","l":"Low","v":"Volume"}, inplace=True)
     return df
 
-def calculate_vwap(df):
-    df["CumVol"] = df["Volume"].cumsum()
-    df["CumVolPrice"] = (df["Close"] * df["Volume"]).cumsum()
-    df["VWAP"] = df["CumVolPrice"] / df["CumVol"]
-    return df
-
-def calculate_rsi(df, period=14):
+def add_indicators(df):
+    df["VWAP"] = (df["Close"]*df["Volume"]).cumsum() / df["Volume"].cumsum()
     delta = df["Close"].diff()
     gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(14).mean()/loss.rolling(14).mean()
+    df["RSI"] = 100 - (100/(1+rs))
+
+    tr = np.maximum(df["High"]-df["Low"],
+        np.maximum(abs(df["High"]-df["Close"].shift()),
+                   abs(df["Low"]-df["Close"].shift())))
+    df["ATR"] = tr.rolling(14).mean()
     return df
 
-def analyze(df):
-    df = calculate_vwap(df)
-    df = calculate_rsi(df)
-    df = calculate_atr(df)
+def get_vix_regime():
+    df = get_data("VIXY")
+    if df is None:
+        return "UNKNOWN"
+    vix = df.iloc[-1]["Close"]
+    if vix < 18:
+        return "LOW"
+    elif vix < 25:
+        return "NORMAL"
+    return "HIGH"
 
-    opening_range = df.iloc[:15]
-    orb_high = opening_range["High"].max()
-    orb_low = opening_range["Low"].min()
-
-    last_price = df["Close"].iloc[-1]
-    atr = df["ATR"].iloc[-1]
-    rsi = df["RSI"].iloc[-1]
-    vwap = df["VWAP"].iloc[-1]
-
-    probability = 50
-    bias = None
-
-    if last_price > orb_high:
-        probability += 20
-        bias = "LONG"
-    elif last_price < orb_low:
-        probability += 20
-        bias = "SHORT"
-
-    if last_price > vwap:
-        probability += 10
-    if rsi > 60:
-        probability += 10
-
-    probability = min(probability, 95)
-
-    return bias, probability, orb_high, orb_low, atr
-
-def generate_trade_plan(price, atr, bias):
-    risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PERCENT / 100)
-
-    if bias == "LONG":
-        stop = price - atr
-        target = price + (2 * atr)
-    else:
-        stop = price + atr
-        target = price - (2 * atr)
-
-    risk_per_share = abs(price - stop)
-    position_size = risk_amount / risk_per_share
-
-    return round(stop,2), round(target,2), int(position_size)
-
-def generate_option_ideas(price, bias):
-    strike = round(price)
-    if bias == "LONG":
-        return f"{strike}C", f"{strike+5}C (30-45 DTE)"
-    else:
-        return f"{strike}P", f"{strike-5}P (30-45 DTE)"
-
-st.title("🚨 ORB Options Scanner ELITE")
+st.title("🚀 Quant Trading Engine")
 
 if not market_is_open():
     st.warning("Market Closed — Scanner Paused")
 else:
+    vol_regime = get_vix_regime()
+    st.info(f"Volatility Regime: {vol_regime}")
+
     for ticker in TICKERS:
-        df = get_intraday(ticker)
-        if df is None or len(df) < 30:
+        if ticker == "SPY":
             continue
 
-        bias, probability, orb_high, orb_low, atr = analyze(df)
-
-        if bias is None or probability < 70:
+        df = get_data(ticker)
+        if df is None or len(df)<30:
             continue
 
-        last_price = df["Close"].iloc[-1]
-        stop, target, size = generate_trade_plan(last_price, atr, bias)
-        zero_dte, thirty_dte = generate_option_ideas(last_price, bias)
+        df = add_indicators(df)
+
+        opening = df.iloc[:15]
+        orb_high = opening["High"].max()
+        orb_low = opening["Low"].min()
+
+        last = df.iloc[-1]
+        price = last["Close"]
+        rsi = last["RSI"]
+        atr = last["ATR"]
+
+        bias=None
+        mode=None
+
+        if price>orb_high:
+            bias="LONG"
+            mode="ORB"
+        elif price<orb_low:
+            bias="SHORT"
+            mode="ORB"
+
+        if vol_regime=="HIGH" and rsi>65:
+            mode="SCALP"
+
+        if bias is None:
+            continue
+
+        stop = price-atr if bias=="LONG" else price+atr
+        target = price+(2*atr) if mode=="ORB" else price+atr
+
+        probability=80 if mode=="SCALP" else 75
 
         st.markdown("---")
-        st.subheader(ticker)
-        st.write(f"Price: ${round(last_price,2)}")
-        st.write(f"Bias: {bias}")
+        st.subheader(f"{ticker} — {mode}")
+        st.write(f"Entry: {round(price,2)}")
+        st.write(f"Stop: {round(stop,2)}")
+        st.write(f"Target: {round(target,2)}")
         st.write(f"Probability: {probability}%")
-        st.write(f"Stop: {stop}")
-        st.write(f"Target: {target}")
-        st.write(f"Position Size (shares equiv): {size}")
-        st.write(f"0DTE: {zero_dte}")
-        st.write(f"30DTE: {thirty_dte}")
 
-        if probability >= 80 and ticker not in st.session_state.alerted:
-            message = f"""
-🚨 ORB ELITE SIGNAL 🚨
-
+        key=f"{ticker}_{mode}"
+        if key not in st.session_state.alerted:
+            message=f"""
+🚨 {mode} SIGNAL 🚨
 Ticker: {ticker}
-Bias: {bias}
-Entry: {round(last_price,2)}
-Stop: {stop}
-Target: {target}
-Probability: {probability}%
-
-0DTE: {zero_dte}
-30DTE: {thirty_dte}
+Entry: {round(price,2)}
+Stop: {round(stop,2)}
+Target: {round(target,2)}
+Vol Regime: {vol_regime}
 """
-            send_telegram_alert(message)
-            st.session_state.alerted[ticker] = True
+            send_telegram(message)
+            log_trade(ticker,mode,bias,price,stop,target,probability,vol_regime)
+            st.session_state.alerted[key]=True
