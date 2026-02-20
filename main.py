@@ -1,8 +1,6 @@
 from flask import Flask, render_template_string
 import requests
 import os
-from datetime import datetime
-import pytz
 import statistics
 
 app = Flask(__name__)
@@ -21,7 +19,7 @@ HEADERS = {
 }
 
 DATA_URL = "https://data.alpaca.markets/v2/stocks/{}/bars"
-CLOCK_URL = "https://api.alpaca.markets/v2/clock"
+CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
 OPTIONS_URL = "https://data.alpaca.markets/v1beta1/options/contracts"
 
 
@@ -41,35 +39,22 @@ def send_telegram_alert(message):
 
 
 # =========================
-# MARKET CLOCK + TIME FILTER (FIXED)
+# MARKET OPEN CHECK (SIMPLIFIED)
 # =========================
-def market_open_and_time_valid():
+def market_open():
     try:
         r = requests.get(CLOCK_URL, headers=HEADERS)
         if r.status_code != 200:
+            print("Clock error:", r.text)
             return False
 
         clock = r.json()
+        print("Clock:", clock)
 
-        if not clock.get("is_open"):
-            return False
+        return clock.get("is_open", False)
 
-        # Use Alpaca timestamp (NOT server time)
-        timestamp = clock.get("timestamp")
-        now_utc = datetime.fromisoformat(timestamp.replace("Z","+00:00"))
-
-        eastern = pytz.timezone("US/Eastern")
-        now = now_utc.astimezone(eastern)
-
-        morning_start = now.replace(hour=9, minute=35, second=0)
-        morning_end = now.replace(hour=11, minute=30, second=0)
-        afternoon_start = now.replace(hour=13, minute=0, second=0)
-        afternoon_end = now.replace(hour=15, minute=30, second=0)
-
-        return (morning_start <= now <= morning_end) or \
-               (afternoon_start <= now <= afternoon_end)
-
-    except:
+    except Exception as e:
+        print("Clock exception:", e)
         return False
 
 
@@ -126,7 +111,7 @@ def calculate_vwap(bars):
 
 
 # =========================
-# VOLATILITY REGIME (ATR EXPANSION)
+# VOLATILITY REGIME
 # =========================
 def volatility_regime(daily_bars):
     if len(daily_bars) < 5:
@@ -250,8 +235,8 @@ def scan_market():
 def generate_signal():
     global last_alert
 
-    if not market_open_and_time_valid():
-        return {"status": "Outside Trade Window"}
+    if not market_open():
+        return {"status": "Market Closed"}
 
     trade = scan_market()
 
