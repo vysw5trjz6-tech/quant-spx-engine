@@ -34,69 +34,89 @@ def send_telegram_alert(message):
 
     if token and chat_id:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": message})
+        try:
+            requests.post(url, json={"chat_id": chat_id, "text": message})
+        except:
+            pass
 
 
 # =========================
-# MARKET CLOCK + TIME FILTER
+# MARKET CLOCK + TIME FILTER (FIXED)
 # =========================
 def market_open_and_time_valid():
-    r = requests.get(CLOCK_URL, headers=HEADERS)
-    if r.status_code != 200:
+    try:
+        r = requests.get(CLOCK_URL, headers=HEADERS)
+        if r.status_code != 200:
+            return False
+
+        clock = r.json()
+
+        if not clock.get("is_open"):
+            return False
+
+        # Use Alpaca timestamp (NOT server time)
+        timestamp = clock.get("timestamp")
+        now_utc = datetime.fromisoformat(timestamp.replace("Z","+00:00"))
+
+        eastern = pytz.timezone("US/Eastern")
+        now = now_utc.astimezone(eastern)
+
+        morning_start = now.replace(hour=9, minute=35, second=0)
+        morning_end = now.replace(hour=11, minute=30, second=0)
+        afternoon_start = now.replace(hour=13, minute=0, second=0)
+        afternoon_end = now.replace(hour=15, minute=30, second=0)
+
+        return (morning_start <= now <= morning_end) or \
+               (afternoon_start <= now <= afternoon_end)
+
+    except:
         return False
-
-    if not r.json().get("is_open"):
-        return False
-
-    eastern = pytz.timezone("US/Eastern")
-    now = datetime.now(eastern)
-
-    morning_start = now.replace(hour=9, minute=35)
-    morning_end = now.replace(hour=11, minute=30)
-    afternoon_start = now.replace(hour=13, minute=0)
-    afternoon_end = now.replace(hour=15, minute=30)
-
-    return (morning_start <= now <= morning_end) or (afternoon_start <= now <= afternoon_end)
 
 
 # =========================
 # GET INTRADAY BARS
 # =========================
 def get_intraday(symbol):
-    r = requests.get(
-        DATA_URL.format(symbol),
-        headers=HEADERS,
-        params={"timeframe": "5Min", "limit": 50}
-    )
-    if r.status_code != 200:
+    try:
+        r = requests.get(
+            DATA_URL.format(symbol),
+            headers=HEADERS,
+            params={"timeframe": "5Min", "limit": 50}
+        )
+        if r.status_code != 200:
+            return None
+        return r.json().get("bars", [])
+    except:
         return None
-    return r.json().get("bars", [])
 
 
 # =========================
-# GET DAILY BARS FOR ATR
+# GET DAILY BARS
 # =========================
 def get_daily(symbol):
-    r = requests.get(
-        DATA_URL.format(symbol),
-        headers=HEADERS,
-        params={"timeframe": "1Day", "limit": 20}
-    )
-    if r.status_code != 200:
+    try:
+        r = requests.get(
+            DATA_URL.format(symbol),
+            headers=HEADERS,
+            params={"timeframe": "1Day", "limit": 20}
+        )
+        if r.status_code != 200:
+            return None
+        return r.json().get("bars", [])
+    except:
         return None
-    return r.json().get("bars", [])
 
 
 # =========================
-# VWAP CALC
+# VWAP
 # =========================
 def calculate_vwap(bars):
     cumulative_pv = 0
     cumulative_volume = 0
 
     for b in bars:
-        typical_price = (b["h"] + b["l"] + b["c"]) / 3
-        cumulative_pv += typical_price * b["v"]
+        typical = (b["h"] + b["l"] + b["c"]) / 3
+        cumulative_pv += typical * b["v"]
         cumulative_volume += b["v"]
 
     if cumulative_volume == 0:
@@ -106,12 +126,16 @@ def calculate_vwap(bars):
 
 
 # =========================
-# VOLATILITY REGIME
+# VOLATILITY REGIME (ATR EXPANSION)
 # =========================
 def volatility_regime(daily_bars):
+    if len(daily_bars) < 5:
+        return False
+
     ranges = [b["h"] - b["l"] for b in daily_bars]
     today_range = ranges[-1]
     avg_range = statistics.mean(ranges[:-1])
+
     return today_range > avg_range
 
 
@@ -125,6 +149,7 @@ def get_liquid_option(symbol, direction):
             headers=HEADERS,
             params={"underlying_symbols": symbol}
         )
+
         if r.status_code != 200:
             return None, None
 
@@ -132,12 +157,17 @@ def get_liquid_option(symbol, direction):
         if not contracts:
             return None, None
 
-        calls_or_puts = [c for c in contracts if c["type"] == direction.lower()]
-        if not calls_or_puts:
+        filtered = [
+            c for c in contracts
+            if c["type"] == direction.lower()
+            and c.get("open_interest", 0) > 100
+            and float(c.get("close_price", 0)) > 0.10
+        ]
+
+        if not filtered:
             return None, None
 
-        liquid = sorted(calls_or_puts, key=lambda x: x["open_interest"], reverse=True)
-        best = liquid[0]
+        best = sorted(filtered, key=lambda x: x["open_interest"], reverse=True)[0]
 
         return float(best["close_price"]), best["strike_price"]
 
@@ -151,14 +181,17 @@ def get_liquid_option(symbol, direction):
 def calculate_contracts(premium):
     risk = ACCOUNT_SIZE * 0.03
     max_loss = premium * 100 * 0.45
-    if max_loss == 0:
+
+    if max_loss <= 0:
         return 0,0,0
+
     contracts = int(risk // max_loss)
+
     return contracts, round(premium*0.55,2), round(premium*1.4,2)
 
 
 # =========================
-# SCANNER ENGINE
+# SCANNER
 # =========================
 def scan_market():
     best_trade = None
@@ -192,13 +225,16 @@ def scan_market():
         if price > orb_high and price > vwap:
             direction = "CALL"
             breakout_strength = (price - orb_high) / orb_high
+
         elif price < orb_low and price < vwap:
             direction = "PUT"
             breakout_strength = (orb_low - price) / orb_low
+
         else:
             continue
 
-        volume_ratio = current["v"] / intraday[-2]["v"]
+        volume_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+
         score = breakout_strength * 100 + volume_ratio
 
         if score > best_score:
