@@ -1,25 +1,28 @@
 from flask import Flask, render_template_string
 import requests
-import yfinance as yf
 import os
 from datetime import datetime
 import pytz
+import statistics
 
 app = Flask(__name__)
 
 ACCOUNT_SIZE = 30000
 last_alert = None
 
+SYMBOLS = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","META","MSFT","AMZN"]
+
 ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
-ALPACA_DATA_URL = "https://data.alpaca.markets/v2"
-ALPACA_CLOCK_URL = "https://api.alpaca.markets/v2/clock"
 
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET
 }
+
+DATA_URL = "https://data.alpaca.markets/v2/stocks/{}/bars"
+CLOCK_URL = "https://api.alpaca.markets/v2/clock"
+OPTIONS_URL = "https://data.alpaca.markets/v1beta1/options/contracts"
 
 
 # =========================
@@ -29,83 +32,114 @@ def send_telegram_alert(message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-    if not token or not chat_id:
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    try:
-        requests.post(url, json={
-            "chat_id": chat_id,
-            "text": message
-        })
-    except:
-        pass
+    if token and chat_id:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": message})
 
 
 # =========================
-# ALPACA MARKET CLOCK
+# MARKET CLOCK + TIME FILTER
 # =========================
-def market_is_open():
-    try:
-        r = requests.get(ALPACA_CLOCK_URL, headers=HEADERS)
-        if r.status_code != 200:
-            return False
-        return r.json().get("is_open", False)
-    except:
+def market_open_and_time_valid():
+    r = requests.get(CLOCK_URL, headers=HEADERS)
+    if r.status_code != 200:
         return False
 
+    if not r.json().get("is_open"):
+        return False
+
+    eastern = pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+
+    morning_start = now.replace(hour=9, minute=35)
+    morning_end = now.replace(hour=11, minute=30)
+    afternoon_start = now.replace(hour=13, minute=0)
+    afternoon_end = now.replace(hour=15, minute=30)
+
+    return (morning_start <= now <= morning_end) or (afternoon_start <= now <= afternoon_end)
+
 
 # =========================
-# GET SPY 5M DATA FROM ALPACA
+# GET INTRADAY BARS
 # =========================
-def get_spy_data():
-    try:
-        r = requests.get(
-            f"{ALPACA_DATA_URL}/stocks/SPY/bars",
-            headers=HEADERS,
-            params={
-                "timeframe": "5Min",
-                "limit": 50
-            }
-        )
+def get_intraday(symbol):
+    r = requests.get(
+        DATA_URL.format(symbol),
+        headers=HEADERS,
+        params={"timeframe": "5Min", "limit": 50}
+    )
+    if r.status_code != 200:
+        return None
+    return r.json().get("bars", [])
 
-        if r.status_code != 200:
-            print("Alpaca error:", r.text)
-            return None
 
-        bars = r.json().get("bars", [])
-        if not bars:
-            return None
+# =========================
+# GET DAILY BARS FOR ATR
+# =========================
+def get_daily(symbol):
+    r = requests.get(
+        DATA_URL.format(symbol),
+        headers=HEADERS,
+        params={"timeframe": "1Day", "limit": 20}
+    )
+    if r.status_code != 200:
+        return None
+    return r.json().get("bars", [])
 
-        return bars
 
-    except Exception as e:
-        print("Data fetch error:", e)
+# =========================
+# VWAP CALC
+# =========================
+def calculate_vwap(bars):
+    cumulative_pv = 0
+    cumulative_volume = 0
+
+    for b in bars:
+        typical_price = (b["h"] + b["l"] + b["c"]) / 3
+        cumulative_pv += typical_price * b["v"]
+        cumulative_volume += b["v"]
+
+    if cumulative_volume == 0:
         return None
 
+    return cumulative_pv / cumulative_volume
+
 
 # =========================
-# OPTION FETCH (Yahoo for SPX)
+# VOLATILITY REGIME
 # =========================
-def get_atm_option(symbol, direction):
+def volatility_regime(daily_bars):
+    ranges = [b["h"] - b["l"] for b in daily_bars]
+    today_range = ranges[-1]
+    avg_range = statistics.mean(ranges[:-1])
+    return today_range > avg_range
+
+
+# =========================
+# OPTIONS (ALPACA ONLY)
+# =========================
+def get_liquid_option(symbol, direction):
     try:
-        ticker = yf.Ticker(symbol)
-        expirations = ticker.options
-
-        if not expirations:
+        r = requests.get(
+            OPTIONS_URL,
+            headers=HEADERS,
+            params={"underlying_symbols": symbol}
+        )
+        if r.status_code != 200:
             return None, None
 
-        expiration = expirations[0]
-        chain = ticker.option_chain(expiration)
+        contracts = r.json().get("option_contracts", [])
+        if not contracts:
+            return None, None
 
-        underlying_price = ticker.history(period="1d")["Close"].iloc[-1]
-        options = chain.calls if direction == "CALL" else chain.puts
+        calls_or_puts = [c for c in contracts if c["type"] == direction.lower()]
+        if not calls_or_puts:
+            return None, None
 
-        options["distance"] = abs(options["strike"] - underlying_price)
-        atm_option = options.sort_values("distance").iloc[0]
+        liquid = sorted(calls_or_puts, key=lambda x: x["open_interest"], reverse=True)
+        best = liquid[0]
 
-        return atm_option["lastPrice"], atm_option["strike"]
+        return float(best["close_price"]), best["strike_price"]
 
     except:
         return None, None
@@ -115,95 +149,122 @@ def get_atm_option(symbol, direction):
 # RISK ENGINE
 # =========================
 def calculate_contracts(premium):
-    dollar_risk_allowed = ACCOUNT_SIZE * 0.03
-    max_loss_per_contract = premium * 100 * 0.45
-
-    if max_loss_per_contract == 0:
-        return 0, 0, 0
-
-    contracts = int(dollar_risk_allowed // max_loss_per_contract)
-    stop_price = round(premium * 0.55, 2)
-    take_profit_price = round(premium * 1.40, 2)
-
-    return contracts, stop_price, take_profit_price
+    risk = ACCOUNT_SIZE * 0.03
+    max_loss = premium * 100 * 0.45
+    if max_loss == 0:
+        return 0,0,0
+    contracts = int(risk // max_loss)
+    return contracts, round(premium*0.55,2), round(premium*1.4,2)
 
 
 # =========================
-# SIGNAL ENGINE
+# SCANNER ENGINE
+# =========================
+def scan_market():
+    best_trade = None
+    best_score = 0
+
+    for symbol in SYMBOLS:
+
+        intraday = get_intraday(symbol)
+        daily = get_daily(symbol)
+
+        if not intraday or len(intraday) < 5 or not daily:
+            continue
+
+        if not volatility_regime(daily):
+            continue
+
+        orb = intraday[:3]
+        orb_high = max(b["h"] for b in orb)
+        orb_low = min(b["l"] for b in orb)
+
+        current = intraday[-1]
+        price = current["c"]
+
+        vwap = calculate_vwap(intraday)
+        if not vwap:
+            continue
+
+        direction = None
+        breakout_strength = 0
+
+        if price > orb_high and price > vwap:
+            direction = "CALL"
+            breakout_strength = (price - orb_high) / orb_high
+        elif price < orb_low and price < vwap:
+            direction = "PUT"
+            breakout_strength = (orb_low - price) / orb_low
+        else:
+            continue
+
+        volume_ratio = current["v"] / intraday[-2]["v"]
+        score = breakout_strength * 100 + volume_ratio
+
+        if score > best_score:
+            best_score = score
+            best_trade = (symbol, direction, price, score)
+
+    return best_trade
+
+
+# =========================
+# MAIN SIGNAL
 # =========================
 def generate_signal():
     global last_alert
 
-    if not market_is_open():
-        return {"status": "Market Closed"}
+    if not market_open_and_time_valid():
+        return {"status": "Outside Trade Window"}
 
-    bars = get_spy_data()
+    trade = scan_market()
 
-    if not bars or len(bars) < 4:
-        return {"status": "Waiting for data"}
+    if not trade:
+        return {"status": "No Institutional Breakouts"}
 
-    orb = bars[:3]
+    symbol, direction, price, score = trade
 
-    orb_high = max(bar["h"] for bar in orb)
-    orb_low = min(bar["l"] for bar in orb)
-
-    current = bars[-1]
-    price = current["c"]
-
-    direction = None
-
-    if price > orb_high:
-        direction = "CALL"
-    elif price < orb_low:
-        direction = "PUT"
-    else:
-        return {"status": "No Breakout"}
-
-    premium, strike = get_atm_option("^SPX", direction)
-    instrument = "SPX"
+    premium, strike = get_liquid_option(symbol, direction)
 
     if not premium:
-        premium, strike = get_atm_option("SPY", direction)
-        instrument = "SPY"
+        return {"status": "No Option Liquidity"}
 
-    if not premium:
-        return {"status": "No Option Data"}
-
-    contracts, stop_price, take_profit = calculate_contracts(premium)
+    contracts, stop, target = calculate_contracts(premium)
 
     if contracts == 0:
-        return {"status": "Risk Model Blocked Trade"}
+        return {"status": "Risk Model Blocked"}
 
-    alert_id = f"{instrument}_{direction}"
+    alert_id = f"{symbol}_{direction}"
 
     if last_alert != alert_id:
         message = f"""
-🚀 0DTE BREAKOUT
+🚀 INSTITUTIONAL BREAKOUT
 
-Instrument: {instrument}
+Symbol: {symbol}
 Direction: {direction}
+Score: {round(score,2)}
 
 Underlying: {round(price,2)}
 Strike: {strike}
 Premium: ${round(premium,2)}
 
 Contracts: {contracts}
-Stop: ${stop_price}
-Target: ${take_profit}
+Stop: ${stop}
+Target: ${target}
 """
         send_telegram_alert(message)
         last_alert = alert_id
 
     return {
-        "instrument": instrument,
+        "symbol": symbol,
         "direction": direction,
-        "price": round(price, 2),
+        "price": round(price,2),
         "strike": strike,
-        "premium": round(premium, 2),
+        "premium": round(premium,2),
         "contracts": contracts,
-        "stop": stop_price,
-        "target": take_profit,
-        "probability": 75
+        "stop": stop,
+        "target": target,
+        "score": round(score,2)
     }
 
 
@@ -219,32 +280,30 @@ def home():
     <head>
         <meta http-equiv="refresh" content="60">
         <style>
-            body { background-color: #0d1117; color: white; font-family: Arial; padding: 40px;}
-            .card { background-color: #161b22; padding: 25px; border-radius: 10px; max-width: 500px;}
-            h1 { color: #58a6ff; }
-            .green { color: #3fb950; }
-            .red { color: #f85149; }
+            body { background:#0d1117;color:white;font-family:Arial;padding:40px;}
+            .card {background:#161b22;padding:25px;border-radius:10px;max-width:600px;}
+            .green {color:#3fb950;}
+            .red {color:#f85149;}
         </style>
     </head>
     <body>
-        <h1>🚀 Quant 0DTE Engine (Alpaca Powered)</h1>
+        <h1>🚀 Institutional 0DTE Engine (Fully Alpaca)</h1>
         <div class="card">
     """
 
     if "status" in signal:
         html += f"<h2>{signal['status']}</h2>"
     else:
-        color = "green" if signal["direction"] == "CALL" else "red"
-
+        color = "green" if signal["direction"]=="CALL" else "red"
         html += f"""
-        <h2>{signal['instrument']} 0DTE <span class="{color}">{signal['direction']}</span></h2>
+        <h2>{signal['symbol']} <span class="{color}">{signal['direction']}</span></h2>
+        <p>Score: {signal['score']}</p>
         <p>Underlying: {signal['price']}</p>
         <p>Strike: {signal['strike']}</p>
         <p>Premium: ${signal['premium']}</p>
         <p>Contracts: {signal['contracts']}</p>
         <p>Stop: ${signal['stop']}</p>
         <p>Target: ${signal['target']}</p>
-        <p>Probability: {signal['probability']}%</p>
         """
 
     html += "</div></body></html>"
@@ -252,5 +311,5 @@ def home():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT",8000))
+    app.run(host="0.0.0.0",port=port)
