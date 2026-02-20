@@ -1,12 +1,14 @@
 from flask import Flask
 import yfinance as yf
 import requests
-import os
+import osi
 from datetime import datetime
+import pytz
 
 app = Flask(__name__)
 
 ACCOUNT_SIZE = 30000
+last_alert = None  # prevents duplicate alerts
 
 
 # =========================
@@ -17,14 +19,17 @@ def send_telegram_alert(message):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
+        print("Telegram not configured")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    requests.post(url, json={
+    r = requests.post(url, json={
         "chat_id": chat_id,
         "text": message
     })
+
+    print("Telegram status:", r.status_code)
 
 
 # =========================
@@ -59,37 +64,22 @@ def calculate_contracts(premium, score):
 
 
 # =========================
-# GET REAL ATM OPTION
+# GET ATM OPTION
 # =========================
-def get_atm_option(ticker_symbol, direction):
-    ticker = yf.Ticker(ticker_symbol)
+def get_atm_option(symbol, direction):
+    ticker = yf.Ticker(symbol)
 
     expirations = ticker.options
     if not expirations:
         return None, None
 
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # Try today expiration first (0DTE)
-    expiration = None
-    for exp in expirations:
-        if exp >= today:
-            expiration = exp
-            break
-
-    if not expiration:
-        return None, None
+    expiration = expirations[0]  # nearest expiry
 
     chain = ticker.option_chain(expiration)
-
     underlying_price = ticker.history(period="1d")["Close"].iloc[-1]
 
-    if direction == "CALL":
-        options = chain.calls
-    else:
-        options = chain.puts
+    options = chain.calls if direction == "CALL" else chain.puts
 
-    # Find closest strike to underlying price
     options["distance"] = abs(options["strike"] - underlying_price)
     atm_option = options.sort_values("distance").iloc[0]
 
@@ -100,41 +90,26 @@ def get_atm_option(ticker_symbol, direction):
 
 
 # =========================
-# SCORE ENGINE
-# =========================
-def calculate_score(price, orb_high, orb_low, day_range):
-    score = 50
-
-    if price > orb_high or price < orb_low:
-        score += 20
-
-    if day_range > price * 0.004:
-        score += 15
-
-    expansion = abs(price - orb_high) if price > orb_high else abs(price - orb_low)
-    if expansion > price * 0.002:
-        score += 10
-
-    return min(score, 95)
-
-
-# =========================
-# MAIN SIGNAL LOGIC
+# SIGNAL ENGINE
 # =========================
 def get_signal():
+    global last_alert
+
     try:
-        data = yf.download("^GSPC", period="1d", interval="5m")
+        eastern = pytz.timezone("US/Eastern")
+        now = datetime.now(eastern)
+
+        if now.weekday() >= 5:
+            return "Market Closed"
+
+        data = yf.download("^SPX", period="1d", interval="5m")
 
         if data.empty or len(data) < 4:
-            return "WAITING FOR DATA"
+            return "Waiting for data"
 
         orb_high = data["High"].iloc[:3].max()
         orb_low = data["Low"].iloc[:3].min()
         price = data["Close"].iloc[-1]
-
-        day_high = data["High"].max()
-        day_low = data["Low"].min()
-        day_range = day_high - day_low
 
         direction = None
 
@@ -143,58 +118,64 @@ def get_signal():
         elif price < orb_low:
             direction = "PUT"
         else:
-            return "NO TRADE"
+            return "No breakout"
 
-        score = calculate_score(price, orb_high, orb_low, day_range)
+        score = 75  # simplified stable score for now
 
-        # Try SPX first
         premium, strike = get_atm_option("^SPX", direction)
+
         instrument = "SPX"
 
-        # Fallback to SPY if SPX fails
         if not premium or premium == 0:
             premium, strike = get_atm_option("SPY", direction)
             instrument = "SPY"
 
-        if not premium or premium == 0:
-            return "OPTION DATA UNAVAILABLE"
+        if not premium:
+            return "No option data"
 
         contracts, stop_price, take_profit = calculate_contracts(premium, score)
 
         if contracts == 0:
-            return f"Setup detected but score too low ({score})"
+            return "Score too low"
 
-        probability = round(score * 0.75, 1)
+        alert_id = f"{instrument}_{direction}"
+
+        if last_alert == alert_id:
+            return "Already alerted"
+
+        probability = 75
 
         message = f"""
-{instrument} 0DTE {direction}
+🚀 0DTE BREAKOUT
 
-Underlying Price: {round(price,2)}
+Instrument: {instrument}
+Direction: {direction}
+
+Underlying: {round(price,2)}
 Strike: {strike}
 Premium: ${round(premium,2)}
 
-Score: {score}
-Probability: {probability}%
-
 Contracts: {contracts}
-Stop: ${stop_price} (-45%)
-Partial Take: ${take_profit} (+40%)
+Stop: ${stop_price}
+Target: ${take_profit}
 
-Time Stop: 45 min if no expansion
+Probability: {probability}%
 """
 
         send_telegram_alert(message)
 
+        last_alert = alert_id
+
         return f"ALERT SENT: {instrument} {direction}"
 
     except Exception as e:
+        print("ERROR:", e)
         return f"ERROR: {str(e)}"
 
 
 @app.route("/")
 def home():
-    signal = get_signal()
-    return f"<h1>{signal}</h1>"
+    return get_signal()
 
 
 if __name__ == "__main__":
