@@ -74,7 +74,7 @@ def generate_signal():
     if now.weekday() >= 5:
         return {"status": "Market Closed"}
 
-    data = yf.download("^SPX", period="1d", interval="5m")
+    data = yf.download("SPY", period="1d", interval="5m")
 
     if data.empty or len(data) < 4:
         return {"status": "Waiting for data"}
