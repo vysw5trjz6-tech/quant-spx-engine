@@ -653,11 +653,21 @@ def scan_all_symbols():
         vs_orb_low  = round((orb_low - price) / orb_low * 100, 3)
         vs_vwap     = round((price - vwap) / vwap * 100, 3)
 
-        result["price"]    = round(price, 2)
-        result["vwap"]     = round(vwap, 2)
-        result["orb_high"] = round(orb_high, 2)
-        result["orb_low"]  = round(orb_low, 2)
-        result["vol_mult"] = round(vol_mult, 2)
+        orb_range = orb_high - orb_low
+
+        result["price"]          = round(price, 2)
+        result["vwap"]           = round(vwap, 2)
+        result["orb_high"]       = round(orb_high, 2)
+        result["orb_low"]        = round(orb_low, 2)
+        result["vol_mult"]       = round(vol_mult, 2)
+        # Underlying price targets based on ORB range projection
+        if orb_range > 0:
+            result["und_call_t1"]   = round(orb_high + orb_range, 2)
+            result["und_call_t2"]   = round(orb_high + orb_range * 2, 2)
+            result["und_call_stop"] = round(orb_high - orb_range * 0.5, 2)
+            result["und_put_t1"]    = round(orb_low  - orb_range, 2)
+            result["und_put_t2"]    = round(orb_low  - orb_range * 2, 2)
+            result["und_put_stop"]  = round(orb_low  + orb_range * 0.5, 2)
 
         # Determine direction and breakout strength
         direction         = None
@@ -869,48 +879,85 @@ def render_dashboard():
         dcolor = "green" if d == "CALL" else "red"
 
         if status == "SIGNAL":
+            # Build underlying target string based on direction
+            if d == "CALL":
+                und_tgt_str = "T1:${} T2:${}  Stop:${}".format(
+                    s.get("und_call_t1","-"),
+                    s.get("und_call_t2","-"),
+                    s.get("und_call_stop","-"))
+            else:
+                und_tgt_str = "T1:${} T2:${}  Stop:${}".format(
+                    s.get("und_put_t1","-"),
+                    s.get("und_put_t2","-"),
+                    s.get("und_put_stop","-"))
             signal_rows += (
                 "<tr style='border-bottom:1px solid #21262d;background:#0d2818'>"
-                "<td style='padding:8px'><b>{}</b></td>"
-                "<td style='color:{};padding:8px'><b>{}</b></td>"
-                "<td style='padding:8px'>${}</td>"
-                "<td style='padding:8px'><b>{}</b></td>"
-                "<td style='padding:8px'>${}</td>"
-                "<td style='padding:8px;font-size:11px'>${}/{}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>{} VWAP</td>"
+                "<td style='padding:8px'><b>{sym}</b></td>"
+                "<td style='color:{dc};padding:8px'><b>{d}</b></td>"
+                # Current price + underlying targets stacked
+                "<td style='padding:8px'>"
+                "<div style='font-size:13px'><b>${price}</b></div>"
+                "<div style='font-size:10px;color:#3fb950;margin-top:2px'>{utgt}</div>"
+                "</td>"
+                "<td style='padding:8px'><b>{score}</b></td>"
+                # Option premium + option stop/target stacked
+                "<td style='padding:8px'>"
+                "<div style='font-size:13px'>${prem}</div>"
+                "<div style='font-size:10px;color:#8b949e;margin-top:2px'>"
+                "Stop:${stp} Tgt:${tgt}</div>"
+                "</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
+                "VWAP:${vwap}</td>"
                 "<td style='padding:8px'>"
                 "<span style='background:#1f6feb;color:white;padding:2px 6px;"
                 "border-radius:4px;font-size:10px'>SIGNAL</span>&nbsp;"
-                "<a href='/take?sym={}&dir={}&prem={}&con={}&stp={}&tgt={}' "
+                "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
+                "&stp={stp}&tgt={tgt}' "
                 "style='background:#238636;color:white;padding:4px 8px;"
                 "border-radius:5px;text-decoration:none;font-size:11px'>TAKE</a>"
                 "</td></tr>"
             ).format(
-                sym, dcolor, d, price, score,
-                s.get("premium","-"), s.get("stop","-"), s.get("target","-"),
-                s.get("vs_vwap","-"),
-                sym, d, s.get("premium",""), s.get("contracts",""),
-                s.get("stop",""), s.get("target","")
+                sym=sym, dc=dcolor, d=d, price=price, score=score,
+                utgt=und_tgt_str,
+                prem=s.get("premium","-"),
+                stp=s.get("stop","-"), tgt=s.get("target","-"),
+                vwap=s.get("vwap","-"),
+                con=s.get("contracts","1")
             )
 
         elif status == "WATCHING":
+            # Show breakout trigger level for WATCHING symbols
+            if d == "CALL":
+                trigger = "Break>${}".format(s.get("orb_high","-"))
+                t1_str  = "T1:${}".format(s.get("und_call_t1","-"))
+            else:
+                trigger = "Break<${}".format(s.get("orb_low","-"))
+                t1_str  = "T1:${}".format(s.get("und_put_t1","-"))
             signal_rows += (
                 "<tr style='border-bottom:1px solid #21262d'>"
-                "<td style='padding:8px'><b>{}</b></td>"
-                "<td style='color:{};padding:8px'>{}</td>"
-                "<td style='padding:8px'>${}</td>"
-                "<td style='padding:8px'>{}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>{}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>{}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>{}</td>"
+                "<td style='padding:8px'><b>{sym}</b></td>"
+                "<td style='color:{dc};padding:8px'>{d}</td>"
+                "<td style='padding:8px'>"
+                "<div style='font-size:13px'>${price}</div>"
+                "<div style='font-size:10px;color:#e3b341;margin-top:2px'>"
+                "{trigger}</div>"
+                "</td>"
+                "<td style='padding:8px'>{score}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
+                "{vs_orb}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
+                "{t1}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
+                "Vol {vm}x</td>"
                 "<td style='padding:8px'>"
                 "<span style='background:#9e6a03;color:white;padding:2px 6px;"
                 "border-radius:4px;font-size:10px'>WATCH</span>"
                 "</td></tr>"
             ).format(
-                sym, dcolor, d, price, score,
-                s.get("vs_orb","-"), s.get("vs_vwap","-"),
-                "Vol {}x".format(s.get("vol_mult","-"))
+                sym=sym, dc=dcolor, d=d, price=price, score=score,
+                trigger=trigger, t1=t1_str,
+                vs_orb=s.get("vs_orb","-"),
+                vm=s.get("vol_mult","-")
             )
 
         elif "SIGNAL" in status:
