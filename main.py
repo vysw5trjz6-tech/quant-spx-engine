@@ -17,7 +17,7 @@ app = Flask(__name__)
 
 ACCOUNT_SIZE  = 30000
 SCAN_INTERVAL = 300
-BOT_ENABLED   = True
+ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
 SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN"]
 
@@ -36,12 +36,11 @@ OPTIONS_URL      = "https://data.alpaca.markets/v1beta1/options/contracts"
 OPTIONS_SNAP_URL = "https://data.alpaca.markets/v1beta1/options/snapshots/{}"
 
 ALERT_FILE = "/tmp/last_alert.json"
-CACHE_FILE = "/tmp/scan_cache.json"
 DB_FILE    = "/tmp/trades.db"
 
 state_lock   = threading.Lock()
 debug_log    = []
-all_signals  = []   # ranked list of all symbol results
+all_signals  = []
 next_scan_at = 0
 bot_enabled  = True
 
@@ -84,18 +83,18 @@ def init_db():
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts          TEXT,
-            symbol      TEXT,
-            direction   TEXT,
-            premium     REAL,
-            contracts   INTEGER,
-            stop        REAL,
-            target      REAL,
-            outcome     TEXT,
-            exit_price  REAL,
-            pnl         REAL,
-            r_mult      REAL
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts         TEXT,
+            symbol     TEXT,
+            direction  TEXT,
+            premium    REAL,
+            contracts  INTEGER,
+            stop       REAL,
+            target     REAL,
+            outcome    TEXT,
+            exit_price REAL,
+            pnl        REAL,
+            r_mult     REAL
         )
     """)
     conn.commit()
@@ -107,7 +106,8 @@ def db_log_signal(sig):
         conn = sqlite3.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
-            INSERT INTO signals (ts,symbol,direction,price,score,premium,strike,contracts,stop,target)
+            INSERT INTO signals
+            (ts,symbol,direction,price,score,premium,strike,contracts,stop,target)
             VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
@@ -127,7 +127,8 @@ def db_log_trade(symbol, direction, premium, contracts, stop, target):
         conn = sqlite3.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
-            INSERT INTO trades (ts,symbol,direction,premium,contracts,stop,target,outcome)
+            INSERT INTO trades
+            (ts,symbol,direction,premium,contracts,stop,target,outcome)
             VALUES (?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
@@ -152,12 +153,8 @@ def db_close_trade(trade_id, exit_price, outcome):
             conn.close()
             return
         premium, contracts = row
-        if outcome == "WIN":
-            pnl    = (exit_price - premium) * 100 * contracts
-            r_mult = (exit_price - premium) / (premium * 0.45)
-        else:
-            pnl    = (exit_price - premium) * 100 * contracts
-            r_mult = (exit_price - premium) / (premium * 0.45)
+        pnl    = (exit_price - premium) * 100 * contracts
+        r_mult = (exit_price - premium) / (premium * 0.45)
         c.execute("""
             UPDATE trades SET outcome=?, exit_price=?, pnl=?, r_mult=?
             WHERE id=?
@@ -176,14 +173,15 @@ def db_get_today_trades():
         conn  = sqlite3.connect(DB_FILE)
         c     = conn.cursor()
         c.execute("""
-            SELECT id,symbol,direction,premium,contracts,stop,target,outcome,exit_price,pnl,r_mult,ts
+            SELECT id,symbol,direction,premium,contracts,stop,target,
+                   outcome,exit_price,pnl,r_mult,ts
             FROM trades WHERE ts LIKE ?
             ORDER BY ts DESC
         """, (today + "%",))
         rows = c.fetchall()
         conn.close()
-        cols = ["id","symbol","direction","premium","contracts",
-                "stop","target","outcome","exit_price","pnl","r_mult","ts"]
+        cols = ["id","symbol","direction","premium","contracts","stop",
+                "target","outcome","exit_price","pnl","r_mult","ts"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log("DB get trades error: {}".format(e))
@@ -270,7 +268,7 @@ def get_telegram_updates(offset=0):
         resp = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15)
         if resp.status_code != 200:
             return [], offset
-        updates = resp.json().get("result", [])
+        updates    = resp.json().get("result", [])
         new_offset = offset
         if updates:
             new_offset = updates[-1]["update_id"] + 1
@@ -282,7 +280,6 @@ def get_telegram_updates(offset=0):
 def handle_telegram_command(text):
     global bot_enabled
     text = text.strip().lower()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
     if text in ("/stop", "stop"):
         bot_enabled = False
@@ -295,32 +292,30 @@ def handle_telegram_command(text):
     elif text in ("/status", "status"):
         with state_lock:
             sigs = list(all_signals)
-        if sigs:
-            best = sigs[0]
-            if best.get("direction"):
-                msg = "SIGNAL: {} {} | Score: {} | Premium: ${}".format(
-                    best["symbol"], best["direction"],
-                    best.get("score","?"), best.get("premium","?"))
-            else:
-                msg = "No active breakout signals right now."
+        active = [s for s in sigs if s.get("status") in ("SIGNAL","WATCHING")]
+        if active:
+            lines = []
+            for s in active[:3]:
+                lines.append("{} {} | {} | Score: {}".format(
+                    s["symbol"], s.get("direction","?"),
+                    s["status"], s.get("score","?")))
+            send_telegram("TOP SETUPS:\n" + "\n".join(lines))
         else:
-            msg = "No scan data yet."
-        send_telegram(msg)
+            send_telegram("No setups right now. Market may be in consolidation.")
 
     elif text in ("/pnl", "pnl"):
-        trades = db_get_today_trades()
-        closed = [t for t in trades if t["outcome"] != "OPEN"]
+        trades    = db_get_today_trades()
+        closed    = [t for t in trades if t["outcome"] != "OPEN"]
         total_pnl = sum(t["pnl"] or 0 for t in closed)
-        wins  = len([t for t in closed if t["outcome"] == "WIN"])
-        losses = len([t for t in closed if t["outcome"] == "LOSS"])
-        msg = "TODAY P&L\nTrades: {} | W: {} L: {}\nTotal: ${}".format(
-            len(closed), wins, losses, round(total_pnl, 2))
-        send_telegram(msg)
+        wins      = len([t for t in closed if t["outcome"] == "WIN"])
+        losses    = len([t for t in closed if t["outcome"] == "LOSS"])
+        send_telegram("TODAY P&L\nTrades: {} | W: {} L: {}\nTotal: ${}".format(
+            len(closed), wins, losses, round(total_pnl, 2)))
 
     elif text in ("/help", "help"):
         send_telegram(
             "Commands:\n"
-            "/status - current signal\n"
+            "/status - top current setups\n"
             "/pnl - today P&L\n"
             "/stop - pause bot\n"
             "/start - resume bot\n"
@@ -359,11 +354,15 @@ def market_open():
 def get_intraday(symbol):
     try:
         r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "5Min", "limit": 50}, timeout=10)
+                         params={"timeframe": "5Min", "limit": 78}, timeout=10)
         if r.status_code != 200:
+            log("Intraday {} error: {}".format(symbol, r.text[:80]))
             return None
-        return r.json().get("bars", [])
-    except:
+        bars = r.json().get("bars", [])
+        log("Intraday {}: {} bars".format(symbol, len(bars)))
+        return bars
+    except Exception as e:
+        log("Intraday exception {}: {}".format(symbol, e))
         return None
 
 
@@ -382,7 +381,7 @@ def get_current_price(symbol):
     try:
         r = requests.get(QUOTE_URL.format(symbol), headers=HEADERS, timeout=5)
         if r.status_code == 200:
-            q = r.json().get("quote", {})
+            q  = r.json().get("quote", {})
             ap = q.get("ap", 0)
             bp = q.get("bp", 0)
             if ap and bp:
@@ -405,13 +404,32 @@ def calculate_vwap(bars):
     return pv / vol if vol else None
 
 
-def volatility_regime(daily_bars):
+def volatility_score(daily_bars):
+    """
+    Returns a multiplier (0.5 to 1.5) based on today's range vs average.
+    No longer a hard block - just modifies signal score.
+    Only returns 0 on truly dead days (< 30% of average range).
+    """
     if len(daily_bars) < 5:
-        return False
+        return 1.0
     ranges    = [b["h"] - b["l"] for b in daily_bars]
     today_rng = ranges[-1]
     avg_rng   = statistics.mean(ranges[:-1])
-    return today_rng > avg_rng * 0.75
+    if avg_rng == 0:
+        return 1.0
+    ratio = today_rng / avg_rng
+    log("  Vol ratio: {:.2f} (today={:.2f} avg={:.2f})".format(
+        ratio, today_rng, avg_rng))
+    if ratio < 0.30:
+        return 0.0    # truly dead day - skip
+    elif ratio < 0.60:
+        return 0.6    # below avg - reduce score
+    elif ratio < 0.85:
+        return 0.85   # slightly below avg - small reduction
+    elif ratio <= 1.20:
+        return 1.0    # normal
+    else:
+        return 1.3    # high vol day - bonus
 
 
 # =============================================
@@ -424,19 +442,19 @@ def get_liquid_option(symbol, direction):
         r = requests.get(OPTIONS_URL, headers=HEADERS,
                          params={"underlying_symbols": symbol, "type": option_type,
                                  "status": "active", "limit": 100}, timeout=10)
-        log("Options/contracts {} {}: HTTP {}".format(symbol, option_type, r.status_code))
+        log("Options {} {}: HTTP {}".format(symbol, option_type, r.status_code))
         if r.status_code == 200:
             contracts = r.json().get("option_contracts", [])
-            filtered  = [c for c in contracts if float(c.get("close_price") or 0) > 0.10]
+            filtered  = [c for c in contracts
+                         if float(c.get("close_price") or 0) > 0.10]
             filtered.sort(key=lambda x: x.get("open_interest", 0), reverse=True)
             if filtered:
                 best = filtered[0]
                 return float(best["close_price"]), best["strike_price"]
         else:
-            log("Options error: {}".format(r.text[:150]))
+            log("Options contracts error: {}".format(r.text[:150]))
     except Exception as e:
         log("Options exception: {}".format(e))
-
     try:
         r2 = requests.get(OPTIONS_SNAP_URL.format(symbol), headers=HEADERS,
                           params={"type": option_type, "limit": 100}, timeout=10)
@@ -449,7 +467,11 @@ def get_liquid_option(symbol, direction):
                 greeks = snap.get("greeks", {})
                 delta  = abs(greeks.get("delta", 0)) if greeks else 0
                 if price and float(price) > 0.10:
-                    candidates.append({"symbol": sym, "price": float(price), "delta": delta})
+                    candidates.append({
+                        "symbol": sym,
+                        "price":  float(price),
+                        "delta":  delta
+                    })
             candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
             if candidates:
                 best = candidates[0]
@@ -460,7 +482,6 @@ def get_liquid_option(symbol, direction):
                 return best["price"], strike
     except Exception as e:
         log("Options snapshots exception: {}".format(e))
-
     return None, None
 
 
@@ -479,7 +500,7 @@ def calculate_contracts(premium, score=80):
 
 
 # =============================================
-# SCANNER - returns ALL symbol results ranked
+# SCANNER
 # =============================================
 
 def scan_all_symbols():
@@ -500,56 +521,94 @@ def scan_all_symbols():
             "vwap":      None,
             "orb_high":  None,
             "orb_low":   None,
+            "vs_orb":    None,
+            "vs_vwap":   None,
+            "vol_ratio": None,
         }
 
         intraday = get_intraday(symbol)
         daily    = get_daily(symbol)
 
-        if not intraday or len(intraday) < 5 or not daily:
+        if not intraday or len(intraday) < ORB_BARS + 2 or not daily:
             result["status"] = "no data"
             results.append(result)
             continue
 
-        if not volatility_regime(daily):
-            result["status"] = "low volatility"
+        # Volatility score (modifier, not hard block)
+        vol_mult = volatility_score(daily)
+        if vol_mult == 0.0:
+            result["status"] = "dead market"
             results.append(result)
             continue
 
-        orb_high = max(b["h"] for b in intraday[:3])
-        orb_low  = min(b["l"] for b in intraday[:3])
+        # ORB using first 30 min (6 bars)
+        orb      = intraday[:ORB_BARS]
+        orb_high = max(b["h"] for b in orb)
+        orb_low  = min(b["l"] for b in orb)
         current  = intraday[-1]
         price    = current["c"]
         vwap     = calculate_vwap(intraday)
-
-        result["price"]    = round(price, 2)
-        result["vwap"]     = round(vwap, 2) if vwap else None
-        result["orb_high"] = round(orb_high, 2)
-        result["orb_low"]  = round(orb_low, 2)
 
         if not vwap:
             result["status"] = "no vwap"
             results.append(result)
             continue
 
+        range_size = orb_high - orb_low
+        vs_orb_high = round((price - orb_high) / orb_high * 100, 3)
+        vs_orb_low  = round((orb_low - price) / orb_low * 100, 3)
+        vs_vwap     = round((price - vwap) / vwap * 100, 3)
+
+        result["price"]    = round(price, 2)
+        result["vwap"]     = round(vwap, 2)
+        result["orb_high"] = round(orb_high, 2)
+        result["orb_low"]  = round(orb_low, 2)
+        result["vol_mult"] = round(vol_mult, 2)
+
+        # Determine direction and breakout strength
         direction         = None
         breakout_strength = 0
 
         if price > orb_high and price > vwap:
             direction         = "CALL"
             breakout_strength = (price - orb_high) / orb_high
+            result["vs_orb"]  = "+{}%".format(abs(vs_orb_high))
+            result["vs_vwap"] = "+{}%".format(abs(vs_vwap))
+
         elif price < orb_low and price < vwap:
             direction         = "PUT"
             breakout_strength = (orb_low - price) / orb_low
+            result["vs_orb"]  = "-{}%".format(abs(vs_orb_low))
+            result["vs_vwap"] = "-{}%".format(abs(vs_vwap))
 
-        if not direction:
-            result["status"] = "no breakout"
+        else:
+            # No confirmed breakout yet - classify as WATCHING
+            # Show best directional bias based on price location
+            if price > vwap:
+                result["direction"] = "CALL"
+                result["vs_vwap"]   = "+{}%".format(abs(vs_vwap))
+                result["vs_orb"]    = "{:.2f}% from ORB high".format(
+                    abs(vs_orb_high))
+            else:
+                result["direction"] = "PUT"
+                result["vs_vwap"]   = "-{}%".format(abs(vs_vwap))
+                result["vs_orb"]    = "{:.2f}% from ORB low".format(
+                    abs(vs_orb_low))
+
+            # Score based on proximity to breakout level
+            proximity = 1 - min(abs(vs_orb_high), abs(vs_orb_low)) / 100
+            vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+            result["score"]  = round(proximity * vol_mult * 10, 2)
+            result["status"] = "WATCHING"
             results.append(result)
             continue
 
+        # Confirmed breakout - get options
         vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
-        score     = breakout_strength * 100 + vol_ratio
+        score     = (breakout_strength * 100 + vol_ratio) * vol_mult
 
         premium, strike = get_liquid_option(symbol, direction)
+
         if premium:
             contracts, stop, target = calculate_contracts(premium, score)
             result["premium"]   = round(premium, 2)
@@ -557,15 +616,29 @@ def scan_all_symbols():
             result["contracts"] = contracts
             result["stop"]      = stop
             result["target"]    = target
+            result["status"]    = "SIGNAL"
         else:
-            result["status"] = "no option data"
+            result["status"] = "SIGNAL (no options)"
 
         result["direction"] = direction
         result["score"]     = round(score, 2)
-        result["status"]    = "signal" if premium else "signal (no options)"
         results.append(result)
+        log("{}: {} {} score={:.2f} vol_mult={:.2f}".format(
+            symbol, result["status"], direction, score, vol_mult))
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # Sort: SIGNAL first, then WATCHING, then rest - all by score desc
+    def sort_key(r):
+        s = r.get("status","")
+        if s == "SIGNAL":
+            return (0, -r.get("score",0))
+        elif s == "WATCHING":
+            return (1, -r.get("score",0))
+        elif "SIGNAL" in s:
+            return (2, -r.get("score",0))
+        else:
+            return (3, 0)
+
+    results.sort(key=sort_key)
     return results
 
 
@@ -576,7 +649,7 @@ def scan_all_symbols():
 def run_signal_scan():
     global all_signals, next_scan_at
     log("=== Running signal scan ===")
-    log("Key set: {} | Secret set: {} | Bot enabled: {}".format(
+    log("Key set: {} | Secret set: {} | Bot: {}".format(
         bool(ALPACA_KEY), bool(ALPACA_SECRET), bot_enabled))
 
     if not market_open():
@@ -591,34 +664,50 @@ def run_signal_scan():
         all_signals  = results
         next_scan_at = time.time() + SCAN_INTERVAL
 
-    # Alert on best signal only
-    best = next((r for r in results if r["status"] == "signal"), None)
-    if best and bot_enabled:
-        if should_alert(best["symbol"], best["direction"]):
-            db_log_signal(best)
+    signals  = [r for r in results if r["status"] == "SIGNAL"]
+    watching = [r for r in results if r["status"] == "WATCHING"]
+
+    # Telegram: alert on confirmed signals
+    for sig in signals:
+        if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
+            db_log_signal(sig)
             msg = (
                 "INSTITUTIONAL BREAKOUT\n\n"
-                "Symbol: {}\n"
-                "Direction: {}\n"
-                "Score: {}\n\n"
-                "Underlying: ${}\n"
-                "Strike: {}\n"
-                "Premium: ${}\n\n"
-                "Contracts: {}\n"
-                "Stop: ${}\n"
-                "Target: ${}\n\n"
-                "Dashboard: {}tion.up.railway.app"
+                "Symbol: {}\nDirection: {}\nScore: {}\n\n"
+                "Underlying: ${}\nStrike: {}\nPremium: ${}\n\n"
+                "Contracts: {}\nStop: ${}\nTarget: ${}\n\n"
+                "Vol Multiplier: {}x"
             ).format(
-                best["symbol"], best["direction"], best["score"],
-                best["price"], best["strike"], best["premium"],
-                best["contracts"], best["stop"], best["target"],
-                ""
+                sig["symbol"], sig["direction"], sig["score"],
+                sig["price"], sig["strike"], sig["premium"],
+                sig["contracts"], sig["stop"], sig["target"],
+                sig.get("vol_mult", 1.0)
             )
             send_telegram(msg)
+            break  # Only alert best signal
 
-    log("Scan complete. {} symbols scanned, {} signals found.".format(
-        len(results),
-        len([r for r in results if "signal" in r.get("status","")])))
+    # Telegram: send watching list if no signals
+    if not signals and watching and bot_enabled:
+        et    = pytz.timezone("America/New_York")
+        now   = datetime.now(et)
+        # Only send watching alert once, between 10:00-10:05 AM
+        if now.hour == 10 and now.minute < 6:
+            top3  = watching[:3]
+            lines = []
+            for w in top3:
+                lines.append("{} {} | Score:{} | {}ORB | {}VWAP".format(
+                    w["symbol"], w.get("direction","?"),
+                    w.get("score","?"),
+                    w.get("vs_orb","?"), w.get("vs_vwap","?")))
+            send_telegram(
+                "WATCHING (no confirmed breakouts yet):\n\n" +
+                "\n".join(lines) +
+                "\n\nWaiting for ORB breakout + volume confirmation."
+            )
+
+    log("Scan done: {} SIGNAL, {} WATCHING, {} other".format(
+        len(signals), len(watching),
+        len(results) - len(signals) - len(watching)))
 
 
 # =============================================
@@ -647,7 +736,7 @@ def telegram_poller():
                 msg  = update.get("message", {})
                 text = msg.get("text", "")
                 if text:
-                    log("Telegram command received: {}".format(text))
+                    log("Telegram command: {}".format(text))
                     handle_telegram_command(text)
         except Exception as e:
             log("Telegram poller error: {}".format(e))
@@ -655,7 +744,7 @@ def telegram_poller():
 
 
 # =============================================
-# DASHBOARD HTML
+# DASHBOARD
 # =============================================
 
 def render_dashboard():
@@ -671,81 +760,98 @@ def render_dashboard():
     wins        = len([t for t in closed if t["outcome"] == "WIN"])
     losses      = len([t for t in closed if t["outcome"] == "LOSS"])
 
-    is_open = market_open()
+    is_open       = market_open()
     market_color  = "green" if is_open else "red"
     market_status = "OPEN" if is_open else "CLOSED"
+    pnl_color     = "green" if total_pnl >= 0 else "red"
 
-    # Build signal rows
     signal_rows = ""
     for s in signals:
         status = s.get("status", "")
         sym    = s["symbol"]
         price  = s.get("price", "-")
         score  = s.get("score", 0)
+        d      = s.get("direction") or ""
+        dcolor = "green" if d == "CALL" else "red"
 
-        if status == "signal":
-            d     = s["direction"]
-            color = "green" if d == "CALL" else "red"
-            row   = (
-                "<tr style='border-bottom:1px solid #21262d'>"
-                "<td style='padding:10px'><b>{}</b></td>"
-                "<td style='color:{};padding:10px'><b>{}</b></td>"
-                "<td style='padding:10px'>${}</td>"
-                "<td style='padding:10px'>{}</td>"
-                "<td style='padding:10px'>${}</td>"
-                "<td style='padding:10px'>${} / ${}</td>"
-                "<td style='padding:10px'>"
+        if status == "SIGNAL":
+            signal_rows += (
+                "<tr style='border-bottom:1px solid #21262d;background:#0d2818'>"
+                "<td style='padding:8px'><b>{}</b></td>"
+                "<td style='color:{};padding:8px'><b>{}</b></td>"
+                "<td style='padding:8px'>${}</td>"
+                "<td style='padding:8px'><b>{}</b></td>"
+                "<td style='padding:8px'>${}</td>"
+                "<td style='padding:8px;font-size:11px'>${}/{}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>{} VWAP</td>"
+                "<td style='padding:8px'>"
+                "<span style='background:#1f6feb;color:white;padding:2px 6px;"
+                "border-radius:4px;font-size:10px'>SIGNAL</span>&nbsp;"
                 "<a href='/take?sym={}&dir={}&prem={}&con={}&stp={}&tgt={}' "
-                "style='background:#238636;color:white;padding:5px 10px;"
-                "border-radius:5px;text-decoration:none;font-size:12px'>TAKE</a>"
-                "</td>"
-                "</tr>"
+                "style='background:#238636;color:white;padding:4px 8px;"
+                "border-radius:5px;text-decoration:none;font-size:11px'>TAKE</a>"
+                "</td></tr>"
             ).format(
-                sym, color, d, price, score,
-                s.get("premium","-"),
-                s.get("stop","-"), s.get("target","-"),
+                sym, dcolor, d, price, score,
+                s.get("premium","-"), s.get("stop","-"), s.get("target","-"),
+                s.get("vs_vwap","-"),
                 sym, d, s.get("premium",""), s.get("contracts",""),
                 s.get("stop",""), s.get("target","")
             )
-        elif status == "signal (no options)":
-            row = (
-                "<tr style='border-bottom:1px solid #21262d;opacity:0.7'>"
-                "<td style='padding:10px'><b>{}</b></td>"
-                "<td style='color:{};padding:10px'>{}</td>"
-                "<td style='padding:10px'>${}</td>"
-                "<td style='padding:10px'>{}</td>"
-                "<td colspan='3' style='padding:10px;color:#e3b341'>No option data</td>"
-                "</tr>"
-            ).format(sym,
-                     "green" if s.get("direction")=="CALL" else "red",
-                     s.get("direction",""), price, score)
+
+        elif status == "WATCHING":
+            signal_rows += (
+                "<tr style='border-bottom:1px solid #21262d'>"
+                "<td style='padding:8px'><b>{}</b></td>"
+                "<td style='color:{};padding:8px'>{}</td>"
+                "<td style='padding:8px'>${}</td>"
+                "<td style='padding:8px'>{}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>{}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>{}</td>"
+                "<td style='padding:8px;font-size:11px;color:#8b949e'>{}</td>"
+                "<td style='padding:8px'>"
+                "<span style='background:#9e6a03;color:white;padding:2px 6px;"
+                "border-radius:4px;font-size:10px'>WATCH</span>"
+                "</td></tr>"
+            ).format(
+                sym, dcolor, d, price, score,
+                s.get("vs_orb","-"), s.get("vs_vwap","-"),
+                "Vol {}x".format(s.get("vol_mult","-"))
+            )
+
+        elif "SIGNAL" in status:
+            signal_rows += (
+                "<tr style='border-bottom:1px solid #21262d;opacity:0.8'>"
+                "<td style='padding:8px'><b>{}</b></td>"
+                "<td style='color:{};padding:8px'>{}</td>"
+                "<td style='padding:8px'>${}</td>"
+                "<td style='padding:8px'>{}</td>"
+                "<td colspan='3' style='padding:8px;color:#e3b341'>"
+                "Breakout confirmed - no option data</td>"
+                "<td></td></tr>"
+            ).format(sym, dcolor, d, price, score)
+
         else:
-            row = (
-                "<tr style='border-bottom:1px solid #21262d;opacity:0.4'>"
-                "<td style='padding:10px'>{}</td>"
-                "<td colspan='6' style='padding:10px;color:#8b949e'>{}</td>"
+            signal_rows += (
+                "<tr style='border-bottom:1px solid #21262d;opacity:0.35'>"
+                "<td style='padding:8px'>{}</td>"
+                "<td colspan='7' style='padding:8px;color:#8b949e'>{}</td>"
                 "</tr>"
             ).format(sym, status)
 
-        signal_rows += row
-
-    # Build open trades rows
     open_rows = ""
     for t in open_trades:
-        current_price = get_current_price(t["symbol"])
-        if current_price and t["premium"]:
-            unreal = round((current_price - t["premium"]) * 100 * t["contracts"], 2)
-            unreal_color = "green" if unreal >= 0 else "red"
-            unreal_str = "<span style='color:{}'>${}</span>".format(unreal_color, unreal)
+        cp = get_current_price(t["symbol"])
+        if cp and t["premium"]:
+            unreal = round((cp - t["premium"]) * 100 * t["contracts"], 2)
+            uc     = "green" if unreal >= 0 else "red"
+            us     = "<span style='color:{}'>${}</span>".format(uc, unreal)
         else:
-            unreal_str = "<span style='color:#8b949e'>-</span>"
-
+            us = "<span style='color:#8b949e'>-</span>"
         open_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
-            "<td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>${}</td>"
-            "<td style='padding:8px'>{}x</td>"
+            "<td style='padding:8px'>{}</td><td style='padding:8px'>{}</td>"
+            "<td style='padding:8px'>${}</td><td style='padding:8px'>{}x</td>"
             "<td style='padding:8px'>{}</td>"
             "<td style='padding:8px'>"
             "<a href='/close?id={}&outcome=WIN&exit={}' "
@@ -754,144 +860,100 @@ def render_dashboard():
             "<a href='/close?id={}&outcome=LOSS&exit={}' "
             "style='background:#da3633;color:white;padding:4px 8px;"
             "border-radius:4px;text-decoration:none;font-size:11px'>LOSS</a>"
-            "</td>"
-            "</tr>"
-        ).format(
-            t["symbol"], t["direction"], t["premium"], t["contracts"],
-            unreal_str,
-            t["id"], current_price or 0,
-            t["id"], current_price or 0
-        )
+            "</td></tr>"
+        ).format(t["symbol"], t["direction"], t["premium"], t["contracts"], us,
+                 t["id"], cp or 0, t["id"], cp or 0)
 
-    # Build closed trades rows
     closed_rows = ""
     for t in closed:
-        pnl_color = "green" if (t["pnl"] or 0) >= 0 else "red"
+        pc = "green" if (t["pnl"] or 0) >= 0 else "red"
         closed_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
-            "<td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>${}</td>"
-            "<td style='padding:8px'>{}</td>"
-            "<td style='padding:8px;color:{}'>${}</td>"
-            "</tr>"
-        ).format(
-            t["symbol"], t["direction"], t["premium"],
-            t["outcome"], pnl_color, t["pnl"] or 0
-        )
+            "<td style='padding:8px'>{}</td><td style='padding:8px'>{}</td>"
+            "<td style='padding:8px'>${}</td><td style='padding:8px'>{}</td>"
+            "<td style='padding:8px;color:{}'>${}</td></tr>"
+        ).format(t["symbol"], t["direction"], t["premium"],
+                 t["outcome"], pc, t["pnl"] or 0)
 
-    pnl_color = "green" if total_pnl >= 0 else "red"
-
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta http-equiv='refresh' content='30'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<style>
-  body{{background:#0d1117;color:white;font-family:Arial,sans-serif;padding:15px;margin:0}}
-  h1{{font-size:18px;margin-bottom:5px}}
-  h2{{font-size:14px;color:#8b949e;margin:20px 0 8px 0}}
-  .card{{background:#161b22;border-radius:10px;margin-bottom:15px;overflow:hidden}}
-  .card-header{{padding:12px 15px;border-bottom:1px solid #21262d;
-               display:flex;justify-content:space-between;align-items:center}}
-  .green{{color:#3fb950}} .red{{color:#f85149}} .yellow{{color:#e3b341}}
-  .badge{{font-size:11px;padding:3px 8px;border-radius:10px;font-weight:bold}}
-  .badge-green{{background:#238636}} .badge-red{{background:#da3633}}
-  table{{width:100%;border-collapse:collapse;font-size:13px}}
-  th{{padding:10px;text-align:left;color:#8b949e;border-bottom:1px solid #21262d}}
-  .debug{{background:#0a0d12;padding:12px;border-radius:8px;font-size:10px;
-         font-family:monospace;max-height:200px;overflow-y:auto;color:#8b949e}}
-  .stat-row{{display:flex;gap:10px;margin-bottom:15px}}
-  .stat{{background:#161b22;border-radius:8px;padding:15px;flex:1;text-align:center}}
-  .stat-val{{font-size:22px;font-weight:bold}}
-  .stat-lbl{{font-size:11px;color:#8b949e;margin-top:4px}}
-  a.nav{{color:#58a6ff;text-decoration:none;font-size:12px;margin-right:10px}}
-</style>
-</head>
-<body>
-<h1>Institutional 0DTE Engine</h1>
-<div style='margin-bottom:12px;font-size:12px;color:#8b949e'>
-  Market: <span class='{mcolor}'>{mstatus}</span> &nbsp;|&nbsp;
-  Next scan: {secs}s &nbsp;|&nbsp;
-  Bot: <span class='{bcolor}'>{benabled}</span> &nbsp;|&nbsp;
-  <a class='nav' href='/alpaca-test'>Alpaca</a>
-  <a class='nav' href='/telegram-test'>Telegram</a>
-  <a class='nav' href='/debug'>Debug</a>
-</div>
-
-<div class='stat-row'>
-  <div class='stat'>
-    <div class='stat-val {pcolor}'>${pnl}</div>
-    <div class='stat-lbl'>Today P&L</div>
-  </div>
-  <div class='stat'>
-    <div class='stat-val'>{ntrades}</div>
-    <div class='stat-lbl'>Trades</div>
-  </div>
-  <div class='stat'>
-    <div class='stat-val green'>{nwins}</div>
-    <div class='stat-lbl'>Wins</div>
-  </div>
-  <div class='stat'>
-    <div class='stat-val red'>{nlosses}</div>
-    <div class='stat-lbl'>Losses</div>
-  </div>
-</div>
-
-<div class='card'>
-  <div class='card-header'>
-    <span>Signal Scanner</span>
-    <span style='font-size:12px;color:#8b949e'>{nsymbols} symbols</span>
-  </div>
-  <table>
-    <tr>
-      <th>Symbol</th><th>Dir</th><th>Price</th>
-      <th>Score</th><th>Premium</th><th>Stop/Target</th><th>Action</th>
-    </tr>
-    {signal_rows}
-  </table>
-</div>
-
-<div class='card'>
-  <div class='card-header'><span>Open Trades</span></div>
-  <table>
-    <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Size</th><th>Unreal P&L</th><th>Close</th></tr>
-    {open_rows}
-  </table>
-</div>
-
-<div class='card'>
-  <div class='card-header'><span>Today Closed</span></div>
-  <table>
-    <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Result</th><th>P&L</th></tr>
-    {closed_rows}
-  </table>
-</div>
-
-<div class='card' style='padding:12px'>
-  <div style='color:#8b949e;font-size:12px;margin-bottom:6px'>Debug Log</div>
-  <div class='debug'>{log_lines}</div>
-</div>
-
-</body></html>
-""".format(
-        mcolor=market_color, mstatus=market_status,
-        secs=secs,
-        bcolor="green" if bot_enabled else "red",
-        benabled="ON" if bot_enabled else "PAUSED",
-        pcolor=pnl_color,
-        pnl=round(total_pnl, 2),
-        ntrades=len(closed),
-        nwins=wins,
-        nlosses=losses,
-        nsymbols=len(signals),
-        signal_rows=signal_rows if signal_rows else "<tr><td colspan='7' style='padding:15px;color:#8b949e;text-align:center'>Waiting for market open or scan...</td></tr>",
-        open_rows=open_rows if open_rows else "<tr><td colspan='6' style='padding:15px;color:#8b949e;text-align:center'>No open trades</td></tr>",
-        closed_rows=closed_rows if closed_rows else "<tr><td colspan='5' style='padding:15px;color:#8b949e;text-align:center'>No closed trades today</td></tr>",
-        log_lines="<br>".join(logs) if logs else "No logs yet"
+    html = (
+        "<!DOCTYPE html><html><head>"
+        "<meta http-equiv='refresh' content='30'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{{background:#0d1117;color:white;font-family:Arial,sans-serif;"
+        "padding:15px;margin:0}}"
+        "h1{{font-size:18px;margin-bottom:5px}}"
+        ".card{{background:#161b22;border-radius:10px;margin-bottom:15px;overflow:hidden}}"
+        ".ch{{padding:12px 15px;border-bottom:1px solid #21262d;"
+        "display:flex;justify-content:space-between;align-items:center}}"
+        ".green{{color:#3fb950}}.red{{color:#f85149}}.yellow{{color:#e3b341}}"
+        "table{{width:100%;border-collapse:collapse;font-size:12px}}"
+        "th{{padding:8px;text-align:left;color:#8b949e;border-bottom:1px solid #21262d}}"
+        ".debug{{background:#0a0d12;padding:12px;border-radius:8px;font-size:10px;"
+        "font-family:monospace;max-height:200px;overflow-y:auto;color:#8b949e}}"
+        ".sr{{display:flex;gap:8px;margin-bottom:15px}}"
+        ".st{{background:#161b22;border-radius:8px;padding:12px;flex:1;text-align:center}}"
+        ".sv{{font-size:20px;font-weight:bold}}"
+        ".sl{{font-size:10px;color:#8b949e;margin-top:3px}}"
+        "a.nav{{color:#58a6ff;text-decoration:none;font-size:12px;margin-right:8px}}"
+        "</style></head><body>"
+        "<h1>Institutional 0DTE Engine</h1>"
+        "<div style='margin-bottom:10px;font-size:12px;color:#8b949e'>"
+        "Market:<span class='{mc}'> {ms}</span> | "
+        "Scan:{sc}s | "
+        "Bot:<span class='{bc}'> {be}</span> | "
+        "<a class='nav' href='/alpaca-test'>Alpaca</a>"
+        "<a class='nav' href='/telegram-test'>Telegram</a>"
+        "<a class='nav' href='/debug'>Debug</a>"
+        "</div>"
+        "<div class='sr'>"
+        "<div class='st'><div class='sv {pc}'>${pl}</div>"
+        "<div class='sl'>Today P&amp;L</div></div>"
+        "<div class='st'><div class='sv'>{nt}</div>"
+        "<div class='sl'>Trades</div></div>"
+        "<div class='st'><div class='sv green'>{nw}</div>"
+        "<div class='sl'>Wins</div></div>"
+        "<div class='st'><div class='sv red'>{nl}</div>"
+        "<div class='sl'>Losses</div></div>"
+        "</div>"
+        "<div class='card'>"
+        "<div class='ch'><span>Signal Scanner</span>"
+        "<span style='font-size:11px;color:#8b949e'>"
+        "{ns} symbols | ORB=30min | Vol-adjusted</span></div>"
+        "<table><tr>"
+        "<th>Symbol</th><th>Dir</th><th>Price</th><th>Score</th>"
+        "<th>Premium</th><th>Stop/Tgt</th><th>vs VWAP</th><th>Action</th>"
+        "</tr>{sr2}</table></div>"
+        "<div class='card'><div class='ch'><span>Open Trades</span></div>"
+        "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
+        "<th>Size</th><th>Unreal P&amp;L</th><th>Close</th></tr>"
+        "{or_}</table></div>"
+        "<div class='card'><div class='ch'><span>Today Closed</span></div>"
+        "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
+        "<th>Result</th><th>P&amp;L</th></tr>"
+        "{cr}</table></div>"
+        "<div class='card' style='padding:12px'>"
+        "<div style='color:#8b949e;font-size:11px;margin-bottom:6px'>Debug Log</div>"
+        "<div class='debug'>{ll}</div></div>"
+        "</body></html>"
+    ).format(
+        mc=market_color, ms=market_status, sc=secs,
+        bc="green" if bot_enabled else "red",
+        be="ON" if bot_enabled else "PAUSED",
+        pc=pnl_color, pl=round(total_pnl,2),
+        nt=len(closed), nw=wins, nl=losses,
+        ns=len(signals),
+        sr2=signal_rows or (
+            "<tr><td colspan='8' style='padding:15px;color:#8b949e;"
+            "text-align:center'>Waiting for scan...</td></tr>"),
+        or_=open_rows or (
+            "<tr><td colspan='6' style='padding:15px;color:#8b949e;"
+            "text-align:center'>No open trades</td></tr>"),
+        cr=closed_rows or (
+            "<tr><td colspan='5' style='padding:15px;color:#8b949e;"
+            "text-align:center'>No closed trades today</td></tr>"),
+        ll="<br>".join(logs) if logs else "No logs yet"
     )
-
     return html
 
 
@@ -906,7 +968,6 @@ def home():
 
 @app.route("/take")
 def take_trade():
-    """User clicks TAKE on a signal - logs it as an open trade."""
     sym  = request.args.get("sym", "")
     dir_ = request.args.get("dir", "")
     prem = request.args.get("prem", "0")
@@ -916,8 +977,9 @@ def take_trade():
     try:
         db_log_trade(sym, dir_, float(prem), int(con), float(stp), float(tgt))
         log("Trade taken: {} {} prem={}".format(sym, dir_, prem))
-        send_telegram("TRADE TAKEN: {} {} | Entry: ${} | {}x contracts | Stop: ${} | Target: ${}".format(
-            sym, dir_, prem, con, stp, tgt))
+        send_telegram(
+            "TRADE TAKEN: {} {} | Entry: ${} | {}x | Stop: ${} | Target: ${}".format(
+                sym, dir_, prem, con, stp, tgt))
     except Exception as e:
         log("Take trade error: {}".format(e))
     return redirect("/")
@@ -925,7 +987,6 @@ def take_trade():
 
 @app.route("/close")
 def close_trade():
-    """User clicks WIN or LOSS on open trade."""
     trade_id = request.args.get("id", "")
     outcome  = request.args.get("outcome", "")
     exit_p   = request.args.get("exit", "0")
@@ -994,7 +1055,6 @@ def telegram_test():
 # =============================================
 
 init_db()
-
 threading.Thread(target=background_scheduler, daemon=True).start()
 threading.Thread(target=telegram_poller,      daemon=True).start()
 
