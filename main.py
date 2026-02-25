@@ -29,11 +29,17 @@ HEADERS = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET
 }
 
-DATA_URL         = "https://data.alpaca.markets/v2/stocks/{}/bars"
-QUOTE_URL        = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
-CLOCK_URL        = "https://paper-api.alpaca.markets/v2/clock"
-OPTIONS_URL      = "https://data.alpaca.markets/v1beta1/options/contracts"
-OPTIONS_SNAP_URL = "https://data.alpaca.markets/v1beta1/options/snapshots/{}"
+DATA_URL  = "https://data.alpaca.markets/v2/stocks/{}/bars"
+QUOTE_URL = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
+CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
+
+# Tradier - options data source (real ATM 0DTE chains)
+TRADIER_TOKEN   = os.getenv("TRADIER_TOKEN", "").strip()
+TRADIER_URL     = "https://sandbox.tradier.com/v1"
+TRADIER_HEADERS = {
+    "Authorization": "Bearer {}".format(os.getenv("TRADIER_TOKEN", "").strip()),
+    "Accept":        "application/json"
+}
 
 ALERT_FILE = "/tmp/last_alert.json"
 DB_FILE    = "/tmp/trades.db"
@@ -94,9 +100,23 @@ def init_db():
             outcome    TEXT,
             exit_price REAL,
             pnl        REAL,
-            r_mult     REAL
+            r_mult     REAL,
+            grade      TEXT,
+            grade_pts  INTEGER,
+            gap_pct    REAL,
+            gap_dir    TEXT,
+            rs         REAL,
+            entry_hour REAL
         )
     """)
+    # Migrate existing tables that may not have new columns
+    for col, coltype in [("grade","TEXT"), ("grade_pts","INTEGER"),
+                          ("gap_pct","REAL"), ("gap_dir","TEXT"),
+                          ("rs","REAL"), ("entry_hour","REAL")]:
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN {} {}".format(col, coltype))
+        except:
+            pass
     conn.commit()
     conn.close()
 
@@ -122,17 +142,25 @@ def db_log_signal(sig):
         log("DB signal log error: {}".format(e))
 
 
-def db_log_trade(symbol, direction, premium, contracts, stop, target):
+def db_log_trade(symbol, direction, premium, contracts, stop, target,
+                  grade=None, grade_pts=None, gap_pct=None,
+                  gap_dir=None, rs=None, entry_hour=None):
     try:
         conn = sqlite3.connect(DB_FILE)
         c    = conn.cursor()
+        et   = pytz.timezone("America/New_York")
+        if entry_hour is None:
+            now        = datetime.now(et)
+            entry_hour = round(now.hour + now.minute / 60.0, 2)
         c.execute("""
             INSERT INTO trades
-            (ts,symbol,direction,premium,contracts,stop,target,outcome)
-            VALUES (?,?,?,?,?,?,?,?)
+            (ts,symbol,direction,premium,contracts,stop,target,outcome,
+             grade,grade_pts,gap_pct,gap_dir,rs,entry_hour)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
-            symbol, direction, premium, contracts, stop, target, "OPEN"
+            symbol, direction, premium, contracts, stop, target, "OPEN",
+            grade, grade_pts, gap_pct, gap_dir, rs, entry_hour
         ))
         trade_id = c.lastrowid
         conn.commit()
@@ -442,141 +470,327 @@ def volatility_score(daily_bars):
 
 
 # =============================================
+# GAP ANALYSIS
+# =============================================
+
+def get_premarket_gap(daily_bars, intraday_bars):
+    """
+    Gap % = (today open - yesterday close) / yesterday close * 100
+    Uses first intraday bar open vs last daily bar close.
+    Returns (gap_pct, gap_direction) e.g. (1.23, "UP") or (-0.85, "DOWN")
+    """
+    if not daily_bars or not intraday_bars:
+        return 0.0, "FLAT"
+    prev_close  = daily_bars[-1]["c"]
+    today_open  = intraday_bars[0]["o"]
+    if prev_close == 0:
+        return 0.0, "FLAT"
+    gap_pct = round((today_open - prev_close) / prev_close * 100, 3)
+    if gap_pct > 0.3:
+        direction = "UP"
+    elif gap_pct < -0.3:
+        direction = "DOWN"
+    else:
+        direction = "FLAT"
+    return gap_pct, direction
+
+
+# =============================================
+# SPY RELATIVE STRENGTH
+# =============================================
+
+_spy_cache = {"bars": None, "ts": 0}
+
+def get_spy_change():
+    """
+    Returns SPY intraday % change from open.
+    Cached for 60s to avoid repeated API calls during full scan.
+    """
+    global _spy_cache
+    now = time.time()
+    if _spy_cache["bars"] and now - _spy_cache["ts"] < 60:
+        bars = _spy_cache["bars"]
+    else:
+        bars = get_intraday("SPY")
+        _spy_cache = {"bars": bars, "ts": now}
+    if not bars or len(bars) < 2:
+        return 0.0
+    open_price = bars[0]["o"]
+    last_price = bars[-1]["c"]
+    if open_price == 0:
+        return 0.0
+    return round((last_price - open_price) / open_price * 100, 3)
+
+
+def get_symbol_change(intraday_bars):
+    """Intraday % change from open for a symbol."""
+    if not intraday_bars or len(intraday_bars) < 2:
+        return 0.0
+    open_price = intraday_bars[0]["o"]
+    last_price = intraday_bars[-1]["c"]
+    if open_price == 0:
+        return 0.0
+    return round((last_price - open_price) / open_price * 100, 3)
+
+
+def relative_strength(symbol_change, spy_change):
+    """
+    RS = symbol % change - SPY % change.
+    Positive = outperforming SPY (good for CALL).
+    Negative = underperforming SPY (good for PUT).
+    """
+    return round(symbol_change - spy_change, 3)
+
+
+# =============================================
+# CONFLUENCE GRADE
+# =============================================
+
+def confluence_grade(breakout_strength, vol_ratio, vol_mult,
+                     gap_pct, gap_direction, rs, direction,
+                     et_hour):
+    """
+    Scores 0-100 across 5 factors, returns grade A/B/C/D and score.
+
+    Factor weights:
+      - Breakout strength  25pts  (how far past ORB)
+      - Volume confirmation 20pts  (volume vs prior bar)
+      - Gap alignment       20pts  (gap in same direction as trade)
+      - Relative strength   20pts  (outperforming/underperforming SPY)
+      - Time of day         15pts  (earlier = better for 0DTE)
+    """
+    pts = 0
+
+    # 1. Breakout strength (0-25)
+    # breakout_strength is pct as decimal e.g. 0.005 = 0.5%
+    bs_pct = breakout_strength * 100
+    if bs_pct >= 0.5:
+        pts += 25
+    elif bs_pct >= 0.3:
+        pts += 18
+    elif bs_pct >= 0.15:
+        pts += 12
+    else:
+        pts += 6
+
+    # 2. Volume ratio (0-20)
+    if vol_ratio >= 2.0:
+        pts += 20
+    elif vol_ratio >= 1.5:
+        pts += 15
+    elif vol_ratio >= 1.2:
+        pts += 10
+    else:
+        pts += 4
+
+    # 3. Gap alignment (0-20)
+    # Gap in same direction as trade = bullish confluence
+    if direction == "CALL":
+        if gap_direction == "UP" and gap_pct >= 0.5:
+            pts += 20
+        elif gap_direction == "UP":
+            pts += 14
+        elif gap_direction == "FLAT":
+            pts += 8
+        else:
+            pts += 2   # gap against trade direction
+    else:  # PUT
+        if gap_direction == "DOWN" and abs(gap_pct) >= 0.5:
+            pts += 20
+        elif gap_direction == "DOWN":
+            pts += 14
+        elif gap_direction == "FLAT":
+            pts += 8
+        else:
+            pts += 2
+
+    # 4. Relative strength (0-20)
+    if direction == "CALL":
+        if rs >= 0.3:
+            pts += 20
+        elif rs >= 0.1:
+            pts += 14
+        elif rs >= -0.1:
+            pts += 8
+        else:
+            pts += 2   # underperforming SPY on a CALL = bad
+    else:  # PUT
+        if rs <= -0.3:
+            pts += 20
+        elif rs <= -0.1:
+            pts += 14
+        elif rs <= 0.1:
+            pts += 8
+        else:
+            pts += 2
+
+    # 5. Time of day (0-15)
+    # Best window: 9:30-11:00 AM ET (momentum window)
+    # Decent: 11:00-1:00 PM
+    # Risky: 1:00-2:00 PM
+    # Late: 2:00+ PM (theta decay accelerates)
+    if et_hour < 11:
+        pts += 15
+    elif et_hour < 13:
+        pts += 10
+    elif et_hour < 14:
+        pts += 5
+    else:
+        pts += 1   # after 2pm, almost no value
+
+    # Apply vol regime modifier
+    pts = int(pts * vol_mult)
+    pts = min(pts, 100)
+
+    if pts >= 75:
+        grade = "A"
+        color = "#3fb950"   # green
+    elif pts >= 55:
+        grade = "B"
+        color = "#e3b341"   # yellow
+    elif pts >= 35:
+        grade = "C"
+        color = "#f0883e"   # orange
+    else:
+        grade = "D"
+        color = "#f85149"   # red
+
+    return grade, pts, color
+
+
+# =============================================
 # OPTIONS
 # =============================================
 
 def get_liquid_option(symbol, direction, underlying_price=None):
     """
-    Fetch a 0DTE ATM option.
-    Uses snapshots endpoint (no expiration_date param - not supported).
-    Filters by strike proximity to underlying price as primary filter.
-    Falls back to estimating premium from underlying price if API returns
-    no near-strike data.
+    Fetch a real 0DTE ATM option via Tradier API.
+    Steps:
+      1. Get today expiration date from Tradier expirations endpoint
+      2. Fetch full options chain for that expiration
+      3. Filter to ATM strikes (within 2% of underlying)
+      4. Select best by delta closest to 0.40
+    Returns (premium, strike, is_live)
     """
     option_type = "call" if direction == "CALL" else "put"
     et          = pytz.timezone("America/New_York")
     today_str   = datetime.now(et).strftime("%Y-%m-%d")
 
-    # ---- Strategy 1: Snapshots with pagination to find ATM strikes ----
+    if not TRADIER_TOKEN:
+        log("TRADIER_TOKEN not set - cannot fetch options")
+        return None, None, False
+
     try:
-        all_snaps = {}
-        page_token = None
-        pages = 0
-        while pages < 5:  # max 5 pages to avoid rate limiting
-            params = {"feed": "indicative", "type": option_type, "limit": 200}
-            if page_token:
-                params["page_token"] = page_token
-            r = requests.get(OPTIONS_SNAP_URL.format(symbol),
-                             headers=HEADERS, params=params, timeout=10)
-            pages += 1
-            if r.status_code != 200:
-                log("Options snap {} HTTP {}: {}".format(
-                    symbol, r.status_code, r.text[:100]))
-                break
-            data       = r.json()
-            snaps      = data.get("snapshots", {})
-            all_snaps.update(snaps)
-            page_token = data.get("next_page_token")
+        # Step 1: Get available expirations and confirm today is 0DTE
+        exp_url = "{}/markets/options/expirations".format(TRADIER_URL)
+        r = requests.get(exp_url, headers=TRADIER_HEADERS,
+                         params={"symbol": symbol, "includeAllRoots": "true"},
+                         timeout=10)
+        log("Tradier expirations {}: HTTP {}".format(symbol, r.status_code))
+        if r.status_code != 200:
+            log("  Expirations error: {}".format(r.text[:150]))
+            return None, None, False
 
-            # Check if we have any near-ATM strikes yet
-            if underlying_price and all_snaps:
-                near = [s for s in all_snaps.keys()
-                        if abs(int(s[-8:]) / 1000 - underlying_price)
-                        / underlying_price < 0.03]
-                if near:
-                    break  # found ATM range, stop paginating
+        expirations = r.json().get("expirations", {}) or {}
+        exp_dates   = expirations.get("date", [])
+        if isinstance(exp_dates, str):
+            exp_dates = [exp_dates]
 
-            if not page_token:
-                break
+        # Use today if available, else nearest expiration
+        if today_str in exp_dates:
+            target_exp = today_str
+            log("  0DTE expiration found: {}".format(target_exp))
+        elif exp_dates:
+            target_exp = exp_dates[0]
+            log("  No 0DTE today, using nearest: {}".format(target_exp))
+        else:
+            log("  No expirations available for {}".format(symbol))
+            return None, None, False
 
-        log("Options snap {}: {} total contracts across {} pages".format(
-            symbol, len(all_snaps), pages))
+        # Step 2: Fetch options chain for target expiration
+        chain_url = "{}/markets/options/chains".format(TRADIER_URL)
+        r2 = requests.get(chain_url, headers=TRADIER_HEADERS,
+                          params={"symbol":     symbol,
+                                  "expiration": target_exp,
+                                  "greeks":     "true"},
+                          timeout=10)
+        log("Tradier chain {} {}: HTTP {}".format(symbol, target_exp, r2.status_code))
+        if r2.status_code != 200:
+            log("  Chain error: {}".format(r2.text[:150]))
+            return None, None, False
 
+        options = r2.json().get("options", {}) or {}
+        chain   = options.get("option", [])
+        if isinstance(chain, dict):
+            chain = [chain]
+
+        log("  Chain returned {} contracts".format(len(chain)))
+
+        # Step 3: Filter to correct type and ATM strikes
         candidates = []
-        for sym, snap in all_snaps.items():
-            # Parse strike from OCC symbol
-            try:
-                strike = int(sym[-8:]) / 1000
-            except:
+        for opt in chain:
+            if opt.get("option_type", "").lower() != option_type[0]:
+                continue  # wrong type
+
+            strike = float(opt.get("strike", 0))
+            if strike == 0:
                 continue
 
-            # Primary filter: strike within 2% of underlying
+            # Strike within 2% of underlying
             if underlying_price:
                 pct_diff = abs(strike - underlying_price) / underlying_price
                 if pct_diff > 0.02:
                     continue
 
-            # Check expiration date in symbol (chars 6-12 = YYMMDD)
-            try:
-                exp_str = "20" + sym[len(symbol):len(symbol)+6]
-                if exp_str != today_str.replace("-", ""):
-                    # Not today - skip unless we have nothing else
-                    pass  # will still include but mark
-            except:
-                pass
-
-            # Get mid price
-            quote = snap.get("latestQuote") or {}
-            trade = snap.get("latestTrade") or {}
-            bid   = float(quote.get("bp") or 0)
-            ask   = float(quote.get("ap") or 0)
-            last  = float(trade.get("p") or 0)
+            # Get mid price from bid/ask
+            bid = float(opt.get("bid") or 0)
+            ask = float(opt.get("ask") or 0)
             if bid > 0 and ask > 0:
-                price = round((bid + ask) / 2, 2)
+                mid = round((bid + ask) / 2, 2)
             elif ask > 0:
-                price = ask
-            elif last > 0:
-                price = last
+                mid = ask
             else:
                 continue
 
-            # Filter: realistic 0DTE premium range
-            if not (0.05 <= price <= 25.00):
+            # Realistic 0DTE premium range
+            if not (0.05 <= mid <= 30.00):
                 continue
 
-            greeks = snap.get("greeks") or {}
-            delta  = abs(greeks.get("delta", 0))
+            greeks = opt.get("greeks") or {}
+            delta  = abs(float(greeks.get("delta") or 0))
+            iv     = float(greeks.get("mid_iv") or 0)
+            volume = int(opt.get("volume") or 0)
+            oi     = int(opt.get("open_interest") or 0)
 
             candidates.append({
-                "sym":    sym,
-                "price":  price,
                 "strike": strike,
+                "price":  mid,
+                "bid":    bid,
+                "ask":    ask,
                 "delta":  delta,
+                "iv":     iv,
+                "volume": volume,
+                "oi":     oi,
             })
 
-        log("  {} near-ATM candidates for {} {}".format(
+        log("  {} ATM candidates for {} {}".format(
             len(candidates), symbol, option_type))
 
-        if candidates:
-            # Sort by closest strike to underlying (ATM)
-            if underlying_price:
-                candidates.sort(
-                    key=lambda x: abs(x["strike"] - underlying_price))
-            else:
-                candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
-            best = candidates[0]
-            log("  Selected: {} strike={} delta={:.3f} price={}".format(
-                best["sym"], best["strike"], best["delta"], best["price"]))
-            return best["price"], best["strike"]
+        if not candidates:
+            log("  No ATM candidates found - check strike range")
+            return None, None, False
+
+        # Step 4: Sort by closest delta to 0.40 (ATM sweet spot for 0DTE)
+        candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
+        best = candidates[0]
+        log("  Selected: strike={} delta={:.3f} bid={} ask={} mid={} vol={} oi={}".format(
+            best["strike"], best["delta"], best["bid"], best["ask"],
+            best["price"], best["volume"], best["oi"]))
+        return best["price"], best["strike"], True
 
     except Exception as e:
-        log("Options snap exception {}: {}".format(symbol, e))
-
-    # ---- Strategy 2: Estimate from underlying price ----
-    # When options API returns no usable data, estimate a realistic ATM premium
-    # based on typical 0DTE IV for the underlying. This is a fallback only.
-    if underlying_price:
-        log("  Using estimated premium for {} (no live option data)".format(symbol))
-        # Typical 0DTE ATM premium ~ 0.3-0.5% of underlying price
-        # Based on ~15% IV annualized, 1-day theta
-        est_premium = round(underlying_price * 0.004, 2)
-        est_premium = max(0.50, min(est_premium, 15.00))
-        est_strike  = round(underlying_price / 1.0) * 1  # nearest dollar
-        log("  Estimated: strike={} premium={}".format(est_strike, est_premium))
-        return est_premium, est_strike
-
-    log("  No option data for {} {}".format(symbol, direction))
-    return None, None
+        log("Tradier exception {}: {}".format(symbol, e))
+        return None, None, False
 
 
 # =============================================
@@ -605,6 +819,9 @@ def scan_all_symbols():
             "symbol":    symbol,
             "direction": None,
             "score":     0,
+            "grade":     None,
+            "grade_pts": 0,
+            "grade_color": "#8b949e",
             "price":     None,
             "premium":   None,
             "strike":    None,
@@ -618,6 +835,11 @@ def scan_all_symbols():
             "vs_orb":    None,
             "vs_vwap":   None,
             "vol_ratio": None,
+            "gap_pct":   None,
+            "gap_dir":   None,
+            "rs":        None,
+            "spy_chg":   None,
+            "late_entry": False,
         }
 
         intraday = get_intraday(symbol)
@@ -655,11 +877,30 @@ def scan_all_symbols():
 
         orb_range = orb_high - orb_low
 
+        # Gap analysis
+        gap_pct, gap_dir = get_premarket_gap(daily, intraday)
+
+        # Relative strength vs SPY
+        spy_chg    = get_spy_change()
+        sym_chg    = get_symbol_change(intraday)
+        rs         = relative_strength(sym_chg, spy_chg)
+
+        # Time of day
+        et         = pytz.timezone("America/New_York")
+        et_now     = datetime.now(et)
+        et_hour    = et_now.hour + et_now.minute / 60.0
+        late_entry = et_hour >= 14.0
+
         result["price"]          = round(price, 2)
         result["vwap"]           = round(vwap, 2)
         result["orb_high"]       = round(orb_high, 2)
         result["orb_low"]        = round(orb_low, 2)
         result["vol_mult"]       = round(vol_mult, 2)
+        result["gap_pct"]        = gap_pct
+        result["gap_dir"]        = gap_dir
+        result["rs"]             = rs
+        result["spy_chg"]        = spy_chg
+        result["late_entry"]     = late_entry
         # Underlying price targets based on ORB range projection
         if orb_range > 0:
             result["und_call_t1"]   = round(orb_high + orb_range, 2)
@@ -711,24 +952,34 @@ def scan_all_symbols():
         vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
         score     = (breakout_strength * 100 + vol_ratio) * vol_mult
 
-        premium, strike = get_liquid_option(symbol, direction, price)
+        # Confluence grade
+        grade, grade_pts, grade_color = confluence_grade(
+            breakout_strength, vol_ratio, vol_mult,
+            gap_pct, gap_dir, rs, direction, et_hour)
 
-        if premium:
+        premium, strike, is_live = get_liquid_option(symbol, direction, price)
+
+        if premium and is_live:
             contracts, stop, target = calculate_contracts(premium, score)
             result["premium"]   = round(premium, 2)
             result["strike"]    = strike
             result["contracts"] = contracts
             result["stop"]      = stop
             result["target"]    = target
+            result["is_live"]   = True
             result["status"]    = "SIGNAL"
         else:
-            result["status"] = "SIGNAL (no options)"
+            result["is_live"]   = False
+            result["status"]    = "SIGNAL (no options)"
 
-        result["direction"] = direction
-        result["score"]     = round(score, 2)
+        result["direction"]   = direction
+        result["score"]       = round(score, 2)
+        result["grade"]       = grade
+        result["grade_pts"]   = grade_pts
+        result["grade_color"] = grade_color
         results.append(result)
-        log("{}: {} {} score={:.2f} vol_mult={:.2f}".format(
-            symbol, result["status"], direction, score, vol_mult))
+        log("{}: {} {} grade={} ({}) score={:.2f}".format(
+            symbol, result["status"], direction, grade, grade_pts, score))
 
     # Sort: SIGNAL first, then WATCHING, then rest - all by score desc
     def sort_key(r):
@@ -890,38 +1141,73 @@ def render_dashboard():
                     s.get("und_put_t1","-"),
                     s.get("und_put_t2","-"),
                     s.get("und_put_stop","-"))
+
+            grade       = s.get("grade") or "-"
+            grade_pts   = s.get("grade_pts") or 0
+            grade_color = s.get("grade_color") or "#8b949e"
+            gap_pct     = s.get("gap_pct") or 0
+            gap_dir     = s.get("gap_dir") or "-"
+            rs          = s.get("rs") or 0
+            late        = s.get("late_entry", False)
+
+            # Gap display
+            gap_sign  = "+" if gap_pct >= 0 else ""
+            gap_color = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
+            rs_color  = "#3fb950" if rs >= 0 else "#f85149"
+
+            # Late entry warning
+            late_badge = ("<span style='background:#9e6a03;color:white;padding:1px 4px;"
+                          "border-radius:3px;font-size:9px;margin-left:4px'>LATE</span>"
+                          if late else "")
+
             signal_rows += (
                 "<tr style='border-bottom:1px solid #21262d;background:#0d2818'>"
-                "<td style='padding:8px'><b>{sym}</b></td>"
+                # Symbol
+                "<td style='padding:8px'><b>{sym}</b>{late}</td>"
+                # Direction
                 "<td style='color:{dc};padding:8px'><b>{d}</b></td>"
-                # Current price + underlying targets stacked
+                # Grade (replaces raw score)
+                "<td style='padding:8px;text-align:center'>"
+                "<div style='font-size:22px;font-weight:bold;color:{gc}'>{grade}</div>"
+                "<div style='font-size:10px;color:#8b949e'>{gpts}pts</div>"
+                "</td>"
+                # Price + underlying targets
                 "<td style='padding:8px'>"
                 "<div style='font-size:13px'><b>${price}</b></div>"
                 "<div style='font-size:10px;color:#3fb950;margin-top:2px'>{utgt}</div>"
                 "</td>"
-                "<td style='padding:8px'><b>{score}</b></td>"
-                # Option premium + option stop/target stacked
+                # Gap + RS
+                "<td style='padding:8px;font-size:11px'>"
+                "<div>Gap: <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
+                "<div>RS: <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
+                "</td>"
+                # Premium
                 "<td style='padding:8px'>"
-                "<div style='font-size:13px'>${prem}</div>"
+                "<div style='font-size:13px'>${prem} "
+                "<span style='background:#238636;color:white;padding:1px 4px;"
+                "border-radius:3px;font-size:9px'>LIVE</span></div>"
                 "<div style='font-size:10px;color:#8b949e;margin-top:2px'>"
                 "Stop:${stp} Tgt:${tgt}</div>"
                 "</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
-                "VWAP:${vwap}</td>"
+                # Action
                 "<td style='padding:8px'>"
                 "<span style='background:#1f6feb;color:white;padding:2px 6px;"
                 "border-radius:4px;font-size:10px'>SIGNAL</span>&nbsp;"
                 "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
-                "&stp={stp}&tgt={tgt}' "
+                "&stp={stp}&tgt={tgt}&grade={grade}&gpts={gpts}"
+                "&gap={gpct}&gdir={gdir}&rs={rs:.2f}' "
                 "style='background:#238636;color:white;padding:4px 8px;"
                 "border-radius:5px;text-decoration:none;font-size:11px'>TAKE</a>"
                 "</td></tr>"
             ).format(
-                sym=sym, dc=dcolor, d=d, price=price, score=score,
-                utgt=und_tgt_str,
+                sym=sym, late=late_badge, dc=dcolor, d=d,
+                grade=grade, gpts=grade_pts, gc=grade_color,
+                price=price, utgt=und_tgt_str,
+                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
+                gdir=gap_dir,
+                rsc=rs_color, rs=rs,
                 prem=s.get("premium","-"),
                 stp=s.get("stop","-"), tgt=s.get("target","-"),
-                vwap=s.get("vwap","-"),
                 con=s.get("contracts","1")
             )
 
@@ -1043,6 +1329,7 @@ def render_dashboard():
         "Market:<span class='{mc}'> {ms}</span> | "
         "Scan:{sc}s | "
         "Bot:<span class='{bc}'> {be}</span> | "
+        "<a class='nav' href='/stats'>Stats</a>"
         "<a class='nav' href='/alpaca-test'>Alpaca</a>"
         "<a class='nav' href='/telegram-test'>Telegram</a>"
         "<a class='nav' href='/debug'>Debug</a>"
@@ -1062,8 +1349,9 @@ def render_dashboard():
         "<span style='font-size:11px;color:#8b949e'>"
         "{ns} symbols | ORB=30min | Vol-adjusted</span></div>"
         "<table><tr>"
-        "<th>Symbol</th><th>Dir</th><th>Price</th><th>Score</th>"
-        "<th>Premium</th><th>Stop/Tgt</th><th>vs VWAP</th><th>Action</th>"
+        "<th>Symbol</th><th>Dir</th><th style='text-align:center'>Grade</th>"
+        "<th>Price / Targets</th><th>Gap / RS</th>"
+        "<th>Premium</th><th>Action</th>"
         "</tr>{sr2}</table></div>"
         "<div class='card'><div class='ch'><span>Open Trades</span></div>"
         "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
@@ -1109,18 +1397,35 @@ def home():
 
 @app.route("/take")
 def take_trade():
-    sym  = request.args.get("sym", "")
-    dir_ = request.args.get("dir", "")
-    prem = request.args.get("prem", "0")
-    con  = request.args.get("con", "1")
-    stp  = request.args.get("stp", "0")
-    tgt  = request.args.get("tgt", "0")
+    sym   = request.args.get("sym", "")
+    dir_  = request.args.get("dir", "")
+    prem  = request.args.get("prem", "0")
+    con   = request.args.get("con", "1")
+    stp   = request.args.get("stp", "0")
+    tgt   = request.args.get("tgt", "0")
+    grade = request.args.get("grade", None)
+    gpts  = request.args.get("gpts", None)
+    gap   = request.args.get("gap", None)
+    gdir  = request.args.get("gdir", None)
+    rs    = request.args.get("rs", None)
     try:
-        db_log_trade(sym, dir_, float(prem), int(con), float(stp), float(tgt))
-        log("Trade taken: {} {} prem={}".format(sym, dir_, prem))
+        db_log_trade(
+            sym, dir_, float(prem), int(con), float(stp), float(tgt),
+            grade=grade,
+            grade_pts=int(gpts) if gpts else None,
+            gap_pct=float(gap) if gap else None,
+            gap_dir=gdir,
+            rs=float(rs) if rs else None
+        )
+        log("Trade taken: {} {} {} grade={} prem={}".format(
+            sym, dir_, grade, gpts, prem))
         send_telegram(
-            "TRADE TAKEN: {} {} | Entry: ${} | {}x | Stop: ${} | Target: ${}".format(
-                sym, dir_, prem, con, stp, tgt))
+            "TRADE TAKEN\n{} {} | Grade: {} ({}pts)\n"
+            "Entry: ${} | {}x | Stop: ${} | Target: ${}\n"
+            "Gap: {}% {} | RS vs SPY: {}%".format(
+                sym, dir_, grade or "?", gpts or "?",
+                prem, con, stp, tgt,
+                gap or "?", gdir or "?", rs or "?"))
     except Exception as e:
         log("Take trade error: {}".format(e))
     return redirect("/")
@@ -1138,6 +1443,196 @@ def close_trade():
     except Exception as e:
         log("Close trade error: {}".format(e))
     return redirect("/")
+
+
+@app.route("/stats")
+def stats_page():
+    """Win rate breakdown by symbol, grade, hour, direction."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("""
+            SELECT symbol, direction, outcome, pnl, r_mult,
+                   grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts
+            FROM trades WHERE outcome != 'OPEN'
+            ORDER BY ts DESC
+        """)
+        rows = c.fetchall()
+        conn.close()
+    except Exception as e:
+        return "DB error: {}".format(e)
+
+    trades = []
+    for r in rows:
+        trades.append({
+            "symbol": r[0], "direction": r[1], "outcome": r[2],
+            "pnl": r[3] or 0, "r_mult": r[4] or 0,
+            "grade": r[5] or "?", "grade_pts": r[6] or 0,
+            "gap_pct": r[7] or 0, "gap_dir": r[8] or "?",
+            "rs": r[9] or 0, "entry_hour": r[10] or 0, "ts": r[11]
+        })
+
+    if not trades:
+        return ("<html><body style='background:#0d1117;color:white;"
+                "font-family:Arial;padding:20px'>"
+                "<h2>No closed trades yet</h2>"
+                "<a href='/' style='color:#58a6ff'>Back to dashboard</a>"
+                "</body></html>")
+
+    total  = len(trades)
+    wins   = len([t for t in trades if t["outcome"] == "WIN"])
+    losses = len([t for t in trades if t["outcome"] == "LOSS"])
+    wr     = round(wins / total * 100, 1) if total else 0
+    total_pnl = round(sum(t["pnl"] for t in trades), 2)
+    avg_r  = round(sum(t["r_mult"] for t in trades) / total, 2) if total else 0
+
+    def stat_rows(group_key, label):
+        groups = {}
+        for t in trades:
+            k = str(t.get(group_key, "?"))
+            if k not in groups:
+                groups[k] = []
+            groups[k].append(t)
+        rows_html = ""
+        for k in sorted(groups.keys()):
+            g   = groups[k]
+            gw  = len([x for x in g if x["outcome"] == "WIN"])
+            gl  = len(g) - gw
+            gwr = round(gw / len(g) * 100, 1)
+            gpnl = round(sum(x["pnl"] for x in g), 2)
+            pc  = "#3fb950" if gpnl >= 0 else "#f85149"
+            wrc = "#3fb950" if gwr >= 55 else "#e3b341" if gwr >= 45 else "#f85149"
+            rows_html += (
+                "<tr style='border-bottom:1px solid #21262d'>"
+                "<td style='padding:8px'>{}</td>"
+                "<td style='padding:8px'>{}</td>"
+                "<td style='padding:8px;color:{}'>{:.0f}%</td>"
+                "<td style='padding:8px'>{}/{}</td>"
+                "<td style='padding:8px;color:{}'>${}</td>"
+                "</tr>"
+            ).format(k, len(g), wrc, gwr, gw, gl, pc, gpnl)
+        return rows_html
+
+    def hour_label(h):
+        if h < 10:   return "9:30-10:00"
+        elif h < 11: return "10:00-11:00"
+        elif h < 12: return "11:00-12:00"
+        elif h < 13: return "12:00-1:00"
+        elif h < 14: return "1:00-2:00"
+        else:        return "2:00+ LATE"
+
+    # Group by hour bucket
+    hour_groups = {}
+    for t in trades:
+        k = hour_label(t["entry_hour"])
+        if k not in hour_groups: hour_groups[k] = []
+        hour_groups[k].append(t)
+
+    hour_rows = ""
+    for k in ["9:30-10:00","10:00-11:00","11:00-12:00",
+               "12:00-1:00","1:00-2:00","2:00+ LATE"]:
+        if k not in hour_groups: continue
+        g   = hour_groups[k]
+        gw  = len([x for x in g if x["outcome"] == "WIN"])
+        gwr = round(gw / len(g) * 100, 1)
+        gpnl = round(sum(x["pnl"] for x in g), 2)
+        pc  = "#3fb950" if gpnl >= 0 else "#f85149"
+        wrc = "#3fb950" if gwr >= 55 else "#e3b341" if gwr >= 45 else "#f85149"
+        hour_rows += (
+            "<tr style='border-bottom:1px solid #21262d'>"
+            "<td style='padding:8px'>{}</td>"
+            "<td style='padding:8px'>{}</td>"
+            "<td style='padding:8px;color:{}'>{:.0f}%</td>"
+            "<td style='padding:8px;color:{}'>${}</td>"
+            "</tr>"
+        ).format(k, len(g), wrc, gwr, pc, gpnl)
+
+    html = """<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<style>
+body{{background:#0d1117;color:white;font-family:Arial,sans-serif;padding:15px;margin:0}}
+h2{{font-size:16px;margin:20px 0 8px 0;color:#58a6ff}}
+.card{{background:#161b22;border-radius:10px;margin-bottom:15px;overflow:hidden}}
+.ch{{padding:10px 15px;border-bottom:1px solid #21262d;font-size:13px;font-weight:bold}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+th{{padding:8px;text-align:left;color:#8b949e;border-bottom:1px solid #21262d}}
+.sr{{display:flex;gap:8px;margin-bottom:15px;flex-wrap:wrap}}
+.st{{background:#161b22;border-radius:8px;padding:12px;flex:1;min-width:80px;text-align:center}}
+.sv{{font-size:20px;font-weight:bold}}
+.sl{{font-size:10px;color:#8b949e;margin-top:3px}}
+a.nav{{color:#58a6ff;text-decoration:none;font-size:12px}}
+</style></head><body>
+<div style='margin-bottom:12px'>
+<a class='nav' href='/'>&#8592; Dashboard</a>
+</div>
+<h1 style='font-size:18px;margin-bottom:5px'>Trade Statistics</h1>
+<div style='font-size:12px;color:#8b949e;margin-bottom:15px'>{total} closed trades</div>
+
+<div class='sr'>
+<div class='st'><div class='sv {wr_c}'>{wr}%</div><div class='sl'>Win Rate</div></div>
+<div class='st'><div class='sv'>{total}</div><div class='sl'>Trades</div></div>
+<div class='st'><div class='sv' style='color:#3fb950'>{wins}</div><div class='sl'>Wins</div></div>
+<div class='st'><div class='sv' style='color:#f85149'>{losses}</div><div class='sl'>Losses</div></div>
+<div class='st'><div class='sv {pnl_c}'>${total_pnl}</div><div class='sl'>Total P&L</div></div>
+<div class='st'><div class='sv'>{avg_r}R</div><div class='sl'>Avg R</div></div>
+</div>
+
+<div class='card'>
+<div class='ch'>By Symbol</div>
+<table><tr><th>Symbol</th><th>Trades</th><th>Win%</th><th>W/L</th><th>P&L</th></tr>
+{sym_rows}</table></div>
+
+<div class='card'>
+<div class='ch'>By Grade</div>
+<table><tr><th>Grade</th><th>Trades</th><th>Win%</th><th>W/L</th><th>P&L</th></tr>
+{grade_rows}</table></div>
+
+<div class='card'>
+<div class='ch'>By Direction</div>
+<table><tr><th>Direction</th><th>Trades</th><th>Win%</th><th>W/L</th><th>P&L</th></tr>
+{dir_rows}</table></div>
+
+<div class='card'>
+<div class='ch'>By Time of Day</div>
+<table><tr><th>Window</th><th>Trades</th><th>Win%</th><th>P&L</th></tr>
+{hour_rows}</table></div>
+
+<div class='card'>
+<div class='ch'>Recent Trades</div>
+<table><tr><th>Symbol</th><th>Dir</th><th>Grade</th><th>Gap</th><th>RS</th><th>Result</th><th>P&L</th></tr>
+{recent_rows}</table></div>
+
+</body></html>""".format(
+        total=total, wins=wins, losses=losses, wr=wr,
+        wr_c="green" if wr >= 50 else "red",
+        total_pnl=total_pnl,
+        pnl_c="color:#3fb950" if total_pnl >= 0 else "color:#f85149",
+        avg_r=avg_r,
+        sym_rows=stat_rows("symbol", "Symbol"),
+        grade_rows=stat_rows("grade", "Grade"),
+        dir_rows=stat_rows("direction", "Direction"),
+        hour_rows=hour_rows,
+        recent_rows="".join([
+            "<tr style='border-bottom:1px solid #21262d'>"
+            "<td style='padding:8px'>{}</td>"
+            "<td style='padding:8px'>{}</td>"
+            "<td style='padding:8px;font-weight:bold;color:{}'>{}</td>"
+            "<td style='padding:8px;font-size:11px;color:{}'>{:+.2f}%</td>"
+            "<td style='padding:8px;font-size:11px;color:{}'>{:+.2f}%</td>"
+            "<td style='padding:8px;color:{}'>{}</td>"
+            "<td style='padding:8px;color:{}'>${}</td>"
+            "</tr>".format(
+                t["symbol"], t["direction"],
+                "#3fb950" if t["grade"]=="A" else "#e3b341" if t["grade"]=="B" else "#f0883e" if t["grade"]=="C" else "#8b949e",
+                t["grade"],
+                "#3fb950" if t["gap_pct"]>=0 else "#f85149", t["gap_pct"],
+                "#3fb950" if t["rs"]>=0 else "#f85149", t["rs"],
+                "#3fb950" if t["outcome"]=="WIN" else "#f85149", t["outcome"],
+                "#3fb950" if t["pnl"]>=0 else "#f85149", round(t["pnl"],2)
+            ) for t in trades[:20]
+        ])
+    )
+    return html
 
 
 @app.route("/debug")
@@ -1162,21 +1657,42 @@ def alpaca_test():
                                 "body": r.json() if r.status_code==200 else r.text[:300]}
     except Exception as e:
         results["spy_bars"] = {"error": str(e)}
+    return jsonify(results)
+
+
+@app.route("/tradier-test")
+def tradier_test():
+    """Test Tradier options data for SPY - shows live chain."""
+    results = {"token_set": bool(TRADIER_TOKEN)}
+    et        = pytz.timezone("America/New_York")
+    today_str = datetime.now(et).strftime("%Y-%m-%d")
     try:
-        r = requests.get(OPTIONS_URL, headers=HEADERS,
-                         params={"underlying_symbols":"SPY","type":"call",
-                                 "status":"active","limit":3}, timeout=10)
-        results["options_contracts"] = {"status": r.status_code,
-                                         "body": r.json() if r.status_code==200 else r.text[:300]}
+        r = requests.get("{}/markets/options/expirations".format(TRADIER_URL),
+                         headers=TRADIER_HEADERS,
+                         params={"symbol": "SPY", "includeAllRoots": "true"},
+                         timeout=10)
+        results["expirations"] = {"status": r.status_code,
+                                   "body": r.json() if r.status_code==200 else r.text[:300]}
     except Exception as e:
-        results["options_contracts"] = {"error": str(e)}
+        results["expirations"] = {"error": str(e)}
     try:
-        r = requests.get(OPTIONS_SNAP_URL.format("SPY"), headers=HEADERS,
-                         params={"type":"call","limit":3}, timeout=10)
-        results["options_snapshots"] = {"status": r.status_code,
-                                         "body": r.json() if r.status_code==200 else r.text[:500]}
+        r2 = requests.get("{}/markets/options/chains".format(TRADIER_URL),
+                          headers=TRADIER_HEADERS,
+                          params={"symbol": "SPY", "expiration": today_str,
+                                  "greeks": "true"},
+                          timeout=10)
+        body = r2.json() if r2.status_code == 200 else r2.text[:500]
+        # Trim chain to first 5 ATM contracts only for readability
+        if r2.status_code == 200:
+            chain = (body.get("options") or {}).get("option", [])
+            if isinstance(chain, dict):
+                chain = [chain]
+            results["chain_total"]  = len(chain)
+            results["chain_sample"] = chain[:5]
+        else:
+            results["chain_error"]  = body
     except Exception as e:
-        results["options_snapshots"] = {"error": str(e)}
+        results["chain"] = {"error": str(e)}
     return jsonify(results)
 
 
