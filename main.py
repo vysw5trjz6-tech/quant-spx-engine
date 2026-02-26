@@ -901,14 +901,29 @@ def scan_all_symbols():
         result["rs"]             = rs
         result["spy_chg"]        = spy_chg
         result["late_entry"]     = late_entry
-        # Underlying price targets based on ORB range projection
+        # Underlying price targets
+        # CALL: targets above current price, stop below ORB high
+        # PUT:  targets below current price, stop above ORB low
+        # T1 = 1x ORB range from current price
+        # T2 = 2x ORB range from current price
+        # Stop = 0.5x ORB range against trade direction
         if orb_range > 0:
-            result["und_call_t1"]   = round(orb_high + orb_range, 2)
-            result["und_call_t2"]   = round(orb_high + orb_range * 2, 2)
-            result["und_call_stop"] = round(orb_high - orb_range * 0.5, 2)
-            result["und_put_t1"]    = round(orb_low  - orb_range, 2)
-            result["und_put_t2"]    = round(orb_low  - orb_range * 2, 2)
-            result["und_put_stop"]  = round(orb_low  + orb_range * 0.5, 2)
+            result["und_call_t1"]   = round(price + orb_range, 2)
+            result["und_call_t2"]   = round(price + orb_range * 2, 2)
+            result["und_call_stop"] = round(price - orb_range * 0.5, 2)
+            result["und_put_t1"]    = round(price - orb_range, 2)
+            result["und_put_t2"]    = round(price - orb_range * 2, 2)
+            result["und_put_stop"]  = round(price + orb_range * 0.5, 2)
+            # Probability estimates based on distance vs average daily range
+            avg_range = statistics.mean([b["h"] - b["l"] for b in daily[-10:]])
+            if avg_range > 0:
+                result["t1_prob"] = round(max(20, min(85,
+                    100 - (orb_range / avg_range * 100))), 0)
+                result["t2_prob"] = round(max(10, min(60,
+                    100 - (orb_range * 2 / avg_range * 100))), 0)
+            else:
+                result["t1_prob"] = 50
+                result["t2_prob"] = 25
 
         # Determine direction and breakout strength
         direction         = None
@@ -1114,21 +1129,24 @@ def render_dashboard():
     total_pnl   = sum(t["pnl"] or 0 for t in closed)
     wins        = len([t for t in closed if t["outcome"] == "WIN"])
     losses      = len([t for t in closed if t["outcome"] == "LOSS"])
+    win_rate    = round(wins / len(closed) * 100) if closed else 0
 
     is_open       = market_open()
-    market_color  = "green" if is_open else "red"
+    market_color  = "#3fb950" if is_open else "#f85149"
     market_status = "OPEN" if is_open else "CLOSED"
-    pnl_color     = "green" if total_pnl >= 0 else "red"
+    pnl_color     = "#3fb950" if total_pnl >= 0 else "#f85149"
 
+    # - Signal rows -
     signal_rows = ""
+    active_count = len([s for s in signals if s.get("status") in ("SIGNAL","SIGNAL (no options)")])
+
     for s in signals:
         status = s.get("status", "")
         sym    = s["symbol"]
         price  = s.get("price", "-")
         d      = s.get("direction") or ""
-        dcolor = "#3fb950" if d == "CALL" else "#f85149"
+        dc     = "#3fb950" if d == "CALL" else "#f85149"
 
-        # Shared computed values
         grade       = s.get("grade") or "-"
         grade_pts   = s.get("grade_pts") or 0
         grade_color = s.get("grade_color") or "#8b949e"
@@ -1136,277 +1154,357 @@ def render_dashboard():
         gap_dir     = s.get("gap_dir") or "FLAT"
         rs          = s.get("rs") or 0
         late        = s.get("late_entry", False)
-        gap_color   = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
-        rs_color    = "#3fb950" if rs >= 0 else "#f85149"
-        gap_sign    = "+" if gap_pct >= 0 else ""
-        late_badge  = (" <span style='background:#9e6a03;color:white;padding:1px 4px;"
-                       "border-radius:3px;font-size:9px'>LATE</span>" if late else "")
+        t1_prob     = s.get("t1_prob", 50)
+        t2_prob     = s.get("t2_prob", 25)
 
-        if status == "SIGNAL":
+        gap_color  = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
+        rs_color   = "#3fb950" if rs >= 0 else "#f85149"
+        gap_sign   = "+" if gap_pct >= 0 else ""
+
+        if status in ("SIGNAL", "SIGNAL (no options)"):
+            has_options = (status == "SIGNAL")
+            bg = "#071a0f" if has_options else "#110d00"
+
             if d == "CALL":
-                und_tgt = "T1:${} T2:${} Stop:${}".format(
-                    s.get("und_call_t1","-"), s.get("und_call_t2","-"),
-                    s.get("und_call_stop","-"))
+                t1   = s.get("und_call_t1", "-")
+                t2   = s.get("und_call_t2", "-")
+                stop = s.get("und_call_stop", "-")
+                arr  = "&#9650;"   # up arrow
+                t_color = "#3fb950"
+                s_color = "#f85149"
             else:
-                und_tgt = "T1:${} T2:${} Stop:${}".format(
-                    s.get("und_put_t1","-"), s.get("und_put_t2","-"),
-                    s.get("und_put_stop","-"))
-            prem = s.get("premium", "-")
-            stp  = s.get("stop", "-")
-            tgt  = s.get("target", "-")
-            con  = s.get("contracts", "1")
-            signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d;background:#0d2818'>"
-                "<td style='padding:8px 6px'><b style='font-size:13px'>{sym}</b>{late}</td>"
-                "<td style='padding:8px 6px;color:{dc};font-weight:bold'>{d}</td>"
-                "<td style='padding:8px 6px;text-align:center'>"
-                  "<div style='font-size:24px;font-weight:bold;color:{gc};line-height:1'>{grade}</div>"
-                  "<div style='font-size:10px;color:#8b949e'>{gpts}pts</div>"
-                "</td>"
-                "<td style='padding:8px 6px'>"
-                  "<div style='font-size:13px;font-weight:bold'>${price}</div>"
-                  "<div style='font-size:10px;color:#3fb950;margin-top:3px'>{utgt}</div>"
-                "</td>"
-                "<td style='padding:8px 6px;font-size:11px'>"
-                  "<div>Gap <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
-                  "<div style='margin-top:2px'>RS <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
-                "</td>"
-                "<td style='padding:8px 6px'>"
-                  "<div style='font-size:13px;font-weight:bold'>${prem} "
-                    "<span style='background:#238636;color:white;padding:1px 4px;"
-                    "border-radius:3px;font-size:9px'>LIVE</span>"
-                  "</div>"
-                  "<div style='font-size:10px;color:#8b949e;margin-top:3px'>Stop ${stp} / Tgt ${tgt}</div>"
-                "</td>"
-                "<td style='padding:8px 6px'>"
-                  "<div style='margin-bottom:4px'>"
-                    "<span style='background:#1f6feb;color:white;padding:2px 6px;"
-                    "border-radius:4px;font-size:10px'>SIGNAL</span>"
-                  "</div>"
-                  "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
+                t1   = s.get("und_put_t1", "-")
+                t2   = s.get("und_put_t2", "-")
+                stop = s.get("und_put_stop", "-")
+                arr  = "&#9660;"   # down arrow
+                t_color = "#f85149"
+                s_color = "#3fb950"
+
+            late_tag = ("<span style='margin-left:5px;background:#9e6a03;"
+                        "color:white;padding:1px 5px;border-radius:3px;"
+                        "font-size:9px;vertical-align:middle'>LATE</span>"
+                        if late else "")
+
+            if has_options:
+                prem_html = (
+                    "<div style='font-size:15px;font-weight:600'>"
+                    "${prem}"
+                    "<span style='margin-left:5px;background:#238636;color:white;"
+                    "padding:1px 5px;border-radius:3px;font-size:9px'>LIVE</span>"
+                    "</div>"
+                    "<div style='color:#8b949e;font-size:10px;margin-top:3px'>"
+                    "Stop ${stp} &nbsp;/&nbsp; Tgt ${tgt}</div>"
+                ).format(prem=s.get("premium","-"),
+                         stp=s.get("stop","-"), tgt=s.get("target","-"))
+                action_html = (
+                    "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
                     "&stp={stp}&tgt={tgt}&grade={grade}&gpts={gpts}"
                     "&gap={gpct}&gdir={gdir}&rs={rs:.2f}' "
-                  "style='background:#238636;color:white;padding:4px 10px;"
-                  "border-radius:5px;text-decoration:none;font-size:11px'>TAKE</a>"
-                "</td></tr>"
-            ).format(
-                sym=sym, late=late_badge, dc=dcolor, d=d,
-                grade=grade, gpts=grade_pts, gc=grade_color,
-                price=price, utgt=und_tgt,
-                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct), 2),
-                gdir=gap_dir, rsc=rs_color, rs=rs,
-                prem=prem, stp=stp, tgt=tgt, con=con
+                    "style='display:inline-block;background:#238636;color:white;"
+                    "padding:6px 14px;border-radius:6px;text-decoration:none;"
+                    "font-size:12px;font-weight:600'>TAKE</a>"
+                ).format(
+                    sym=sym, d=d,
+                    prem=s.get("premium",""), con=s.get("contracts","1"),
+                    stp=s.get("stop",""), tgt=s.get("target",""),
+                    grade=grade, gpts=grade_pts,
+                    gpct=round(abs(gap_pct),2), gdir=gap_dir, rs=rs
+                )
+            else:
+                prem_html = ("<div style='color:#8b949e;font-size:11px'>"
+                             "Check broker</div>")
+                action_html = ""
+
+            signal_rows += """
+<tr style='border-bottom:1px solid #21262d;background:{bg}'>
+  <td style='padding:10px 8px;vertical-align:top'>
+    <div style='font-size:14px;font-weight:700'>{sym}{late}</div>
+    <div style='font-size:11px;color:{dc};margin-top:2px;font-weight:600'>{arr} {d}</div>
+  </td>
+  <td style='padding:10px 8px;text-align:center;vertical-align:top'>
+    <div style='font-size:28px;font-weight:800;color:{gc};line-height:1'>{grade}</div>
+    <div style='font-size:10px;color:#8b949e;margin-top:2px'>{gpts}pts</div>
+    <div style='font-size:9px;margin-top:4px'>
+      <span style='background:#21262d;color:#8b949e;padding:1px 5px;border-radius:3px'>SIGNAL</span>
+    </div>
+  </td>
+  <td style='padding:10px 8px;vertical-align:top'>
+    <div style='font-size:16px;font-weight:700'>${price}</div>
+    <div style='margin-top:4px;font-size:11px'>
+      <span style='color:{tc}'>T1 ${t1}</span>
+      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t1p}%</span>
+    </div>
+    <div style='margin-top:2px;font-size:11px'>
+      <span style='color:{tc}'>T2 ${t2}</span>
+      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t2p}%</span>
+    </div>
+    <div style='margin-top:2px;font-size:11px'>
+      <span style='color:{sc}'>Stop ${stop}</span>
+    </div>
+  </td>
+  <td style='padding:10px 8px;vertical-align:top;font-size:11px'>
+    <div>Gap&nbsp;<span style='color:{gapc};font-weight:600'>{gsign}{gpct}%</span></div>
+    <div style='margin-top:3px'>RS&nbsp;<span style='color:{rsc};font-weight:600'>{rs:+.2f}%</span></div>
+    <div style='margin-top:3px;color:#8b949e'>SPY {spy:+.2f}%</div>
+  </td>
+  <td style='padding:10px 8px;vertical-align:top'>{prem_html}</td>
+  <td style='padding:10px 8px;vertical-align:middle'>{action_html}</td>
+</tr>""".format(
+                bg=bg, sym=sym, late=late_tag, dc=dc, arr=arr, d=d,
+                gc=grade_color, grade=grade, gpts=grade_pts,
+                price=price,
+                t1=t1, t2=t2, stop=stop,
+                tc=t_color, sc=s_color,
+                t1p=int(t1_prob), t2p=int(t2_prob),
+                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
+                rsc=rs_color, rs=rs,
+                spy=s.get("spy_chg") or 0,
+                prem_html=prem_html,
+                action_html=action_html
             )
 
         elif status == "WATCHING":
             if d == "CALL":
-                trigger = "Break &gt; ${}".format(s.get("orb_high", "-"))
-                t1      = "T1: ${}".format(s.get("und_call_t1", "-"))
+                trigger = "Break &gt; ${}".format(s.get("orb_high","-"))
+                t1_w    = s.get("und_call_t1", "-")
+                arr     = "&#9650;"
             else:
-                trigger = "Break &lt; ${}".format(s.get("orb_low", "-"))
-                t1      = "T1: ${}".format(s.get("und_put_t1", "-"))
-            signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d'>"
-                "<td style='padding:8px 6px'><b style='font-size:13px'>{sym}</b></td>"
-                "<td style='padding:8px 6px;color:{dc}'>{d}</td>"
-                "<td style='padding:8px 6px;text-align:center'>"
-                  "<span style='background:#9e6a03;color:white;padding:3px 8px;"
-                  "border-radius:4px;font-size:11px'>WATCH</span>"
-                "</td>"
-                "<td style='padding:8px 6px'>"
-                  "<div style='font-size:13px;font-weight:bold'>${price}</div>"
-                  "<div style='font-size:10px;color:#e3b341;margin-top:3px'>{trigger}</div>"
-                  "<div style='font-size:10px;color:#8b949e;margin-top:1px'>{t1}</div>"
-                "</td>"
-                "<td style='padding:8px 6px;font-size:11px'>"
-                  "<div>Gap <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
-                  "<div style='margin-top:2px'>RS <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
-                "</td>"
-                "<td style='padding:8px 6px;font-size:11px;color:#8b949e'>"
-                  "{vs_orb}"
-                "</td>"
-                "<td style='padding:8px 6px'></td>"
-                "</tr>"
-            ).format(
-                sym=sym, dc=dcolor, d=d, price=price,
-                trigger=trigger, t1=t1,
-                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct), 2),
-                rsc=rs_color, rs=rs,
-                vs_orb=s.get("vs_orb", "-")
-            )
+                trigger = "Break &lt; ${}".format(s.get("orb_low","-"))
+                t1_w    = s.get("und_put_t1", "-")
+                arr     = "&#9660;"
 
-        elif "SIGNAL" in status:
-            # Breakout confirmed but no options data
-            if d == "CALL":
-                und_tgt = "T1:${} T2:${} Stop:${}".format(
-                    s.get("und_call_t1","-"), s.get("und_call_t2","-"),
-                    s.get("und_call_stop","-"))
-            else:
-                und_tgt = "T1:${} T2:${} Stop:${}".format(
-                    s.get("und_put_t1","-"), s.get("und_put_t2","-"),
-                    s.get("und_put_stop","-"))
-            signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d;background:#1a1200'>"
-                "<td style='padding:8px 6px'><b style='font-size:13px'>{sym}</b>{late}</td>"
-                "<td style='padding:8px 6px;color:{dc};font-weight:bold'>{d}</td>"
-                "<td style='padding:8px 6px;text-align:center'>"
-                  "<div style='font-size:24px;font-weight:bold;color:{gc};line-height:1'>{grade}</div>"
-                  "<div style='font-size:10px;color:#8b949e'>{gpts}pts</div>"
-                "</td>"
-                "<td style='padding:8px 6px'>"
-                  "<div style='font-size:13px;font-weight:bold'>${price}</div>"
-                  "<div style='font-size:10px;color:#3fb950;margin-top:3px'>{utgt}</div>"
-                "</td>"
-                "<td style='padding:8px 6px;font-size:11px'>"
-                  "<div>Gap <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
-                  "<div style='margin-top:2px'>RS <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
-                "</td>"
-                "<td style='padding:8px 6px;color:#8b949e;font-size:11px'>"
-                  "Check broker<br>for premium"
-                "</td>"
-                "<td style='padding:8px 6px'>"
-                  "<span style='background:#1f6feb;color:white;padding:2px 6px;"
-                  "border-radius:4px;font-size:10px'>SIGNAL</span>"
-                "</td></tr>"
-            ).format(
-                sym=sym, late=late_badge, dc=dcolor, d=d,
-                grade=grade, gpts=grade_pts, gc=grade_color,
-                price=price, utgt=und_tgt,
-                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct), 2),
-                rsc=rs_color, rs=rs
+            signal_rows += """
+<tr style='border-bottom:1px solid #21262d'>
+  <td style='padding:10px 8px;vertical-align:top'>
+    <div style='font-size:14px;font-weight:700'>{sym}</div>
+    <div style='font-size:11px;color:{dc};margin-top:2px;font-weight:600'>{arr} {d}</div>
+  </td>
+  <td style='padding:10px 8px;text-align:center;vertical-align:top'>
+    <span style='background:#9e6a03;color:white;padding:4px 8px;
+    border-radius:5px;font-size:11px;font-weight:600'>WATCH</span>
+  </td>
+  <td style='padding:10px 8px;vertical-align:top'>
+    <div style='font-size:16px;font-weight:700'>${price}</div>
+    <div style='font-size:10px;color:#e3b341;margin-top:4px'>{trigger}</div>
+    <div style='font-size:10px;color:#8b949e;margin-top:2px'>If breaks: T1 ${t1}</div>
+  </td>
+  <td style='padding:10px 8px;vertical-align:top;font-size:11px'>
+    <div>Gap&nbsp;<span style='color:{gapc};font-weight:600'>{gsign}{gpct}%</span></div>
+    <div style='margin-top:3px'>RS&nbsp;<span style='color:{rsc};font-weight:600'>{rs:+.2f}%</span></div>
+  </td>
+  <td style='padding:10px 8px;vertical-align:top;font-size:11px;color:#8b949e'>
+    {vs_orb}
+  </td>
+  <td></td>
+</tr>""".format(
+                sym=sym, dc=dc, arr=arr, d=d, price=price,
+                trigger=trigger, t1=t1_w,
+                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
+                rsc=rs_color, rs=rs,
+                vs_orb=s.get("vs_orb","-")
             )
 
         else:
             signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d;opacity:0.3'>"
-                "<td style='padding:6px'>{sym}</td>"
-                "<td colspan='6' style='padding:6px;color:#8b949e;font-size:11px'>{status}</td>"
-                "</tr>"
+                "<tr style='border-bottom:1px solid #21262d;opacity:0.25'>"
+                "<td style='padding:6px 8px;font-size:12px'>{sym}</td>"
+                "<td colspan='5' style='padding:6px 8px;font-size:11px;"
+                "color:#8b949e'>{status}</td></tr>"
             ).format(sym=sym, status=status)
 
+    # - Open trades rows -
     open_rows = ""
     for t in open_trades:
         cp = get_current_price(t["symbol"])
         if cp and t["premium"]:
             unreal = round((cp - t["premium"]) * 100 * t["contracts"], 2)
-            uc     = "green" if unreal >= 0 else "red"
-            us     = "<span style='color:{}'>${}</span>".format(uc, unreal)
+            uc     = "#3fb950" if unreal >= 0 else "#f85149"
+            us     = "<span style='color:{};font-weight:600'>${}</span>".format(uc, unreal)
         else:
             us = "<span style='color:#8b949e'>-</span>"
         open_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
-            "<td style='padding:8px'>{}</td><td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>${}</td><td style='padding:8px'>{}x</td>"
-            "<td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>"
-            "<a href='/close?id={}&outcome=WIN&exit={}' "
-            "style='background:#238636;color:white;padding:4px 8px;"
-            "border-radius:4px;text-decoration:none;font-size:11px;margin-right:4px'>WIN</a>"
-            "<a href='/close?id={}&outcome=LOSS&exit={}' "
-            "style='background:#da3633;color:white;padding:4px 8px;"
-            "border-radius:4px;text-decoration:none;font-size:11px'>LOSS</a>"
+            "<td style='padding:10px 8px;font-weight:700'>{sym}</td>"
+            "<td style='padding:10px 8px;color:{dc}'>{dir}</td>"
+            "<td style='padding:10px 8px'>${prem}</td>"
+            "<td style='padding:10px 8px'>{con}x</td>"
+            "<td style='padding:10px 8px'>{unreal}</td>"
+            "<td style='padding:10px 8px'>"
+            "<a href='/close?id={id}&outcome=WIN&exit={cp}' "
+            "style='background:#238636;color:white;padding:5px 10px;"
+            "border-radius:5px;text-decoration:none;font-size:11px;"
+            "font-weight:600;margin-right:5px'>WIN</a>"
+            "<a href='/close?id={id}&outcome=LOSS&exit={cp}' "
+            "style='background:#da3633;color:white;padding:5px 10px;"
+            "border-radius:5px;text-decoration:none;font-size:11px;"
+            "font-weight:600'>LOSS</a>"
             "</td></tr>"
-        ).format(t["symbol"], t["direction"], t["premium"], t["contracts"], us,
-                 t["id"], cp or 0, t["id"], cp or 0)
+        ).format(
+            sym=t["symbol"],
+            dc="#3fb950" if t["direction"]=="CALL" else "#f85149",
+            dir=t["direction"], prem=t["premium"], con=t["contracts"],
+            unreal=us, id=t["id"], cp=cp or 0
+        )
 
+    # - Closed trades rows -
     closed_rows = ""
     for t in closed:
-        pc = "green" if (t["pnl"] or 0) >= 0 else "red"
+        pc = "#3fb950" if (t["pnl"] or 0) >= 0 else "#f85149"
+        oc = "#3fb950" if t["outcome"] == "WIN" else "#f85149"
         closed_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
-            "<td style='padding:8px'>{}</td><td style='padding:8px'>{}</td>"
-            "<td style='padding:8px'>${}</td><td style='padding:8px'>{}</td>"
-            "<td style='padding:8px;color:{}'>${}</td></tr>"
-        ).format(t["symbol"], t["direction"], t["premium"],
-                 t["outcome"], pc, t["pnl"] or 0)
+            "<td style='padding:10px 8px;font-weight:700'>{sym}</td>"
+            "<td style='padding:10px 8px;color:{dc}'>{dir}</td>"
+            "<td style='padding:10px 8px'>${prem}</td>"
+            "<td style='padding:10px 8px;color:{oc};font-weight:600'>{out}</td>"
+            "<td style='padding:10px 8px;color:{pc};font-weight:600'>${pnl}</td>"
+            "</tr>"
+        ).format(
+            sym=t["symbol"],
+            dc="#3fb950" if t["direction"]=="CALL" else "#f85149",
+            dir=t["direction"], prem=t["premium"],
+            oc=oc, out=t["outcome"], pc=pc, pnl=round(t["pnl"] or 0, 2)
+        )
 
-    html = (
-        "<!DOCTYPE html><html><head>"
-        "<meta http-equiv='refresh' content='30'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>"
-        "body{{background:#0d1117;color:white;font-family:Arial,sans-serif;"
-        "padding:15px;margin:0}}"
-        "h1{{font-size:18px;margin-bottom:5px}}"
-        ".card{{background:#161b22;border-radius:10px;margin-bottom:15px;overflow:hidden}}"
-        ".ch{{padding:12px 15px;border-bottom:1px solid #21262d;"
-        "display:flex;justify-content:space-between;align-items:center}}"
-        ".green{{color:#3fb950}}.red{{color:#f85149}}.yellow{{color:#e3b341}}"
-        "table{{width:100%;border-collapse:collapse;font-size:12px}}"
-        "th{{padding:8px;text-align:left;color:#8b949e;border-bottom:1px solid #21262d}}"
-        ".debug{{background:#0a0d12;padding:12px;border-radius:8px;font-size:10px;"
-        "font-family:monospace;max-height:200px;overflow-y:auto;color:#8b949e}}"
-        ".sr{{display:flex;gap:8px;margin-bottom:15px}}"
-        ".st{{background:#161b22;border-radius:8px;padding:12px;flex:1;text-align:center}}"
-        ".sv{{font-size:20px;font-weight:bold}}"
-        ".sl{{font-size:10px;color:#8b949e;margin-top:3px}}"
-        "a.nav{{color:#58a6ff;text-decoration:none;font-size:12px;margin-right:8px}}"
-        "</style></head><body>"
-        "<h1>Institutional 0DTE Engine</h1>"
-        "<div style='margin-bottom:10px;font-size:12px;color:#8b949e'>"
-        "Market:<span class='{mc}'> {ms}</span> | "
-        "Scan:{sc}s | "
-        "Bot:<span class='{bc}'> {be}</span> | "
-        "<a class='nav' href='/stats'>Stats</a>"
-        "<a class='nav' href='/alpaca-test'>Alpaca</a>"
-        "<a class='nav' href='/telegram-test'>Telegram</a>"
-        "<a class='nav' href='/debug'>Debug</a>"
-        "</div>"
-        "<div class='sr'>"
-        "<div class='st'><div class='sv {pc}'>${pl}</div>"
-        "<div class='sl'>Today P&amp;L</div></div>"
-        "<div class='st'><div class='sv'>{nt}</div>"
-        "<div class='sl'>Trades</div></div>"
-        "<div class='st'><div class='sv green'>{nw}</div>"
-        "<div class='sl'>Wins</div></div>"
-        "<div class='st'><div class='sv red'>{nl}</div>"
-        "<div class='sl'>Losses</div></div>"
-        "</div>"
-        "<div class='card'>"
-        "<div class='ch'><span>Signal Scanner</span>"
-        "<span style='font-size:11px;color:#8b949e'>"
-        "{ns} symbols | ORB=30min | Vol-adjusted</span></div>"
-        "<table><tr>"
-        "<th>Symbol</th><th>Dir</th><th style='text-align:center'>Grade</th>"
-        "<th>Price / Targets</th><th>Gap / RS</th>"
-        "<th>Premium</th><th>Action</th>"
-        "</tr>{sr2}</table></div>"
-        "<div class='card'><div class='ch'><span>Open Trades</span></div>"
-        "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
-        "<th>Size</th><th>Unreal P&amp;L</th><th>Close</th></tr>"
-        "{or_}</table></div>"
-        "<div class='card'><div class='ch'><span>Today Closed</span></div>"
-        "<table><tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
-        "<th>Result</th><th>P&amp;L</th></tr>"
-        "{cr}</table></div>"
-        "<div class='card' style='padding:12px'>"
-        "<div style='color:#8b949e;font-size:11px;margin-bottom:6px'>Debug Log</div>"
-        "<div class='debug'>{ll}</div></div>"
-        "</body></html>"
-    ).format(
-        mc=market_color, ms=market_status, sc=secs,
-        bc="green" if bot_enabled else "red",
+    # - HTML -
+    empty_scanner = (
+        "<tr><td colspan='6' style='padding:20px;text-align:center;"
+        "color:#8b949e;font-size:13px'>Waiting for next scan...</td></tr>"
+    )
+    empty_open = (
+        "<tr><td colspan='6' style='padding:20px;text-align:center;"
+        "color:#8b949e;font-size:13px'>No open trades</td></tr>"
+    )
+    empty_closed = (
+        "<tr><td colspan='5' style='padding:20px;text-align:center;"
+        "color:#8b949e;font-size:13px'>No closed trades today</td></tr>"
+    )
+
+    html = """<!DOCTYPE html>
+<html><head>
+<meta http-equiv='refresh' content='30'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0 }}
+  body {{ background:#0d1117; color:#e6edf3; font-family:-apple-system,Arial,sans-serif; padding:12px }}
+  h1 {{ font-size:17px; font-weight:700; margin-bottom:4px }}
+  .topbar {{ font-size:11px; color:#8b949e; margin-bottom:14px; display:flex; align-items:center; gap:8px; flex-wrap:wrap }}
+  .dot {{ width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:3px }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; margin-bottom:14px; overflow:hidden }}
+  .card-header {{ padding:11px 14px; border-bottom:1px solid #30363d; display:flex; justify-content:space-between; align-items:center }}
+  .card-title {{ font-size:13px; font-weight:600; color:#e6edf3 }}
+  .card-sub {{ font-size:11px; color:#8b949e }}
+  .stats-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:14px }}
+  .stat-box {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:11px; text-align:center }}
+  .stat-val {{ font-size:20px; font-weight:700; line-height:1 }}
+  .stat-lbl {{ font-size:10px; color:#8b949e; margin-top:4px }}
+  table {{ width:100%; border-collapse:collapse }}
+  th {{ padding:9px 8px; text-align:left; font-size:11px; font-weight:600; color:#8b949e; border-bottom:1px solid #30363d; text-transform:uppercase; letter-spacing:.5px }}
+  .nav-link {{ color:#58a6ff; text-decoration:none; font-size:11px; font-weight:500 }}
+  .nav-link:hover {{ text-decoration:underline }}
+  .debug-box {{ background:#010409; border-radius:6px; padding:10px; font-size:10px; font-family:monospace; max-height:180px; overflow-y:auto; color:#8b949e; line-height:1.6 }}
+  .grade-pill {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:700 }}
+</style>
+</head><body>
+
+<h1>Institutional 0DTE Engine</h1>
+<div class='topbar'>
+  <span><span class='dot' style='background:{mc}'></span><span style='color:{mc};font-weight:600'>{ms}</span></span>
+  <span>Next scan {sc}s</span>
+  <span>Bot <span style='color:{bc};font-weight:600'>{be}</span></span>
+  <span style='margin-left:4px'>
+    <a class='nav-link' href='/stats'>Stats</a> &nbsp;
+    <a class='nav-link' href='/alpaca-test'>Alpaca</a> &nbsp;
+    <a class='nav-link' href='/telegram-test'>Telegram</a> &nbsp;
+    <a class='nav-link' href='/debug'>Debug</a>
+  </span>
+</div>
+
+<div class='stats-grid'>
+  <div class='stat-box'>
+    <div class='stat-val' style='color:{pc}'>${pl}</div>
+    <div class='stat-lbl'>Today P&amp;L</div>
+  </div>
+  <div class='stat-box'>
+    <div class='stat-val'>{nt}</div>
+    <div class='stat-lbl'>Trades</div>
+  </div>
+  <div class='stat-box'>
+    <div class='stat-val' style='color:#3fb950'>{nw}</div>
+    <div class='stat-lbl'>Wins</div>
+  </div>
+  <div class='stat-box'>
+    <div class='stat-val' style='color:{wrc}'>{wr}%</div>
+    <div class='stat-lbl'>Win Rate</div>
+  </div>
+</div>
+
+<div class='card'>
+  <div class='card-header'>
+    <span class='card-title'>Signal Scanner</span>
+    <span class='card-sub'>{ns} signals &nbsp;|&nbsp; ORB 30min &nbsp;|&nbsp; Vol-adjusted</span>
+  </div>
+  <table>
+    <tr>
+      <th>Symbol</th>
+      <th style='text-align:center'>Grade</th>
+      <th>Price &amp; Targets</th>
+      <th>Gap / RS</th>
+      <th>Option</th>
+      <th>Action</th>
+    </tr>
+    {sr}
+  </table>
+</div>
+
+<div class='card'>
+  <div class='card-header'>
+    <span class='card-title'>Open Trades</span>
+  </div>
+  <table>
+    <tr>
+      <th>Symbol</th><th>Dir</th><th>Entry</th><th>Size</th>
+      <th>Unreal P&amp;L</th><th>Close</th>
+    </tr>
+    {or_}
+  </table>
+</div>
+
+<div class='card'>
+  <div class='card-header'>
+    <span class='card-title'>Today Closed</span>
+  </div>
+  <table>
+    <tr>
+      <th>Symbol</th><th>Dir</th><th>Entry</th><th>Result</th><th>P&amp;L</th>
+    </tr>
+    {cr}
+  </table>
+</div>
+
+<div class='card' style='padding:12px'>
+  <div style='font-size:11px;font-weight:600;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px'>Debug Log</div>
+  <div class='debug-box'>{ll}</div>
+</div>
+
+</body></html>""".format(
+        mc=market_color, ms=market_status,
+        sc=secs,
+        bc="#3fb950" if bot_enabled else "#f85149",
         be="ON" if bot_enabled else "PAUSED",
-        pc=pnl_color, pl=round(total_pnl,2),
-        nt=len(closed), nw=wins, nl=losses,
-        ns=len(signals),
-        sr2=signal_rows or (
-            "<tr><td colspan='8' style='padding:15px;color:#8b949e;"
-            "text-align:center'>Waiting for scan...</td></tr>"),
-        or_=open_rows or (
-            "<tr><td colspan='6' style='padding:15px;color:#8b949e;"
-            "text-align:center'>No open trades</td></tr>"),
-        cr=closed_rows or (
-            "<tr><td colspan='5' style='padding:15px;color:#8b949e;"
-            "text-align:center'>No closed trades today</td></tr>"),
+        pc=pnl_color, pl=round(total_pnl, 2),
+        nt=len(closed), nw=wins,
+        wr=win_rate,
+        wrc="#3fb950" if win_rate >= 50 else "#f85149",
+        ns=active_count,
+        sr=signal_rows or empty_scanner,
+        or_=open_rows or empty_open,
+        cr=closed_rows or empty_closed,
         ll="<br>".join(logs) if logs else "No logs yet"
     )
     return html
 
 
-# =============================================
-# ROUTES
-# =============================================
 
 @app.route("/")
 def home():
