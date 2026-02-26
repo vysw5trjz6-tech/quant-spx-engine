@@ -1125,146 +1125,164 @@ def render_dashboard():
         status = s.get("status", "")
         sym    = s["symbol"]
         price  = s.get("price", "-")
-        score  = s.get("score", 0)
         d      = s.get("direction") or ""
-        dcolor = "green" if d == "CALL" else "red"
+        dcolor = "#3fb950" if d == "CALL" else "#f85149"
+
+        # Shared computed values
+        grade       = s.get("grade") or "-"
+        grade_pts   = s.get("grade_pts") or 0
+        grade_color = s.get("grade_color") or "#8b949e"
+        gap_pct     = s.get("gap_pct") or 0
+        gap_dir     = s.get("gap_dir") or "FLAT"
+        rs          = s.get("rs") or 0
+        late        = s.get("late_entry", False)
+        gap_color   = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
+        rs_color    = "#3fb950" if rs >= 0 else "#f85149"
+        gap_sign    = "+" if gap_pct >= 0 else ""
+        late_badge  = (" <span style='background:#9e6a03;color:white;padding:1px 4px;"
+                       "border-radius:3px;font-size:9px'>LATE</span>" if late else "")
 
         if status == "SIGNAL":
-            # Build underlying target string based on direction
             if d == "CALL":
-                und_tgt_str = "T1:${} T2:${}  Stop:${}".format(
-                    s.get("und_call_t1","-"),
-                    s.get("und_call_t2","-"),
+                und_tgt = "T1:${} T2:${} Stop:${}".format(
+                    s.get("und_call_t1","-"), s.get("und_call_t2","-"),
                     s.get("und_call_stop","-"))
             else:
-                und_tgt_str = "T1:${} T2:${}  Stop:${}".format(
-                    s.get("und_put_t1","-"),
-                    s.get("und_put_t2","-"),
+                und_tgt = "T1:${} T2:${} Stop:${}".format(
+                    s.get("und_put_t1","-"), s.get("und_put_t2","-"),
                     s.get("und_put_stop","-"))
-
-            grade       = s.get("grade") or "-"
-            grade_pts   = s.get("grade_pts") or 0
-            grade_color = s.get("grade_color") or "#8b949e"
-            gap_pct     = s.get("gap_pct") or 0
-            gap_dir     = s.get("gap_dir") or "-"
-            rs          = s.get("rs") or 0
-            late        = s.get("late_entry", False)
-
-            # Gap display
-            gap_sign  = "+" if gap_pct >= 0 else ""
-            gap_color = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
-            rs_color  = "#3fb950" if rs >= 0 else "#f85149"
-
-            # Late entry warning
-            late_badge = ("<span style='background:#9e6a03;color:white;padding:1px 4px;"
-                          "border-radius:3px;font-size:9px;margin-left:4px'>LATE</span>"
-                          if late else "")
-
+            prem = s.get("premium", "-")
+            stp  = s.get("stop", "-")
+            tgt  = s.get("target", "-")
+            con  = s.get("contracts", "1")
             signal_rows += (
                 "<tr style='border-bottom:1px solid #21262d;background:#0d2818'>"
-                # Symbol
-                "<td style='padding:8px'><b>{sym}</b>{late}</td>"
-                # Direction
-                "<td style='color:{dc};padding:8px'><b>{d}</b></td>"
-                # Grade (replaces raw score)
-                "<td style='padding:8px;text-align:center'>"
-                "<div style='font-size:22px;font-weight:bold;color:{gc}'>{grade}</div>"
-                "<div style='font-size:10px;color:#8b949e'>{gpts}pts</div>"
+                "<td style='padding:8px 6px'><b style='font-size:13px'>{sym}</b>{late}</td>"
+                "<td style='padding:8px 6px;color:{dc};font-weight:bold'>{d}</td>"
+                "<td style='padding:8px 6px;text-align:center'>"
+                  "<div style='font-size:24px;font-weight:bold;color:{gc};line-height:1'>{grade}</div>"
+                  "<div style='font-size:10px;color:#8b949e'>{gpts}pts</div>"
                 "</td>"
-                # Price + underlying targets
-                "<td style='padding:8px'>"
-                "<div style='font-size:13px'><b>${price}</b></div>"
-                "<div style='font-size:10px;color:#3fb950;margin-top:2px'>{utgt}</div>"
+                "<td style='padding:8px 6px'>"
+                  "<div style='font-size:13px;font-weight:bold'>${price}</div>"
+                  "<div style='font-size:10px;color:#3fb950;margin-top:3px'>{utgt}</div>"
                 "</td>"
-                # Gap + RS
-                "<td style='padding:8px;font-size:11px'>"
-                "<div>Gap: <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
-                "<div>RS: <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
+                "<td style='padding:8px 6px;font-size:11px'>"
+                  "<div>Gap <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
+                  "<div style='margin-top:2px'>RS <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
                 "</td>"
-                # Premium
-                "<td style='padding:8px'>"
-                "<div style='font-size:13px'>${prem} "
-                "<span style='background:#238636;color:white;padding:1px 4px;"
-                "border-radius:3px;font-size:9px'>LIVE</span></div>"
-                "<div style='font-size:10px;color:#8b949e;margin-top:2px'>"
-                "Stop:${stp} Tgt:${tgt}</div>"
+                "<td style='padding:8px 6px'>"
+                  "<div style='font-size:13px;font-weight:bold'>${prem} "
+                    "<span style='background:#238636;color:white;padding:1px 4px;"
+                    "border-radius:3px;font-size:9px'>LIVE</span>"
+                  "</div>"
+                  "<div style='font-size:10px;color:#8b949e;margin-top:3px'>Stop ${stp} / Tgt ${tgt}</div>"
                 "</td>"
-                # Action
-                "<td style='padding:8px'>"
-                "<span style='background:#1f6feb;color:white;padding:2px 6px;"
-                "border-radius:4px;font-size:10px'>SIGNAL</span>&nbsp;"
-                "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
-                "&stp={stp}&tgt={tgt}&grade={grade}&gpts={gpts}"
-                "&gap={gpct}&gdir={gdir}&rs={rs:.2f}' "
-                "style='background:#238636;color:white;padding:4px 8px;"
-                "border-radius:5px;text-decoration:none;font-size:11px'>TAKE</a>"
+                "<td style='padding:8px 6px'>"
+                  "<div style='margin-bottom:4px'>"
+                    "<span style='background:#1f6feb;color:white;padding:2px 6px;"
+                    "border-radius:4px;font-size:10px'>SIGNAL</span>"
+                  "</div>"
+                  "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
+                    "&stp={stp}&tgt={tgt}&grade={grade}&gpts={gpts}"
+                    "&gap={gpct}&gdir={gdir}&rs={rs:.2f}' "
+                  "style='background:#238636;color:white;padding:4px 10px;"
+                  "border-radius:5px;text-decoration:none;font-size:11px'>TAKE</a>"
                 "</td></tr>"
             ).format(
                 sym=sym, late=late_badge, dc=dcolor, d=d,
                 grade=grade, gpts=grade_pts, gc=grade_color,
-                price=price, utgt=und_tgt_str,
-                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
-                gdir=gap_dir,
-                rsc=rs_color, rs=rs,
-                prem=s.get("premium","-"),
-                stp=s.get("stop","-"), tgt=s.get("target","-"),
-                con=s.get("contracts","1")
+                price=price, utgt=und_tgt,
+                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct), 2),
+                gdir=gap_dir, rsc=rs_color, rs=rs,
+                prem=prem, stp=stp, tgt=tgt, con=con
             )
 
         elif status == "WATCHING":
-            # Show breakout trigger level for WATCHING symbols
             if d == "CALL":
-                trigger = "Break>${}".format(s.get("orb_high","-"))
-                t1_str  = "T1:${}".format(s.get("und_call_t1","-"))
+                trigger = "Break &gt; ${}".format(s.get("orb_high", "-"))
+                t1      = "T1: ${}".format(s.get("und_call_t1", "-"))
             else:
-                trigger = "Break<${}".format(s.get("orb_low","-"))
-                t1_str  = "T1:${}".format(s.get("und_put_t1","-"))
+                trigger = "Break &lt; ${}".format(s.get("orb_low", "-"))
+                t1      = "T1: ${}".format(s.get("und_put_t1", "-"))
             signal_rows += (
                 "<tr style='border-bottom:1px solid #21262d'>"
-                "<td style='padding:8px'><b>{sym}</b></td>"
-                "<td style='color:{dc};padding:8px'>{d}</td>"
-                "<td style='padding:8px'>"
-                "<div style='font-size:13px'>${price}</div>"
-                "<div style='font-size:10px;color:#e3b341;margin-top:2px'>"
-                "{trigger}</div>"
+                "<td style='padding:8px 6px'><b style='font-size:13px'>{sym}</b></td>"
+                "<td style='padding:8px 6px;color:{dc}'>{d}</td>"
+                "<td style='padding:8px 6px;text-align:center'>"
+                  "<span style='background:#9e6a03;color:white;padding:3px 8px;"
+                  "border-radius:4px;font-size:11px'>WATCH</span>"
                 "</td>"
-                "<td style='padding:8px'>{score}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
-                "{vs_orb}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
-                "{t1}</td>"
-                "<td style='padding:8px;font-size:11px;color:#8b949e'>"
-                "Vol {vm}x</td>"
-                "<td style='padding:8px'>"
-                "<span style='background:#9e6a03;color:white;padding:2px 6px;"
-                "border-radius:4px;font-size:10px'>WATCH</span>"
-                "</td></tr>"
+                "<td style='padding:8px 6px'>"
+                  "<div style='font-size:13px;font-weight:bold'>${price}</div>"
+                  "<div style='font-size:10px;color:#e3b341;margin-top:3px'>{trigger}</div>"
+                  "<div style='font-size:10px;color:#8b949e;margin-top:1px'>{t1}</div>"
+                "</td>"
+                "<td style='padding:8px 6px;font-size:11px'>"
+                  "<div>Gap <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
+                  "<div style='margin-top:2px'>RS <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
+                "</td>"
+                "<td style='padding:8px 6px;font-size:11px;color:#8b949e'>"
+                  "{vs_orb}"
+                "</td>"
+                "<td style='padding:8px 6px'></td>"
+                "</tr>"
             ).format(
-                sym=sym, dc=dcolor, d=d, price=price, score=score,
-                trigger=trigger, t1=t1_str,
-                vs_orb=s.get("vs_orb","-"),
-                vm=s.get("vol_mult","-")
+                sym=sym, dc=dcolor, d=d, price=price,
+                trigger=trigger, t1=t1,
+                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct), 2),
+                rsc=rs_color, rs=rs,
+                vs_orb=s.get("vs_orb", "-")
             )
 
         elif "SIGNAL" in status:
+            # Breakout confirmed but no options data
+            if d == "CALL":
+                und_tgt = "T1:${} T2:${} Stop:${}".format(
+                    s.get("und_call_t1","-"), s.get("und_call_t2","-"),
+                    s.get("und_call_stop","-"))
+            else:
+                und_tgt = "T1:${} T2:${} Stop:${}".format(
+                    s.get("und_put_t1","-"), s.get("und_put_t2","-"),
+                    s.get("und_put_stop","-"))
             signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d;opacity:0.8'>"
-                "<td style='padding:8px'><b>{}</b></td>"
-                "<td style='color:{};padding:8px'>{}</td>"
-                "<td style='padding:8px'>${}</td>"
-                "<td style='padding:8px'>{}</td>"
-                "<td colspan='3' style='padding:8px;color:#e3b341'>"
-                "Breakout confirmed - no option data</td>"
-                "<td></td></tr>"
-            ).format(sym, dcolor, d, price, score)
+                "<tr style='border-bottom:1px solid #21262d;background:#1a1200'>"
+                "<td style='padding:8px 6px'><b style='font-size:13px'>{sym}</b>{late}</td>"
+                "<td style='padding:8px 6px;color:{dc};font-weight:bold'>{d}</td>"
+                "<td style='padding:8px 6px;text-align:center'>"
+                  "<div style='font-size:24px;font-weight:bold;color:{gc};line-height:1'>{grade}</div>"
+                  "<div style='font-size:10px;color:#8b949e'>{gpts}pts</div>"
+                "</td>"
+                "<td style='padding:8px 6px'>"
+                  "<div style='font-size:13px;font-weight:bold'>${price}</div>"
+                  "<div style='font-size:10px;color:#3fb950;margin-top:3px'>{utgt}</div>"
+                "</td>"
+                "<td style='padding:8px 6px;font-size:11px'>"
+                  "<div>Gap <span style='color:{gapc}'>{gsign}{gpct}%</span></div>"
+                  "<div style='margin-top:2px'>RS <span style='color:{rsc}'>{rs:+.2f}%</span></div>"
+                "</td>"
+                "<td style='padding:8px 6px;color:#e3b341;font-size:11px'>"
+                  "No option data<br>Add Tradier token"
+                "</td>"
+                "<td style='padding:8px 6px'>"
+                  "<span style='background:#1f6feb;color:white;padding:2px 6px;"
+                  "border-radius:4px;font-size:10px'>SIGNAL</span>"
+                "</td></tr>"
+            ).format(
+                sym=sym, late=late_badge, dc=dcolor, d=d,
+                grade=grade, gpts=grade_pts, gc=grade_color,
+                price=price, utgt=und_tgt,
+                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct), 2),
+                rsc=rs_color, rs=rs
+            )
 
         else:
             signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d;opacity:0.35'>"
-                "<td style='padding:8px'>{}</td>"
-                "<td colspan='7' style='padding:8px;color:#8b949e'>{}</td>"
+                "<tr style='border-bottom:1px solid #21262d;opacity:0.3'>"
+                "<td style='padding:6px'>{sym}</td>"
+                "<td colspan='6' style='padding:6px;color:#8b949e;font-size:11px'>{status}</td>"
                 "</tr>"
-            ).format(sym, status)
+            ).format(sym=sym, status=status)
 
     open_rows = ""
     for t in open_trades:
