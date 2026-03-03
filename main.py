@@ -414,6 +414,44 @@ def get_daily(symbol):
         return None
 
 
+def get_1hr_bars(symbol):
+    """Last 30 x 1hr bars for key level detection."""
+    try:
+        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                         params={"timeframe": "1Hour", "limit": 30}, timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json().get("bars", [])
+    except:
+        return None
+
+
+def get_4hr_bars(symbol):
+    """Synthesize 4hr candles from 1hr bars (4 x 1hr grouped)."""
+    try:
+        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                         params={"timeframe": "1Hour", "limit": 80}, timeout=10)
+        if r.status_code != 200:
+            return None
+        bars = r.json().get("bars", [])
+        if not bars:
+            return None
+        grouped = []
+        for i in range(0, len(bars) - 3, 4):
+            chunk = bars[i:i+4]
+            grouped.append({
+                "o": chunk[0]["o"],
+                "h": max(b["h"] for b in chunk),
+                "l": min(b["l"] for b in chunk),
+                "c": chunk[-1]["c"],
+                "v": sum(b["v"] for b in chunk),
+                "t": chunk[0]["t"],
+            })
+        return grouped
+    except:
+        return None
+
+
 def get_current_price(symbol):
     try:
         r = requests.get(QUOTE_URL.format(symbol), headers=HEADERS, timeout=5)
@@ -659,6 +697,162 @@ def confluence_grade(breakout_strength, vol_ratio, vol_mult,
 
 
 # =============================================
+# MULTI-TIMEFRAME KEY LEVELS
+# =============================================
+
+def get_key_levels(daily_bars, bars_1hr, bars_4hr):
+    """
+    Returns sorted list of key price levels from daily/4hr/1hr charts.
+    Each level: {price, label, tf, strength}  strength: 3=daily 2=4hr 1=1hr
+    """
+    levels = []
+
+    if daily_bars and len(daily_bars) >= 2:
+        pdh = daily_bars[-2]["h"]
+        pdl = daily_bars[-2]["l"]
+        levels.append({"price": pdh, "label": "PDH", "tf": "Daily", "strength": 3})
+        levels.append({"price": pdl, "label": "PDL", "tf": "Daily", "strength": 3})
+        week = daily_bars[-5:] if len(daily_bars) >= 5 else daily_bars
+        wkh  = max(b["h"] for b in week)
+        wkl  = min(b["l"] for b in week)
+        if pdh and abs(wkh - pdh) / pdh > 0.002:
+            levels.append({"price": wkh, "label": "WkH", "tf": "Daily", "strength": 2})
+        if pdl and abs(wkl - pdl) / pdl > 0.002:
+            levels.append({"price": wkl, "label": "WkL", "tf": "Daily", "strength": 2})
+
+    if bars_4hr and len(bars_4hr) >= 6:
+        for i in range(2, len(bars_4hr) - 2):
+            b = bars_4hr[i]
+            if (b["h"] > bars_4hr[i-1]["h"] and b["h"] > bars_4hr[i-2]["h"] and
+                    b["h"] > bars_4hr[i+1]["h"] and b["h"] > bars_4hr[i+2]["h"]):
+                levels.append({"price": b["h"], "label": "4H-R", "tf": "4hr", "strength": 2})
+            if (b["l"] < bars_4hr[i-1]["l"] and b["l"] < bars_4hr[i-2]["l"] and
+                    b["l"] < bars_4hr[i+1]["l"] and b["l"] < bars_4hr[i+2]["l"]):
+                levels.append({"price": b["l"], "label": "4H-S", "tf": "4hr", "strength": 2})
+
+    if bars_1hr and len(bars_1hr) >= 4:
+        recent = bars_1hr[-10:]
+        for i in range(1, len(recent) - 1):
+            b = recent[i]
+            if b["h"] > recent[i-1]["h"] and b["h"] > recent[i+1]["h"]:
+                levels.append({"price": b["h"], "label": "1H-R", "tf": "1hr", "strength": 1})
+            if b["l"] < recent[i-1]["l"] and b["l"] < recent[i+1]["l"]:
+                levels.append({"price": b["l"], "label": "1H-S", "tf": "1hr", "strength": 1})
+
+    # Sort and deduplicate within 0.1% of each other
+    levels.sort(key=lambda x: x["price"])
+    deduped = []
+    for lvl in levels:
+        if not deduped:
+            deduped.append(lvl)
+        elif abs(lvl["price"] - deduped[-1]["price"]) / deduped[-1]["price"] < 0.001:
+            if lvl["strength"] > deduped[-1]["strength"]:
+                deduped[-1] = lvl
+        else:
+            deduped.append(lvl)
+    return deduped
+
+
+def check_clear_air(price, direction, t1, t2, key_levels):
+    """
+    Checks if key levels block T1 or T2.
+    Returns dict: clear_to_t1, clear_to_t2, blocking_level, context
+    """
+    if not key_levels or not t1 or not t2:
+        return {"clear_to_t1": True, "clear_to_t2": True,
+                "blocking_level": None, "context": "No levels identified"}
+
+    blocking = []
+    if direction == "CALL":
+        for lvl in key_levels:
+            if price < lvl["price"] <= t2:
+                blocking.append(lvl)
+        blocking.sort(key=lambda x: x["price"])
+    else:
+        for lvl in key_levels:
+            if t2 <= lvl["price"] < price:
+                blocking.append(lvl)
+        blocking.sort(key=lambda x: x["price"], reverse=True)
+
+    if not blocking:
+        return {"clear_to_t1": True, "clear_to_t2": True,
+                "blocking_level": None, "context": "Clear to T2"}
+
+    nearest = blocking[0]
+    if direction == "CALL":
+        clear_to_t1  = nearest["price"] > t1
+        pct_away     = round((nearest["price"] - price) / price * 100, 2)
+    else:
+        clear_to_t1  = nearest["price"] < t1
+        pct_away     = round((price - nearest["price"]) / price * 100, 2)
+
+    clear_to_t2 = all(
+        (b["price"] > t1 if direction == "CALL" else b["price"] < t1)
+        for b in blocking
+    )
+
+    if clear_to_t1:
+        context = "Clear to T1 | {lbl} {lp:.2f} near T2".format(
+            lbl=nearest["label"], lp=nearest["price"])
+    else:
+        context = "{lbl} {lp:.2f} blocks T1 ({pa:.2f}% away)".format(
+            lbl=nearest["label"], lp=nearest["price"], pa=pct_away)
+
+    return {
+        "clear_to_t1":    clear_to_t1,
+        "clear_to_t2":    clear_to_t2,
+        "blocking_level": nearest,
+        "context":        context,
+        "all_blocking":   blocking[:3],
+    }
+
+
+def recommend_contract(symbol, direction, price, orb_range):
+    """
+    Recommends the best 0DTE contract targeting delta ~0.40 (ATM/slightly OTM).
+    Returns strike, estimated premium range, and rationale.
+    """
+    if symbol in ("SPY", "QQQ"):
+        interval = 1.0
+    elif price > 500:
+        interval = 5.0
+    elif price > 100:
+        interval = 2.5
+    else:
+        interval = 1.0
+
+    # Round to nearest strike
+    atm = round(round(price / interval) * interval, 2)
+
+    if direction == "CALL":
+        # First OTM call = ATM if price below ATM, else one strike above
+        strike = atm if price < atm else round(atm + interval, 2)
+    else:
+        strike = atm if price > atm else round(atm - interval, 2)
+
+    otm_pct = round(abs(strike - price) / price * 100, 2)
+    if otm_pct < 0.1:
+        desc = "ATM"
+    elif otm_pct < 0.5:
+        desc = "1st OTM ({:.2f}%)".format(otm_pct)
+    else:
+        desc = "OTM ({:.2f}%)".format(otm_pct)
+
+    # Estimated premium: 0.35-0.65% of underlying for near-ATM 0DTE
+    prem_lo = round(price * 0.0035, 2)
+    prem_hi = round(price * 0.0065, 2)
+
+    return {
+        "rec_strike":    strike,
+        "delta_target":  0.40,
+        "prem_est_low":  prem_lo,
+        "prem_est_high": prem_hi,
+        "strike_desc":   desc,
+        "interval":      interval,
+    }
+
+
+# =============================================
 # OPTIONS
 # =============================================
 
@@ -814,50 +1008,48 @@ def calculate_contracts(premium, score=80):
 def scan_all_symbols():
     results = []
 
+    # Broad market alignment
+    spy_chg_global = get_spy_change()
+    qqq_intra = get_intraday("QQQ")
+    qqq_chg = 0.0
+    if qqq_intra and len(qqq_intra) >= 2 and qqq_intra[0]["o"]:
+        qqq_chg = round((qqq_intra[-1]["c"] - qqq_intra[0]["o"]) / qqq_intra[0]["o"] * 100, 3)
+    if spy_chg_global > 0.2 and qqq_chg > 0.2:
+        market_bias = "BULL"
+    elif spy_chg_global < -0.2 and qqq_chg < -0.2:
+        market_bias = "BEAR"
+    else:
+        market_bias = "MIXED"
+    log("Market bias: {} | SPY {:.2f}% QQQ {:.2f}%".format(market_bias, spy_chg_global, qqq_chg))
+
     for symbol in SYMBOLS:
         result = {
-            "symbol":    symbol,
-            "direction": None,
-            "score":     0,
-            "grade":     None,
-            "grade_pts": 0,
-            "grade_color": "#8b949e",
-            "price":     None,
-            "premium":   None,
-            "strike":    None,
-            "contracts": None,
-            "stop":      None,
-            "target":    None,
-            "status":    "scanning",
-            "vwap":      None,
-            "orb_high":  None,
-            "orb_low":   None,
-            "vs_orb":    None,
-            "vs_vwap":   None,
-            "vol_ratio": None,
-            "gap_pct":   None,
-            "gap_dir":   None,
-            "rs":        None,
-            "spy_chg":   None,
-            "late_entry": False,
+            "symbol": symbol, "direction": None, "score": 0,
+            "grade": None, "grade_pts": 0, "grade_color": "#8b949e",
+            "price": None, "premium": None, "strike": None,
+            "contracts": None, "stop": None, "target": None,
+            "status": "scanning", "vwap": None,
+            "orb_high": None, "orb_low": None,
+            "vs_orb": None, "vs_vwap": None, "vol_ratio": None,
+            "gap_pct": None, "gap_dir": None, "rs": None,
+            "spy_chg": spy_chg_global, "late_entry": False,
+            "market_bias": market_bias, "aligned": True,
+            "key_levels": [], "clear_air": None, "rec_contract": None,
+            "t1_prob": 50, "t2_prob": 25,
         }
 
         intraday = get_intraday(symbol)
         daily    = get_daily(symbol)
+        bars_1hr = get_1hr_bars(symbol)
+        bars_4hr = get_4hr_bars(symbol)
 
         if not intraday or len(intraday) < ORB_BARS + 2 or not daily:
-            result["status"] = "no data"
-            results.append(result)
-            continue
+            result["status"] = "no data"; results.append(result); continue
 
-        # Volatility score (modifier, not hard block)
         vol_mult = volatility_score(daily)
         if vol_mult == 0.0:
-            result["status"] = "dead market"
-            results.append(result)
-            continue
+            result["status"] = "dead market"; results.append(result); continue
 
-        # ORB using first 30 min (6 bars)
         orb      = intraday[:ORB_BARS]
         orb_high = max(b["h"] for b in orb)
         orb_low  = min(b["l"] for b in orb)
@@ -866,47 +1058,35 @@ def scan_all_symbols():
         vwap     = calculate_vwap(intraday)
 
         if not vwap:
-            result["status"] = "no vwap"
-            results.append(result)
-            continue
+            result["status"] = "no vwap"; results.append(result); continue
 
-        range_size = orb_high - orb_low
+        orb_range   = orb_high - orb_low
         vs_orb_high = round((price - orb_high) / orb_high * 100, 3)
-        vs_orb_low  = round((orb_low - price) / orb_low * 100, 3)
-        vs_vwap     = round((price - vwap) / vwap * 100, 3)
+        vs_orb_low  = round((orb_low  - price) / orb_low  * 100, 3)
+        vs_vwap     = round((price    - vwap)  / vwap     * 100, 3)
 
-        orb_range = orb_high - orb_low
-
-        # Gap analysis
         gap_pct, gap_dir = get_premarket_gap(daily, intraday)
+        sym_chg          = get_symbol_change(intraday)
+        rs               = relative_strength(sym_chg, spy_chg_global)
 
-        # Relative strength vs SPY
-        spy_chg    = get_spy_change()
-        sym_chg    = get_symbol_change(intraday)
-        rs         = relative_strength(sym_chg, spy_chg)
-
-        # Time of day
         et         = pytz.timezone("America/New_York")
         et_now     = datetime.now(et)
         et_hour    = et_now.hour + et_now.minute / 60.0
         late_entry = et_hour >= 14.0
 
-        result["price"]          = round(price, 2)
-        result["vwap"]           = round(vwap, 2)
-        result["orb_high"]       = round(orb_high, 2)
-        result["orb_low"]        = round(orb_low, 2)
-        result["vol_mult"]       = round(vol_mult, 2)
-        result["gap_pct"]        = gap_pct
-        result["gap_dir"]        = gap_dir
-        result["rs"]             = rs
-        result["spy_chg"]        = spy_chg
-        result["late_entry"]     = late_entry
-        # Underlying price targets
-        # CALL: targets above current price, stop below ORB high
-        # PUT:  targets below current price, stop above ORB low
-        # T1 = 1x ORB range from current price
-        # T2 = 2x ORB range from current price
-        # Stop = 0.5x ORB range against trade direction
+        key_levels = get_key_levels(daily, bars_1hr, bars_4hr)
+
+        result["price"]      = round(price, 2)
+        result["vwap"]       = round(vwap, 2)
+        result["orb_high"]   = round(orb_high, 2)
+        result["orb_low"]    = round(orb_low, 2)
+        result["vol_mult"]   = round(vol_mult, 2)
+        result["gap_pct"]    = gap_pct
+        result["gap_dir"]    = gap_dir
+        result["rs"]         = rs
+        result["late_entry"] = late_entry
+        result["key_levels"] = key_levels
+
         if orb_range > 0:
             result["und_call_t1"]   = round(price + orb_range, 2)
             result["und_call_t2"]   = round(price + orb_range * 2, 2)
@@ -914,78 +1094,86 @@ def scan_all_symbols():
             result["und_put_t1"]    = round(price - orb_range, 2)
             result["und_put_t2"]    = round(price - orb_range * 2, 2)
             result["und_put_stop"]  = round(price + orb_range * 0.5, 2)
-            # Probability estimates based on distance vs average daily range
             avg_range = statistics.mean([b["h"] - b["l"] for b in daily[-10:]])
             if avg_range > 0:
-                result["t1_prob"] = round(max(20, min(85,
-                    100 - (orb_range / avg_range * 100))), 0)
-                result["t2_prob"] = round(max(10, min(60,
-                    100 - (orb_range * 2 / avg_range * 100))), 0)
-            else:
-                result["t1_prob"] = 50
-                result["t2_prob"] = 25
+                result["t1_prob"] = round(max(20, min(85, 100 - (orb_range / avg_range * 100))), 0)
+                result["t2_prob"] = round(max(10, min(55, 100 - (orb_range * 2 / avg_range * 100))), 0)
 
-        # Determine direction and breakout strength
-        direction         = None
+        direction = None
         breakout_strength = 0
 
         if price > orb_high and price > vwap:
             direction         = "CALL"
             breakout_strength = (price - orb_high) / orb_high
-            result["vs_orb"]  = "+{}%".format(abs(vs_orb_high))
-            result["vs_vwap"] = "+{}%".format(abs(vs_vwap))
-
+            result["vs_orb"]  = "+{:.3f}%".format(abs(vs_orb_high))
+            result["vs_vwap"] = "+{:.3f}%".format(abs(vs_vwap))
         elif price < orb_low and price < vwap:
             direction         = "PUT"
             breakout_strength = (orb_low - price) / orb_low
-            result["vs_orb"]  = "-{}%".format(abs(vs_orb_low))
-            result["vs_vwap"] = "-{}%".format(abs(vs_vwap))
-
+            result["vs_orb"]  = "-{:.3f}%".format(abs(vs_orb_low))
+            result["vs_vwap"] = "-{:.3f}%".format(abs(vs_vwap))
         else:
-            # No confirmed breakout yet - classify as WATCHING
-            # Show best directional bias based on price location
-            if price > vwap:
-                result["direction"] = "CALL"
-                result["vs_vwap"]   = "+{}%".format(abs(vs_vwap))
-                result["vs_orb"]    = "{:.2f}% from ORB high".format(
-                    abs(vs_orb_high))
-            else:
-                result["direction"] = "PUT"
-                result["vs_vwap"]   = "-{}%".format(abs(vs_vwap))
-                result["vs_orb"]    = "{:.2f}% from ORB low".format(
-                    abs(vs_orb_low))
-
-            # Score based on proximity to breakout level
-            proximity = 1 - min(abs(vs_orb_high), abs(vs_orb_low)) / 100
-            vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
-            result["score"]  = round(proximity * vol_mult * 10, 2)
+            result["direction"] = "CALL" if price > vwap else "PUT"
+            result["vs_vwap"]   = "{:+.3f}%".format(vs_vwap)
+            result["vs_orb"]    = "{:.2f}% from ORB {}".format(
+                abs(vs_orb_high if price > vwap else vs_orb_low),
+                "high" if price > vwap else "low")
+            vol_ratio        = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+            result["score"]  = round((1 - min(abs(vs_orb_high), abs(vs_orb_low)) / 100) * vol_mult * 10, 2)
             result["status"] = "WATCHING"
             results.append(result)
             continue
 
-        # Confirmed breakout - get options
         vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
         score     = (breakout_strength * 100 + vol_ratio) * vol_mult
 
-        # Confluence grade
+        result["aligned"] = not (
+            (direction == "CALL" and market_bias == "BEAR") or
+            (direction == "PUT"  and market_bias == "BULL")
+        )
+
         grade, grade_pts, grade_color = confluence_grade(
             breakout_strength, vol_ratio, vol_mult,
             gap_pct, gap_dir, rs, direction, et_hour)
 
+        t1_key = "und_call_t1" if direction == "CALL" else "und_put_t1"
+        t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
+        clear_air = check_clear_air(price, direction,
+                                    result.get(t1_key), result.get(t2_key),
+                                    key_levels)
+        result["clear_air"] = clear_air
+
+        if not clear_air["clear_to_t1"]:
+            grade_pts = min(grade_pts, 52)
+            if grade in ("A", "B"):
+                grade = "C"; grade_color = "#f0883e"
+                log("  {} grade capped C: {}".format(symbol, clear_air["context"]))
+        elif clear_air["clear_to_t2"] and grade_pts >= 70:
+            grade_pts = min(grade_pts + 5, 100)
+
+        result["rec_contract"] = recommend_contract(symbol, direction, price, orb_range)
+
+        if grade == "D":
+            result["status"]    = "low grade"
+            result["direction"] = direction
+            result["score"]     = round(score, 2)
+            result["grade"]     = grade
+            results.append(result)
+            log("{}: SKIP D grade {}pts".format(symbol, grade_pts))
+            continue
+
         premium, strike, is_live = get_liquid_option(symbol, direction, price)
 
         if premium and is_live:
-            contracts, stop, target = calculate_contracts(premium, score)
+            contracts, stp, tgt = calculate_contracts(premium, score)
             result["premium"]   = round(premium, 2)
             result["strike"]    = strike
             result["contracts"] = contracts
-            result["stop"]      = stop
-            result["target"]    = target
-            result["is_live"]   = True
+            result["stop"]      = stp
+            result["target"]    = tgt
             result["status"]    = "SIGNAL"
         else:
-            result["is_live"]   = False
-            result["status"]    = "SIGNAL (no options)"
+            result["status"] = "SIGNAL (no options)"
 
         result["direction"]   = direction
         result["score"]       = round(score, 2)
@@ -993,20 +1181,17 @@ def scan_all_symbols():
         result["grade_pts"]   = grade_pts
         result["grade_color"] = grade_color
         results.append(result)
-        log("{}: {} {} grade={} ({}) score={:.2f}".format(
-            symbol, result["status"], direction, grade, grade_pts, score))
+        log("{} {} | {} {}pts | aligned={} | clear_t1={} | {}".format(
+            symbol, direction, grade, grade_pts,
+            result["aligned"], clear_air["clear_to_t1"], clear_air["context"]))
 
-    # Sort: SIGNAL first, then WATCHING, then rest - all by score desc
     def sort_key(r):
-        s = r.get("status","")
-        if s == "SIGNAL":
-            return (0, -r.get("score",0))
-        elif s == "WATCHING":
-            return (1, -r.get("score",0))
-        elif "SIGNAL" in s:
-            return (2, -r.get("score",0))
-        else:
-            return (3, 0)
+        s = r.get("status", "")
+        p = -r.get("grade_pts", r.get("score", 0))
+        if s == "SIGNAL":              return (0, p)
+        if s == "SIGNAL (no options)": return (1, p)
+        if s == "WATCHING":            return (2, p)
+        return (4, 0)
 
     results.sort(key=sort_key)
     return results
@@ -1185,6 +1370,48 @@ def render_dashboard():
                         "font-size:9px;vertical-align:middle'>LATE</span>"
                         if late else "")
 
+            # Alignment badge
+            aligned = s.get("aligned", True)
+            align_tag = ""
+            if not aligned:
+                align_tag = ("<div style='margin-top:4px'>"
+                             "<span style='background:#3d1a00;color:#e3b341;"
+                             "padding:2px 6px;border-radius:3px;font-size:9px;"
+                             "font-weight:700'>COUNTER-TREND</span></div>")
+
+            # Clear air context
+            ca       = s.get("clear_air") or {}
+            ca_ok_t1 = ca.get("clear_to_t1", True)
+            ca_ok_t2 = ca.get("clear_to_t2", True)
+            ca_ctx   = ca.get("context", "")[:38]
+            if ca_ok_t2:
+                ca_html = ("<div style='color:#3fb950;font-size:9px;margin-top:3px'>"
+                           "Clear air to T2</div>")
+            elif ca_ok_t1:
+                ca_html = ("<div style='color:#e3b341;font-size:9px;margin-top:3px'>"
+                           + ca_ctx + "</div>")
+            else:
+                ca_html = ("<div style='color:#f85149;font-size:9px;margin-top:3px'>"
+                           + ca_ctx + "</div>")
+
+            # Contract recommendation
+            rec      = s.get("rec_contract") or {}
+            rec_html = (
+                "<div style='background:#0d1117;border:1px solid #30363d;"
+                "border-radius:6px;padding:6px 8px;margin-top:6px'>"
+                "<div style='font-size:9px;color:#8b949e;text-transform:uppercase;"
+                "letter-spacing:.4px;margin-bottom:3px'>Rec Contract</div>"
+                "<div style='font-size:13px;font-weight:700'>Strike ${rs}</div>"
+                "<div style='font-size:10px;color:#8b949e;margin-top:1px'>"
+                "{rdesc} | Est ${plo}-${phi}</div>"
+                "</div>"
+            ).format(
+                rs=rec.get("rec_strike", "-"),
+                rdesc=rec.get("strike_desc", "ATM"),
+                plo=rec.get("prem_est_low", "-"),
+                phi=rec.get("prem_est_high", "-")
+            )
+
             if has_options:
                 prem_html = (
                     "<div style='font-size:15px;font-weight:600'>"
@@ -1201,8 +1428,8 @@ def render_dashboard():
                     "&stp={stp}&tgt={tgt}&grade={grade}&gpts={gpts}"
                     "&gap={gpct}&gdir={gdir}&rs={rs:.2f}' "
                     "style='display:inline-block;background:#238636;color:white;"
-                    "padding:6px 14px;border-radius:6px;text-decoration:none;"
-                    "font-size:12px;font-weight:600'>TAKE</a>"
+                    "padding:8px 16px;border-radius:6px;text-decoration:none;"
+                    "font-size:12px;font-weight:700'>TAKE</a>"
                 ).format(
                     sym=sym, d=d,
                     prem=s.get("premium",""), con=s.get("contracts","1"),
@@ -1216,51 +1443,48 @@ def render_dashboard():
                 action_html = ""
 
             signal_rows += """
-<tr style='border-bottom:1px solid #21262d;background:{bg}'>
+<tr style='border-bottom:2px solid #21262d;background:{bg}'>
   <td style='padding:10px 8px;vertical-align:top'>
     <div style='font-size:14px;font-weight:700'>{sym}{late}</div>
-    <div style='font-size:11px;color:{dc};margin-top:2px;font-weight:600'>{arr} {d}</div>
+    <div style='font-size:11px;color:{dc};margin-top:2px;font-weight:700'>{arr} {d}</div>
+    {align_tag}
   </td>
   <td style='padding:10px 8px;text-align:center;vertical-align:top'>
-    <div style='font-size:28px;font-weight:800;color:{gc};line-height:1'>{grade}</div>
+    <div style='font-size:30px;font-weight:800;color:{gc};line-height:1'>{grade}</div>
     <div style='font-size:10px;color:#8b949e;margin-top:2px'>{gpts}pts</div>
-    <div style='font-size:9px;margin-top:4px'>
-      <span style='background:#21262d;color:#8b949e;padding:1px 5px;border-radius:3px'>SIGNAL</span>
+    <div style='font-size:9px;margin-top:3px'>
+      <span style='background:#21262d;color:#8b949e;padding:2px 6px;border-radius:3px'>SIGNAL</span>
     </div>
+    {ca_html}
   </td>
   <td style='padding:10px 8px;vertical-align:top'>
     <div style='font-size:16px;font-weight:700'>${price}</div>
-    <div style='margin-top:4px;font-size:11px'>
+    <div style='margin-top:5px;font-size:11px;line-height:2'>
       <span style='color:{tc}'>T1 ${t1}</span>
-      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t1p}%</span>
-    </div>
-    <div style='margin-top:2px;font-size:11px'>
+      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t1p}%</span><br>
       <span style='color:{tc}'>T2 ${t2}</span>
-      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t2p}%</span>
-    </div>
-    <div style='margin-top:2px;font-size:11px'>
+      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t2p}%</span><br>
       <span style='color:{sc}'>Stop ${stop}</span>
     </div>
   </td>
-  <td style='padding:10px 8px;vertical-align:top;font-size:11px'>
-    <div>Gap&nbsp;<span style='color:{gapc};font-weight:600'>{gsign}{gpct}%</span></div>
-    <div style='margin-top:3px'>RS&nbsp;<span style='color:{rsc};font-weight:600'>{rs:+.2f}%</span></div>
-    <div style='margin-top:3px;color:#8b949e'>SPY {spy:+.2f}%</div>
+  <td style='padding:10px 8px;vertical-align:top;font-size:11px;line-height:2'>
+    <span style='color:#8b949e'>Gap</span> <span style='color:{gapc};font-weight:600'>{gsign}{gpct}%</span><br>
+    <span style='color:#8b949e'>RS</span> <span style='color:{rsc};font-weight:600'>{rs:+.2f}%</span><br>
+    <span style='color:#8b949e'>SPY</span> <span>{spy:+.2f}%</span>
   </td>
-  <td style='padding:10px 8px;vertical-align:top'>{prem_html}</td>
+  <td style='padding:10px 8px;vertical-align:top'>{prem_html}{rec_html}</td>
   <td style='padding:10px 8px;vertical-align:middle'>{action_html}</td>
 </tr>""".format(
                 bg=bg, sym=sym, late=late_tag, dc=dc, arr=arr, d=d,
                 gc=grade_color, grade=grade, gpts=grade_pts,
-                price=price,
-                t1=t1, t2=t2, stop=stop,
+                price=price, t1=t1, t2=t2, stop=stop,
                 tc=t_color, sc=s_color,
                 t1p=int(t1_prob), t2p=int(t2_prob),
                 gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
                 rsc=rs_color, rs=rs,
                 spy=s.get("spy_chg") or 0,
-                prem_html=prem_html,
-                action_html=action_html
+                prem_html=prem_html, action_html=action_html,
+                align_tag=align_tag, ca_html=ca_html, rec_html=rec_html
             )
 
         elif status == "WATCHING":
@@ -1412,6 +1636,7 @@ def render_dashboard():
   <span><span class='dot' style='background:{mc}'></span><span style='color:{mc};font-weight:600'>{ms}</span></span>
   <span>Next scan {sc}s</span>
   <span>Bot <span style='color:{bc};font-weight:600'>{be}</span></span>
+  <span>Market <span style='color:{mbc};font-weight:600'>{mb}</span></span>
   <span style='margin-left:4px'>
     <a class='nav-link' href='/stats'>Stats</a> &nbsp;
     <a class='nav-link' href='/alpaca-test'>Alpaca</a> &nbsp;
@@ -1492,6 +1717,8 @@ def render_dashboard():
         sc=secs,
         bc="#3fb950" if bot_enabled else "#f85149",
         be="ON" if bot_enabled else "PAUSED",
+        mb=signals[0].get("market_bias","?") if signals else "?",
+        mbc="#3fb950" if (signals[0].get("market_bias","") == "BULL" if signals else False) else "#f85149" if (signals[0].get("market_bias","") == "BEAR" if signals else False) else "#e3b341",
         pc=pnl_color, pl=round(total_pnl, 2),
         nt=len(closed), nw=wins,
         wr=win_rate,
