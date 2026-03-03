@@ -1304,237 +1304,299 @@ def telegram_poller():
 
 def render_dashboard():
     with state_lock:
-        signals = list(all_signals)
-        secs    = max(0, int(next_scan_at - time.time()))
-        logs    = list(debug_log[-30:])
+        signals  = list(all_signals)
+        secs     = max(0, int(next_scan_at - time.time()))
+        logs     = list(debug_log[-20:])
 
     trades      = db_get_today_trades()
     open_trades = db_get_open_trades()
     closed      = [t for t in trades if t["outcome"] != "OPEN"]
-    total_pnl   = sum(t["pnl"] or 0 for t in closed)
+    total_pnl   = round(sum(t["pnl"] or 0 for t in closed), 2)
     wins        = len([t for t in closed if t["outcome"] == "WIN"])
     losses      = len([t for t in closed if t["outcome"] == "LOSS"])
     win_rate    = round(wins / len(closed) * 100) if closed else 0
 
-    is_open       = market_open()
-    market_color  = "#3fb950" if is_open else "#f85149"
-    market_status = "OPEN" if is_open else "CLOSED"
-    pnl_color     = "#3fb950" if total_pnl >= 0 else "#f85149"
+    is_open      = market_open()
+    mkt_color    = "#3fb950" if is_open else "#f85149"
+    mkt_label    = "MKT OPEN" if is_open else "MKT CLOSED"
+    pnl_color    = "#3fb950" if total_pnl >= 0 else "#f85149"
+    wr_color     = "#3fb950" if win_rate >= 55 else "#e3b341" if win_rate >= 45 else "#f85149"
 
-    # - Signal rows -
-    signal_rows = ""
-    active_count = len([s for s in signals if s.get("status") in ("SIGNAL","SIGNAL (no options)")])
-
+    # Derive market bias from first signal that has it
+    market_bias = "---"
+    spy_chg     = 0.0
     for s in signals:
-        status = s.get("status", "")
+        if s.get("market_bias"):
+            market_bias = s["market_bias"]
+            spy_chg     = s.get("spy_chg") or 0.0
+            break
+    bias_color = "#3fb950" if market_bias == "BULL" else "#f85149" if market_bias == "BEAR" else "#e3b341"
+
+    et     = pytz.timezone("America/New_York")
+    et_now = datetime.now(et)
+
+    # - Build signal cards -
+    active_signals  = [s for s in signals if s.get("status") in ("SIGNAL", "SIGNAL (no options)")]
+    watching_list   = [s for s in signals if s.get("status") == "WATCHING"]
+
+    signal_cards = ""
+    for s in active_signals:
         sym    = s["symbol"]
         price  = s.get("price", "-")
-        d      = s.get("direction") or ""
-        dc     = "#3fb950" if d == "CALL" else "#f85149"
+        d      = s.get("direction", "")
+        status = s.get("status", "")
 
         grade       = s.get("grade") or "-"
         grade_pts   = s.get("grade_pts") or 0
         grade_color = s.get("grade_color") or "#8b949e"
-        gap_pct     = s.get("gap_pct") or 0
-        gap_dir     = s.get("gap_dir") or "FLAT"
-        rs          = s.get("rs") or 0
-        late        = s.get("late_entry", False)
-        t1_prob     = s.get("t1_prob", 50)
-        t2_prob     = s.get("t2_prob", 25)
 
-        gap_color  = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
-        rs_color   = "#3fb950" if rs >= 0 else "#f85149"
-        gap_sign   = "+" if gap_pct >= 0 else ""
+        gap_pct  = s.get("gap_pct") or 0
+        gap_dir  = s.get("gap_dir") or "FLAT"
+        rs       = s.get("rs") or 0
+        late     = s.get("late_entry", False)
+        aligned  = s.get("aligned", True)
+        t1_prob  = int(s.get("t1_prob") or 50)
+        t2_prob  = int(s.get("t2_prob") or 25)
 
-        if status in ("SIGNAL", "SIGNAL (no options)"):
-            has_options = (status == "SIGNAL")
-            bg = "#071a0f" if has_options else "#110d00"
+        # Direction colors and labels
+        is_call  = (d == "CALL")
+        dc       = "#3fb950" if is_call else "#f85149"
+        dir_bg   = "rgba(63,185,80,0.08)" if is_call else "rgba(248,81,73,0.08)"
+        dir_border = "#238636" if is_call else "#da3633"
 
-            if d == "CALL":
-                t1   = s.get("und_call_t1", "-")
-                t2   = s.get("und_call_t2", "-")
-                stop = s.get("und_call_stop", "-")
-                arr  = "&#9650;"   # up arrow
-                t_color = "#3fb950"
-                s_color = "#f85149"
-            else:
-                t1   = s.get("und_put_t1", "-")
-                t2   = s.get("und_put_t2", "-")
-                stop = s.get("und_put_stop", "-")
-                arr  = "&#9660;"   # down arrow
-                t_color = "#f85149"
-                s_color = "#3fb950"
-
-            late_tag = ("<span style='margin-left:5px;background:#9e6a03;"
-                        "color:white;padding:1px 5px;border-radius:3px;"
-                        "font-size:9px;vertical-align:middle'>LATE</span>"
-                        if late else "")
-
-            # Alignment badge
-            aligned = s.get("aligned", True)
-            align_tag = ""
-            if not aligned:
-                align_tag = ("<div style='margin-top:4px'>"
-                             "<span style='background:#3d1a00;color:#e3b341;"
-                             "padding:2px 6px;border-radius:3px;font-size:9px;"
-                             "font-weight:700'>COUNTER-TREND</span></div>")
-
-            # Clear air context
-            ca       = s.get("clear_air") or {}
-            ca_ok_t1 = ca.get("clear_to_t1", True)
-            ca_ok_t2 = ca.get("clear_to_t2", True)
-            ca_ctx   = ca.get("context", "")[:38]
-            if ca_ok_t2:
-                ca_html = ("<div style='color:#3fb950;font-size:9px;margin-top:3px'>"
-                           "Clear air to T2</div>")
-            elif ca_ok_t1:
-                ca_html = ("<div style='color:#e3b341;font-size:9px;margin-top:3px'>"
-                           + ca_ctx + "</div>")
-            else:
-                ca_html = ("<div style='color:#f85149;font-size:9px;margin-top:3px'>"
-                           + ca_ctx + "</div>")
-
-            # Contract recommendation
-            rec      = s.get("rec_contract") or {}
-            rec_html = (
-                "<div style='background:#0d1117;border:1px solid #30363d;"
-                "border-radius:6px;padding:6px 8px;margin-top:6px'>"
-                "<div style='font-size:9px;color:#8b949e;text-transform:uppercase;"
-                "letter-spacing:.4px;margin-bottom:3px'>Rec Contract</div>"
-                "<div style='font-size:13px;font-weight:700'>Strike ${rs}</div>"
-                "<div style='font-size:10px;color:#8b949e;margin-top:1px'>"
-                "{rdesc} | Est ${plo}-${phi}</div>"
-                "</div>"
-            ).format(
-                rs=rec.get("rec_strike", "-"),
-                rdesc=rec.get("strike_desc", "ATM"),
-                plo=rec.get("prem_est_low", "-"),
-                phi=rec.get("prem_est_high", "-")
-            )
-
-            if has_options:
-                prem_html = (
-                    "<div style='font-size:15px;font-weight:600'>"
-                    "${prem}"
-                    "<span style='margin-left:5px;background:#238636;color:white;"
-                    "padding:1px 5px;border-radius:3px;font-size:9px'>LIVE</span>"
-                    "</div>"
-                    "<div style='color:#8b949e;font-size:10px;margin-top:3px'>"
-                    "Stop ${stp} &nbsp;/&nbsp; Tgt ${tgt}</div>"
-                ).format(prem=s.get("premium","-"),
-                         stp=s.get("stop","-"), tgt=s.get("target","-"))
-                action_html = (
-                    "<a href='/take?sym={sym}&dir={d}&prem={prem}&con={con}"
-                    "&stp={stp}&tgt={tgt}&grade={grade}&gpts={gpts}"
-                    "&gap={gpct}&gdir={gdir}&rs={rs:.2f}' "
-                    "style='display:inline-block;background:#238636;color:white;"
-                    "padding:8px 16px;border-radius:6px;text-decoration:none;"
-                    "font-size:12px;font-weight:700'>TAKE</a>"
-                ).format(
-                    sym=sym, d=d,
-                    prem=s.get("premium",""), con=s.get("contracts","1"),
-                    stp=s.get("stop",""), tgt=s.get("target",""),
-                    grade=grade, gpts=grade_pts,
-                    gpct=round(abs(gap_pct),2), gdir=gap_dir, rs=rs
-                )
-            else:
-                prem_html = ("<div style='color:#8b949e;font-size:11px'>"
-                             "Check broker</div>")
-                action_html = ""
-
-            signal_rows += """
-<tr style='border-bottom:2px solid #21262d;background:{bg}'>
-  <td style='padding:10px 8px;vertical-align:top'>
-    <div style='font-size:14px;font-weight:700'>{sym}{late}</div>
-    <div style='font-size:11px;color:{dc};margin-top:2px;font-weight:700'>{arr} {d}</div>
-    {align_tag}
-  </td>
-  <td style='padding:10px 8px;text-align:center;vertical-align:top'>
-    <div style='font-size:30px;font-weight:800;color:{gc};line-height:1'>{grade}</div>
-    <div style='font-size:10px;color:#8b949e;margin-top:2px'>{gpts}pts</div>
-    <div style='font-size:9px;margin-top:3px'>
-      <span style='background:#21262d;color:#8b949e;padding:2px 6px;border-radius:3px'>SIGNAL</span>
-    </div>
-    {ca_html}
-  </td>
-  <td style='padding:10px 8px;vertical-align:top'>
-    <div style='font-size:16px;font-weight:700'>${price}</div>
-    <div style='margin-top:5px;font-size:11px;line-height:2'>
-      <span style='color:{tc}'>T1 ${t1}</span>
-      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t1p}%</span><br>
-      <span style='color:{tc}'>T2 ${t2}</span>
-      <span style='color:#8b949e;font-size:10px;margin-left:4px'>{t2p}%</span><br>
-      <span style='color:{sc}'>Stop ${stop}</span>
-    </div>
-  </td>
-  <td style='padding:10px 8px;vertical-align:top;font-size:11px;line-height:2'>
-    <span style='color:#8b949e'>Gap</span> <span style='color:{gapc};font-weight:600'>{gsign}{gpct}%</span><br>
-    <span style='color:#8b949e'>RS</span> <span style='color:{rsc};font-weight:600'>{rs:+.2f}%</span><br>
-    <span style='color:#8b949e'>SPY</span> <span>{spy:+.2f}%</span>
-  </td>
-  <td style='padding:10px 8px;vertical-align:top'>{prem_html}{rec_html}</td>
-  <td style='padding:10px 8px;vertical-align:middle'>{action_html}</td>
-</tr>""".format(
-                bg=bg, sym=sym, late=late_tag, dc=dc, arr=arr, d=d,
-                gc=grade_color, grade=grade, gpts=grade_pts,
-                price=price, t1=t1, t2=t2, stop=stop,
-                tc=t_color, sc=s_color,
-                t1p=int(t1_prob), t2p=int(t2_prob),
-                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
-                rsc=rs_color, rs=rs,
-                spy=s.get("spy_chg") or 0,
-                prem_html=prem_html, action_html=action_html,
-                align_tag=align_tag, ca_html=ca_html, rec_html=rec_html
-            )
-
-        elif status == "WATCHING":
-            if d == "CALL":
-                trigger = "Break &gt; ${}".format(s.get("orb_high","-"))
-                t1_w    = s.get("und_call_t1", "-")
-                arr     = "&#9650;"
-            else:
-                trigger = "Break &lt; ${}".format(s.get("orb_low","-"))
-                t1_w    = s.get("und_put_t1", "-")
-                arr     = "&#9660;"
-
-            signal_rows += """
-<tr style='border-bottom:1px solid #21262d'>
-  <td style='padding:10px 8px;vertical-align:top'>
-    <div style='font-size:14px;font-weight:700'>{sym}</div>
-    <div style='font-size:11px;color:{dc};margin-top:2px;font-weight:600'>{arr} {d}</div>
-  </td>
-  <td style='padding:10px 8px;text-align:center;vertical-align:top'>
-    <span style='background:#9e6a03;color:white;padding:4px 8px;
-    border-radius:5px;font-size:11px;font-weight:600'>WATCH</span>
-  </td>
-  <td style='padding:10px 8px;vertical-align:top'>
-    <div style='font-size:16px;font-weight:700'>${price}</div>
-    <div style='font-size:10px;color:#e3b341;margin-top:4px'>{trigger}</div>
-    <div style='font-size:10px;color:#8b949e;margin-top:2px'>If breaks: T1 ${t1}</div>
-  </td>
-  <td style='padding:10px 8px;vertical-align:top;font-size:11px'>
-    <div>Gap&nbsp;<span style='color:{gapc};font-weight:600'>{gsign}{gpct}%</span></div>
-    <div style='margin-top:3px'>RS&nbsp;<span style='color:{rsc};font-weight:600'>{rs:+.2f}%</span></div>
-  </td>
-  <td style='padding:10px 8px;vertical-align:top;font-size:11px;color:#8b949e'>
-    {vs_orb}
-  </td>
-  <td></td>
-</tr>""".format(
-                sym=sym, dc=dc, arr=arr, d=d, price=price,
-                trigger=trigger, t1=t1_w,
-                gapc=gap_color, gsign=gap_sign, gpct=round(abs(gap_pct),2),
-                rsc=rs_color, rs=rs,
-                vs_orb=s.get("vs_orb","-")
-            )
-
+        # Targets
+        if is_call:
+            t1   = s.get("und_call_t1", "-")
+            t2   = s.get("und_call_t2", "-")
+            stop = s.get("und_call_stop", "-")
+            arr  = "&#9650;"
         else:
-            signal_rows += (
-                "<tr style='border-bottom:1px solid #21262d;opacity:0.25'>"
-                "<td style='padding:6px 8px;font-size:12px'>{sym}</td>"
-                "<td colspan='5' style='padding:6px 8px;font-size:11px;"
-                "color:#8b949e'>{status}</td></tr>"
-            ).format(sym=sym, status=status)
+            t1   = s.get("und_put_t1", "-")
+            t2   = s.get("und_put_t2", "-")
+            stop = s.get("und_put_stop", "-")
+            arr  = "&#9660;"
+
+        t_color = dc
+        s_color = "#f85149" if is_call else "#3fb950"
+
+        # Gap / RS display
+        gap_c   = "#3fb950" if gap_dir == "UP" else "#f85149" if gap_dir == "DOWN" else "#8b949e"
+        rs_c    = "#3fb950" if rs >= 0 else "#f85149"
+        gap_str = "{}{:.2f}%".format("+" if gap_pct >= 0 else "", gap_pct)
+
+        # Clear air
+        ca       = s.get("clear_air") or {}
+        ca_t1    = ca.get("clear_to_t1", True)
+        ca_t2    = ca.get("clear_to_t2", True)
+        ca_ctx   = ca.get("context", "")
+        if ca_t2:
+            ca_icon  = "&#10003;"
+            ca_col   = "#3fb950"
+            ca_label = "Clear air to T2"
+        elif ca_t1:
+            ca_icon  = "&#9888;"
+            ca_col   = "#e3b341"
+            ca_label = ca_ctx[:45] if ca_ctx else "Clear to T1 only"
+        else:
+            ca_icon  = "&#9888;"
+            ca_col   = "#f85149"
+            ca_label = ca_ctx[:45] if ca_ctx else "Level blocks T1"
+
+        # Contract recommendation
+        rec       = s.get("rec_contract") or {}
+        rec_str   = rec.get("rec_strike", "-")
+        rec_desc  = rec.get("strike_desc", "ATM")
+        rec_plo   = rec.get("prem_est_low", "-")
+        rec_phi   = rec.get("prem_est_high", "-")
+
+        # Badges
+        late_badge = ("<span style='background:#9e6a03;color:#fff;padding:2px 6px;"
+                      "border-radius:3px;font-size:10px;font-weight:600;"
+                      "margin-left:6px'>LATE</span>" if late else "")
+        ct_badge   = ("<span style='background:#3d1a00;color:#e3b341;padding:2px 7px;"
+                      "border-radius:3px;font-size:10px;font-weight:700;"
+                      "margin-left:6px'>CTR-TREND</span>" if not aligned else "")
+
+        # Premium / action section
+        has_options = (status == "SIGNAL")
+        if has_options:
+            prem     = s.get("premium", "-")
+            stp_opt  = s.get("stop", "-")
+            tgt_opt  = s.get("target", "-")
+            con      = s.get("contracts", 1)
+            take_url = ("/take?sym={}&dir={}&prem={}&con={}&stp={}&tgt={}"
+                        "&grade={}&gpts={}&gap={:.2f}&gdir={}&rs={:.2f}").format(
+                sym, d, prem, con, stp_opt, tgt_opt,
+                grade, grade_pts, gap_pct, gap_dir, rs)
+            option_section = """
+      <div style='display:flex;align-items:center;justify-content:space-between;
+                  background:#0d1117;border-radius:6px;padding:10px 12px;margin-top:10px;
+                  border:1px solid #238636'>
+        <div>
+          <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                      letter-spacing:.5px;margin-bottom:3px'>Option Premium</div>
+          <div style='font-size:18px;font-weight:700;font-family:monospace'>${prem}</div>
+          <div style='font-size:10px;color:#8b949e;margin-top:2px'>
+            Stop ${sopt} &nbsp;|&nbsp; Target ${topt} &nbsp;|&nbsp; {con}x contracts
+          </div>
+        </div>
+        <a href='{url}' style='background:#238636;color:#fff;padding:10px 20px;
+           border-radius:6px;text-decoration:none;font-size:13px;font-weight:700;
+           letter-spacing:.3px;white-space:nowrap'>LOG TRADE</a>
+      </div>""".format(prem=prem, sopt=stp_opt, topt=tgt_opt, con=con, url=take_url)
+        else:
+            option_section = """
+      <div style='background:#0d1117;border-radius:6px;padding:10px 12px;
+                  margin-top:10px;border:1px solid #30363d;
+                  font-size:11px;color:#8b949e'>
+        No live option data &mdash; enter manually at broker
+      </div>"""
+
+        signal_cards += """
+<div style='background:#161b22;border:1px solid {dborder};border-radius:10px;
+            margin-bottom:12px;overflow:hidden'>
+
+  <!-- Card header -->
+  <div style='background:{dbg};padding:12px 14px;display:flex;
+              align-items:center;justify-content:space-between;
+              border-bottom:1px solid {dborder}'>
+    <div style='display:flex;align-items:center;gap:10px'>
+      <span style='font-size:18px;font-weight:800;letter-spacing:.5px'>{sym}</span>
+      <span style='color:{dc};font-size:14px;font-weight:700'>{arr} {d}</span>
+      {late_badge}{ct_badge}
+    </div>
+    <div style='display:flex;align-items:center;gap:12px'>
+      <div style='text-align:center'>
+        <div style='font-size:28px;font-weight:900;color:{gc};line-height:1'>{grade}</div>
+        <div style='font-size:10px;color:#8b949e;margin-top:1px'>{gpts}pts</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Card body -->
+  <div style='padding:12px 14px'>
+
+    <!-- Row 1: Price + Targets + Context -->
+    <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px'>
+
+      <!-- Price -->
+      <div style='background:#0d1117;border-radius:6px;padding:10px'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:4px'>Underlying</div>
+        <div style='font-size:22px;font-weight:700;font-family:monospace'>${price}</div>
+        <div style='font-size:10px;color:#8b949e;margin-top:3px'>
+          VWAP ${vwap} &nbsp;|&nbsp; {vs_vwap}
+        </div>
+      </div>
+
+      <!-- Targets -->
+      <div style='background:#0d1117;border-radius:6px;padding:10px'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:6px'>Price Targets</div>
+        <div style='font-size:12px;line-height:1.9;font-family:monospace'>
+          <span style='color:{tc}'>T1</span>
+          <span style='font-weight:600'> ${t1}</span>
+          <span style='color:#8b949e;font-size:10px'> {t1p}%</span><br>
+          <span style='color:{tc}'>T2</span>
+          <span style='font-weight:600'> ${t2}</span>
+          <span style='color:#8b949e;font-size:10px'> {t2p}%</span><br>
+          <span style='color:{sc}'>ST</span>
+          <span style='font-weight:600'> ${stop}</span>
+        </div>
+      </div>
+
+      <!-- Context: Gap / RS / SPY -->
+      <div style='background:#0d1117;border-radius:6px;padding:10px'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:6px'>Market Context</div>
+        <div style='font-size:12px;line-height:1.9;font-family:monospace'>
+          <span style='color:#8b949e'>GAP</span>
+          <span style='color:{gapc};font-weight:600'> {gap_str}</span><br>
+          <span style='color:#8b949e'>R/S</span>
+          <span style='color:{rsc};font-weight:600'> {rs:+.2f}%</span><br>
+          <span style='color:#8b949e'>SPY</span>
+          <span style='font-weight:600'> {spy:+.2f}%</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 2: Clear air + Contract rec side by side -->
+    <div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:0'>
+
+      <!-- Clear air -->
+      <div style='background:#0d1117;border-radius:6px;padding:10px;
+                  border-left:3px solid {ca_col}'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:4px'>Key Levels</div>
+        <div style='font-size:12px;color:{ca_col};font-weight:600'>
+          {ca_icon} {ca_label}
+        </div>
+      </div>
+
+      <!-- Recommended contract -->
+      <div style='background:#0d1117;border-radius:6px;padding:10px;
+                  border-left:3px solid #58a6ff'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:4px'>Rec Contract</div>
+        <div style='font-size:13px;font-weight:700;font-family:monospace'>
+          ${rec_str} {d} &nbsp;<span style='font-size:10px;color:#8b949e;font-weight:400'>{rec_desc}</span>
+        </div>
+        <div style='font-size:10px;color:#8b949e;margin-top:2px'>
+          Delta ~0.40 &nbsp;|&nbsp; Est ${rec_plo}-${rec_phi}
+        </div>
+      </div>
+    </div>
+
+    {option_section}
+  </div>
+</div>""".format(
+            sym=sym, d=d, arr=arr, dc=dc,
+            dbg=dir_bg, dborder=dir_border,
+            grade=grade, gpts=grade_pts, gc=grade_color,
+            late_badge=late_badge, ct_badge=ct_badge,
+            price=price,
+            vwap=s.get("vwap","-"),
+            vs_vwap=s.get("vs_vwap",""),
+            t1=t1, t2=t2, stop=stop,
+            tc=t_color, sc=s_color,
+            t1p=t1_prob, t2p=t2_prob,
+            gapc=gap_c, gap_str=gap_str,
+            rsc=rs_c, rs=rs,
+            spy=spy_chg,
+            ca_col=ca_col, ca_icon=ca_icon, ca_label=ca_label,
+            rec_str=rec_str, rec_desc=rec_desc,
+            rec_plo=rec_plo, rec_phi=rec_phi,
+            option_section=option_section
+        )
+
+    # - WATCHING compact rows -
+    watch_rows = ""
+    for s in watching_list:
+        sym  = s["symbol"]
+        d    = s.get("direction","")
+        dc   = "#3fb950" if d=="CALL" else "#f85149"
+        p    = s.get("price","-")
+        rs   = s.get("rs") or 0
+        rsc  = "#3fb950" if rs >= 0 else "#f85149"
+        gap  = s.get("gap_pct") or 0
+        gapc = "#3fb950" if (s.get("gap_dir")=="UP") else "#f85149" if (s.get("gap_dir")=="DOWN") else "#8b949e"
+        orb  = s.get("orb_high","-") if d=="CALL" else s.get("orb_low","-")
+        brk  = "above ${}" .format(orb) if d=="CALL" else "below ${}".format(orb)
+        watch_rows += (
+            "<tr style='border-bottom:1px solid #21262d'>"
+            "<td style='padding:8px 10px;font-weight:700;font-size:13px'>{sym}</td>"
+            "<td style='padding:8px 6px;color:{dc};font-size:12px;font-weight:600'>{d}</td>"
+            "<td style='padding:8px 6px;font-family:monospace;font-size:12px'>${p}</td>"
+            "<td style='padding:8px 6px;font-size:11px;color:#e3b341'>Break {brk}</td>"
+            "<td style='padding:8px 6px;font-size:11px'>"
+            "  Gap <span style='color:{gapc}'>{gap:+.2f}%</span>"
+            "</td>"
+            "<td style='padding:8px 6px;font-size:11px'>"
+            "  RS <span style='color:{rsc}'>{rs:+.2f}%</span>"
+            "</td>"
+            "</tr>"
+        ).format(sym=sym, d=d, dc=dc, p=p, brk=brk,
+                 gap=gap, gapc=gapc, rs=rs, rsc=rsc)
 
     # - Open trades rows -
     open_rows = ""
@@ -1542,195 +1604,209 @@ def render_dashboard():
         cp = get_current_price(t["symbol"])
         if cp and t["premium"]:
             unreal = round((cp - t["premium"]) * 100 * t["contracts"], 2)
-            uc     = "#3fb950" if unreal >= 0 else "#f85149"
-            us     = "<span style='color:{};font-weight:600'>${}</span>".format(uc, unreal)
+            uc = "#3fb950" if unreal >= 0 else "#f85149"
+            us = "<span style='color:{};font-weight:600'>${}</span>".format(uc, unreal)
         else:
             us = "<span style='color:#8b949e'>-</span>"
+        dc = "#3fb950" if t["direction"]=="CALL" else "#f85149"
         open_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
-            "<td style='padding:10px 8px;font-weight:700'>{sym}</td>"
-            "<td style='padding:10px 8px;color:{dc}'>{dir}</td>"
-            "<td style='padding:10px 8px'>${prem}</td>"
-            "<td style='padding:10px 8px'>{con}x</td>"
-            "<td style='padding:10px 8px'>{unreal}</td>"
-            "<td style='padding:10px 8px'>"
+            "<td style='padding:9px 10px;font-weight:700'>{sym}</td>"
+            "<td style='padding:9px 6px;color:{dc}'>{dir}</td>"
+            "<td style='padding:9px 6px;font-family:monospace'>${prem}</td>"
+            "<td style='padding:9px 6px'>{con}x</td>"
+            "<td style='padding:9px 6px'>{unreal}</td>"
+            "<td style='padding:9px 6px'>"
             "<a href='/close?id={id}&outcome=WIN&exit={cp}' "
-            "style='background:#238636;color:white;padding:5px 10px;"
-            "border-radius:5px;text-decoration:none;font-size:11px;"
-            "font-weight:600;margin-right:5px'>WIN</a>"
+            "style='background:#238636;color:#fff;padding:4px 10px;"
+            "border-radius:4px;text-decoration:none;font-size:11px;"
+            "font-weight:600;margin-right:4px'>WIN</a>"
             "<a href='/close?id={id}&outcome=LOSS&exit={cp}' "
-            "style='background:#da3633;color:white;padding:5px 10px;"
-            "border-radius:5px;text-decoration:none;font-size:11px;"
+            "style='background:#da3633;color:#fff;padding:4px 10px;"
+            "border-radius:4px;text-decoration:none;font-size:11px;"
             "font-weight:600'>LOSS</a>"
             "</td></tr>"
-        ).format(
-            sym=t["symbol"],
-            dc="#3fb950" if t["direction"]=="CALL" else "#f85149",
-            dir=t["direction"], prem=t["premium"], con=t["contracts"],
-            unreal=us, id=t["id"], cp=cp or 0
-        )
+        ).format(sym=t["symbol"], dc=dc, dir=t["direction"],
+                 prem=t["premium"], con=t["contracts"],
+                 unreal=us, id=t["id"], cp=cp or 0)
 
     # - Closed trades rows -
     closed_rows = ""
     for t in closed:
         pc = "#3fb950" if (t["pnl"] or 0) >= 0 else "#f85149"
         oc = "#3fb950" if t["outcome"] == "WIN" else "#f85149"
+        dc = "#3fb950" if t["direction"]=="CALL" else "#f85149"
         closed_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
-            "<td style='padding:10px 8px;font-weight:700'>{sym}</td>"
-            "<td style='padding:10px 8px;color:{dc}'>{dir}</td>"
-            "<td style='padding:10px 8px'>${prem}</td>"
-            "<td style='padding:10px 8px;color:{oc};font-weight:600'>{out}</td>"
-            "<td style='padding:10px 8px;color:{pc};font-weight:600'>${pnl}</td>"
+            "<td style='padding:9px 10px;font-weight:700'>{sym}</td>"
+            "<td style='padding:9px 6px;color:{dc}'>{dir}</td>"
+            "<td style='padding:9px 6px;font-family:monospace'>${prem}</td>"
+            "<td style='padding:9px 6px;color:{oc};font-weight:600'>{out}</td>"
+            "<td style='padding:9px 6px;color:{pc};font-weight:600;font-family:monospace'>${pnl}</td>"
             "</tr>"
-        ).format(
-            sym=t["symbol"],
-            dc="#3fb950" if t["direction"]=="CALL" else "#f85149",
-            dir=t["direction"], prem=t["premium"],
-            oc=oc, out=t["outcome"], pc=pc, pnl=round(t["pnl"] or 0, 2)
-        )
+        ).format(sym=t["symbol"], dc=dc, dir=t["direction"],
+                 prem=t["premium"], oc=oc, out=t["outcome"],
+                 pc=pc, pnl=round(t["pnl"] or 0, 2))
 
-    # - HTML -
-    empty_scanner = (
-        "<tr><td colspan='6' style='padding:20px;text-align:center;"
-        "color:#8b949e;font-size:13px'>Waiting for next scan...</td></tr>"
-    )
-    empty_open = (
-        "<tr><td colspan='6' style='padding:20px;text-align:center;"
-        "color:#8b949e;font-size:13px'>No open trades</td></tr>"
-    )
-    empty_closed = (
-        "<tr><td colspan='5' style='padding:20px;text-align:center;"
-        "color:#8b949e;font-size:13px'>No closed trades today</td></tr>"
-    )
+    no_signals   = not active_signals
+    no_watch     = not watching_list
+    no_open      = not open_trades
+    no_closed    = not closed
 
     html = """<!DOCTYPE html>
-<html><head>
-<meta http-equiv='refresh' content='30'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>0DTE Engine</title>
 <style>
-  * {{ box-sizing:border-box; margin:0; padding:0 }}
-  body {{ background:#0d1117; color:#e6edf3; font-family:-apple-system,Arial,sans-serif; padding:12px }}
-  h1 {{ font-size:17px; font-weight:700; margin-bottom:4px }}
-  .topbar {{ font-size:11px; color:#8b949e; margin-bottom:14px; display:flex; align-items:center; gap:8px; flex-wrap:wrap }}
-  .dot {{ width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:3px }}
-  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; margin-bottom:14px; overflow:hidden }}
-  .card-header {{ padding:11px 14px; border-bottom:1px solid #30363d; display:flex; justify-content:space-between; align-items:center }}
-  .card-title {{ font-size:13px; font-weight:600; color:#e6edf3 }}
-  .card-sub {{ font-size:11px; color:#8b949e }}
-  .stats-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:14px }}
-  .stat-box {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:11px; text-align:center }}
-  .stat-val {{ font-size:20px; font-weight:700; line-height:1 }}
-  .stat-lbl {{ font-size:10px; color:#8b949e; margin-top:4px }}
-  table {{ width:100%; border-collapse:collapse }}
-  th {{ padding:9px 8px; text-align:left; font-size:11px; font-weight:600; color:#8b949e; border-bottom:1px solid #30363d; text-transform:uppercase; letter-spacing:.5px }}
-  .nav-link {{ color:#58a6ff; text-decoration:none; font-size:11px; font-weight:500 }}
-  .nav-link:hover {{ text-decoration:underline }}
-  .debug-box {{ background:#010409; border-radius:6px; padding:10px; font-size:10px; font-family:monospace; max-height:180px; overflow-y:auto; color:#8b949e; line-height:1.6 }}
-  .grade-pill {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:700 }}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0d1117;color:#e6edf3;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+       font-size:13px;min-height:100vh}}
+  .topbar{{background:#010409;border-bottom:1px solid #30363d;
+           padding:10px 14px;display:flex;align-items:center;
+           justify-content:space-between;flex-wrap:wrap;gap:8px;
+           position:sticky;top:0;z-index:100}}
+  .topbar-left{{display:flex;align-items:center;gap:16px;flex-wrap:wrap}}
+  .topbar-right{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+  .brand{{font-size:13px;font-weight:700;color:#58a6ff;letter-spacing:.5px}}
+  .stat-chip{{background:#161b22;border:1px solid #30363d;border-radius:6px;
+              padding:4px 10px;font-size:11px;white-space:nowrap}}
+  .stat-chip .val{{font-weight:700;font-size:13px}}
+  .bias-bar{{padding:7px 14px;display:flex;align-items:center;gap:14px;
+             border-bottom:1px solid #30363d;font-size:11px;flex-wrap:wrap}}
+  .section-label{{font-size:10px;font-weight:700;color:#8b949e;
+                  text-transform:uppercase;letter-spacing:.8px;
+                  padding:12px 14px 6px;}}
+  .empty{{padding:20px;text-align:center;color:#8b949e;font-size:12px}}
+  .watch-table{{width:100%;border-collapse:collapse}}
+  .watch-table th{{padding:7px 10px;text-align:left;font-size:10px;
+                   font-weight:600;color:#8b949e;border-bottom:1px solid #30363d;
+                   text-transform:uppercase;letter-spacing:.5px}}
+  .trade-table{{width:100%;border-collapse:collapse}}
+  .trade-table th{{padding:8px 10px;text-align:left;font-size:10px;
+                   font-weight:600;color:#8b949e;border-bottom:1px solid #30363d;
+                   text-transform:uppercase;letter-spacing:.5px}}
+  .card-wrap{{padding:10px 14px}}
+  .section-card{{background:#161b22;border:1px solid #30363d;
+                 border-radius:10px;margin-bottom:12px;overflow:hidden}}
+  .nav-link{{color:#58a6ff;text-decoration:none;font-size:11px;font-weight:500}}
+  .nav-link:hover{{text-decoration:underline}}
+  .dot{{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}}
+  .debug-box{{background:#010409;font-size:10px;font-family:monospace;
+              max-height:160px;overflow-y:auto;color:#6e7681;
+              line-height:1.6;padding:10px 14px}}
 </style>
 </head><body>
 
-<h1>Institutional 0DTE Engine</h1>
-<div class='topbar'>
-  <span><span class='dot' style='background:{mc}'></span><span style='color:{mc};font-weight:600'>{ms}</span></span>
-  <span>Next scan {sc}s</span>
-  <span>Bot <span style='color:{bc};font-weight:600'>{be}</span></span>
-  <span>Market <span style='color:{mbc};font-weight:600'>{mb}</span></span>
-  <span style='margin-left:4px'>
-    <a class='nav-link' href='/stats'>Stats</a> &nbsp;
-    <a class='nav-link' href='/alpaca-test'>Alpaca</a> &nbsp;
-    <a class='nav-link' href='/telegram-test'>Telegram</a> &nbsp;
-    <a class='nav-link' href='/debug'>Debug</a>
-  </span>
-</div>
-
-<div class='stats-grid'>
-  <div class='stat-box'>
-    <div class='stat-val' style='color:{pc}'>${pl}</div>
-    <div class='stat-lbl'>Today P&amp;L</div>
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="brand">0DTE ENGINE</span>
+    <span class="stat-chip">
+      <span class="dot" style="background:{mc}"></span>
+      <span class="val" style="color:{mc}">{ml}</span>
+    </span>
+    <span class="stat-chip">
+      Bias <span class="val" style="color:{biasc}">&nbsp;{bias}</span>
+      <span style="color:#8b949e"> &nbsp;SPY {spy:+.2f}%</span>
+    </span>
+    <span class="stat-chip">
+      P&amp;L <span class="val" style="color:{pc}">&nbsp;${pl}</span>
+    </span>
+    <span class="stat-chip">
+      <span class="val" style="color:{wrc}">{wr}%</span>
+      <span style="color:#8b949e"> &nbsp;{nw}W {nl}L</span>
+    </span>
+    <span class="stat-chip" style="color:#8b949e">
+      Scan <span class="val" style="color:#e6edf3">&nbsp;{sc}s</span>
+    </span>
   </div>
-  <div class='stat-box'>
-    <div class='stat-val'>{nt}</div>
-    <div class='stat-lbl'>Trades</div>
-  </div>
-  <div class='stat-box'>
-    <div class='stat-val' style='color:#3fb950'>{nw}</div>
-    <div class='stat-lbl'>Wins</div>
-  </div>
-  <div class='stat-box'>
-    <div class='stat-val' style='color:{wrc}'>{wr}%</div>
-    <div class='stat-lbl'>Win Rate</div>
+  <div class="topbar-right">
+    <a class="nav-link" href="/stats">Stats</a>
+    <a class="nav-link" href="/alpaca-test">Alpaca</a>
+    <a class="nav-link" href="/debug">Debug</a>
   </div>
 </div>
 
-<div class='card'>
-  <div class='card-header'>
-    <span class='card-title'>Signal Scanner</span>
-    <span class='card-sub'>{ns} signals &nbsp;|&nbsp; ORB 30min &nbsp;|&nbsp; Vol-adjusted</span>
+<!-- SIGNAL CARDS -->
+<div style="padding:12px 14px 0">
+  <div style="font-size:10px;font-weight:700;color:#8b949e;
+              text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">
+    Active Signals &mdash; {nsig} setup{pl_s} found
   </div>
-  <table>
-    <tr>
-      <th>Symbol</th>
-      <th style='text-align:center'>Grade</th>
-      <th>Price &amp; Targets</th>
-      <th>Gap / RS</th>
-      <th>Option</th>
-      <th>Action</th>
-    </tr>
-    {sr}
-  </table>
+  {signal_cards}
+  {no_sig_msg}
 </div>
 
-<div class='card'>
-  <div class='card-header'>
-    <span class='card-title'>Open Trades</span>
-  </div>
-  <table>
-    <tr>
-      <th>Symbol</th><th>Dir</th><th>Entry</th><th>Size</th>
-      <th>Unreal P&amp;L</th><th>Close</th>
-    </tr>
-    {or_}
-  </table>
+<!-- WATCHING -->
+<div class="section-label">Watching &mdash; {nwatch} setup{pl_w}</div>
+<div class="section-card" style="margin:0 14px 12px">
+  {watch_content}
 </div>
 
-<div class='card'>
-  <div class='card-header'>
-    <span class='card-title'>Today Closed</span>
-  </div>
-  <table>
-    <tr>
-      <th>Symbol</th><th>Dir</th><th>Entry</th><th>Result</th><th>P&amp;L</th>
-    </tr>
-    {cr}
-  </table>
+<!-- OPEN TRADES -->
+<div class="section-label">Open Trades</div>
+<div class="section-card" style="margin:0 14px 12px">
+  {open_content}
 </div>
 
-<div class='card' style='padding:12px'>
-  <div style='font-size:11px;font-weight:600;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px'>Debug Log</div>
-  <div class='debug-box'>{ll}</div>
+<!-- CLOSED TODAY -->
+<div class="section-label">Closed Today</div>
+<div class="section-card" style="margin:0 14px 12px">
+  {closed_content}
+</div>
+
+<!-- DEBUG -->
+<div class="section-label">Debug Log</div>
+<div class="section-card" style="margin:0 14px 14px">
+  <div class="debug-box">{log_lines}</div>
 </div>
 
 </body></html>""".format(
-        mc=market_color, ms=market_status,
+        mc=mkt_color, ml=mkt_label,
+        bias=market_bias, biasc=bias_color, spy=spy_chg,
+        pc=pnl_color, pl=total_pnl,
+        wrc=wr_color, wr=win_rate, nw=wins, nl=losses,
         sc=secs,
-        bc="#3fb950" if bot_enabled else "#f85149",
-        be="ON" if bot_enabled else "PAUSED",
-        mb=signals[0].get("market_bias","?") if signals else "?",
-        mbc="#3fb950" if (signals[0].get("market_bias","") == "BULL" if signals else False) else "#f85149" if (signals[0].get("market_bias","") == "BEAR" if signals else False) else "#e3b341",
-        pc=pnl_color, pl=round(total_pnl, 2),
-        nt=len(closed), nw=wins,
-        wr=win_rate,
-        wrc="#3fb950" if win_rate >= 50 else "#f85149",
-        ns=active_count,
-        sr=signal_rows or empty_scanner,
-        or_=open_rows or empty_open,
-        cr=closed_rows or empty_closed,
-        ll="<br>".join(logs) if logs else "No logs yet"
+        nsig=len(active_signals),
+        pl_s="" if len(active_signals)==1 else "s",
+        signal_cards=signal_cards,
+        no_sig_msg=("<div style='background:#161b22;border:1px solid #30363d;"
+                    "border-radius:10px;padding:24px;text-align:center;"
+                    "color:#8b949e;font-size:12px'>"
+                    "No signals confirmed yet &mdash; waiting for ORB breakout</div>"
+                    if no_signals else ""),
+        nwatch=len(watching_list),
+        pl_w="" if len(watching_list)==1 else "s",
+        watch_content=(
+            "<table class='watch-table'>"
+            "<tr><th>Symbol</th><th>Dir</th><th>Price</th>"
+            "<th>Breakout Level</th><th>Gap</th><th>Rel Str</th></tr>"
+            + watch_rows + "</table>"
+            if not no_watch else
+            "<div class='empty'>No symbols approaching ORB levels</div>"
+        ),
+        open_content=(
+            "<table class='trade-table'>"
+            "<tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
+            "<th>Size</th><th>Unreal P&amp;L</th><th>Close</th></tr>"
+            + open_rows + "</table>"
+            if not no_open else
+            "<div class='empty'>No open trades</div>"
+        ),
+        closed_content=(
+            "<table class='trade-table'>"
+            "<tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
+            "<th>Result</th><th>P&amp;L</th></tr>"
+            + closed_rows + "</table>"
+            if not no_closed else
+            "<div class='empty'>No closed trades today</div>"
+        ),
+        log_lines="<br>".join(logs) if logs else "No log entries yet"
     )
     return html
-
 
 
 @app.route("/")
