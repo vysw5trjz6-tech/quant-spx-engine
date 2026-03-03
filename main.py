@@ -853,6 +853,172 @@ def recommend_contract(symbol, direction, price, orb_range):
 
 
 # =============================================
+# 1HR TREND DETECTION
+# =============================================
+
+def get_1hr_trend(bars_1hr):
+    """
+    Detects 1hr chart trend by comparing the last 3 swing highs and lows.
+    Returns: ('BULL'|'BEAR'|'MIXED', description_string, score -1..+1)
+
+    BULL  = 1hr making higher highs AND higher lows  -> confirms CALL
+    BEAR  = 1hr making lower highs  AND lower lows   -> confirms PUT
+    MIXED = neither condition met                    -> no confirmation
+    """
+    if not bars_1hr or len(bars_1hr) < 8:
+        return "MIXED", "Insufficient 1hr data", 0.0
+
+    # Find swing highs and lows using a 2-bar lookback on each side
+    highs, lows = [], []
+    for i in range(2, len(bars_1hr) - 2):
+        b = bars_1hr[i]
+        if b["h"] > bars_1hr[i-1]["h"] and b["h"] > bars_1hr[i-2]["h"]                 and b["h"] > bars_1hr[i+1]["h"] and b["h"] > bars_1hr[i+2]["h"]:
+            highs.append(b["h"])
+        if b["l"] < bars_1hr[i-1]["l"] and b["l"] < bars_1hr[i-2]["l"]                 and b["l"] < bars_1hr[i+1]["l"] and b["l"] < bars_1hr[i+2]["l"]:
+            lows.append(b["l"])
+
+    if len(highs) < 2 or len(lows) < 2:
+        return "MIXED", "Not enough 1hr pivots", 0.0
+
+    # Use last 3 swing points
+    last_highs = highs[-3:]
+    last_lows  = lows[-3:]
+
+    hh = all(last_highs[i] > last_highs[i-1] for i in range(1, len(last_highs)))
+    hl = all(last_lows[i]  > last_lows[i-1]  for i in range(1, len(last_lows)))
+    lh = all(last_highs[i] < last_highs[i-1] for i in range(1, len(last_highs)))
+    ll = all(last_lows[i]  < last_lows[i-1]  for i in range(1, len(last_lows)))
+
+    if hh and hl:
+        return "BULL", "1hr HH+HL confirmed", +1.0
+    elif lh and ll:
+        return "BEAR", "1hr LH+LL confirmed", -1.0
+    elif hh or hl:
+        return "BULL", "1hr partial uptrend", +0.5
+    elif lh or ll:
+        return "BEAR", "1hr partial downtrend", -0.5
+    else:
+        return "MIXED", "1hr ranging/choppy", 0.0
+
+
+# =============================================
+# TIME-ADJUSTED VOLUME
+# =============================================
+
+def get_time_vol_ratio(intraday_today, daily_bars, current_bar_idx):
+    """
+    Compares current bar's volume to the historical average volume
+    at the same time-of-day slot over the last N trading days.
+
+    Uses the intraday 5min bar index as a time proxy:
+      bar 0 = 9:30, bar 1 = 9:35, ..., bar 6 = 10:00, etc.
+
+    Returns: (ratio: float, label: str)
+      ratio > 2.0  = exceptional volume
+      ratio > 1.5  = elevated
+      ratio > 1.0  = normal
+      ratio < 0.8  = light volume
+    """
+    if not intraday_today or not daily_bars:
+        return 1.0, "N/A"
+
+    current_bar_idx = max(0, min(current_bar_idx, len(intraday_today) - 1))
+    current_vol     = intraday_today[current_bar_idx]["v"]
+
+    # We need historical intraday data per day - we don't fetch that separately,
+    # so we approximate using the full-day volume and scaling by time-of-day.
+    # Better approximation: use the last 10 daily bars to get average daily volume,
+    # then use the fraction of day elapsed to estimate expected cumulative volume.
+    if len(daily_bars) < 5:
+        return 1.0, "N/A"
+
+    avg_daily_vol = statistics.mean([b["v"] for b in daily_bars[-10:]])
+    if avg_daily_vol <= 0:
+        return 1.0, "N/A"
+
+    # Fraction of trading day elapsed (78 bars = full day of 5min bars)
+    day_fraction  = max(0.01, (current_bar_idx + 1) / 78.0)
+
+    # Volume typically front-loaded: first 30min ~25% of daily, so weight early bars
+    # Simple model: expected vol at bar N = avg_daily * (bar_fraction ^ 0.7)
+    expected_vol  = avg_daily_vol * (day_fraction ** 0.7)
+
+    # Scale expected to per-bar
+    expected_per_bar = expected_vol / (current_bar_idx + 1) if current_bar_idx > 0 else expected_vol
+
+    ratio = round(current_vol / expected_per_bar, 2) if expected_per_bar > 0 else 1.0
+
+    if ratio >= 3.0:
+        label = "Exceptional ({:.1f}x)".format(ratio)
+    elif ratio >= 2.0:
+        label = "High ({:.1f}x)".format(ratio)
+    elif ratio >= 1.3:
+        label = "Elevated ({:.1f}x)".format(ratio)
+    elif ratio >= 0.8:
+        label = "Normal ({:.1f}x)".format(ratio)
+    else:
+        label = "Light ({:.1f}x)".format(ratio)
+
+    return ratio, label
+
+
+# =============================================
+# COMPOSITE RANK SCORE
+# =============================================
+
+def compute_rank_score(result):
+    """
+    Single number 0-200 for ranking signals against each other.
+    Combines every quality dimension we have.
+
+    Factors:
+      grade_pts      0-100  (base score)
+      alignment      +20 if trend-aligned, -15 if counter
+      1hr trend      +20 if confirms direction, +10 partial, -10 opposes
+      time-adj vol   +15 exceptional, +8 elevated, 0 normal, -10 light
+      clear air      +20 clear to T2, +10 clear to T1, -15 blocked
+      late penalty   -20 after 2pm
+    Max possible: 175
+    """
+    grade_pts  = result.get("grade_pts", 0)
+    aligned    = result.get("aligned", True)
+    direction  = result.get("direction", "")
+    late       = result.get("late_entry", False)
+
+    score = grade_pts
+
+    # Alignment bonus/penalty
+    score += 20 if aligned else -15
+
+    # 1hr trend
+    trend     = result.get("trend_1hr", "MIXED")
+    trend_scr = result.get("trend_score", 0.0)
+    if direction == "CALL":
+        if trend == "BULL":   score += 20 if trend_scr >= 1.0 else 10
+        elif trend == "BEAR": score -= 10
+    elif direction == "PUT":
+        if trend == "BEAR":   score += 20 if trend_scr <= -1.0 else 10
+        elif trend == "BULL": score -= 10
+
+    # Time-adjusted volume
+    tv_ratio = result.get("time_vol_ratio", 1.0)
+    if tv_ratio >= 3.0:   score += 15
+    elif tv_ratio >= 2.0: score += 8
+    elif tv_ratio < 0.8:  score -= 10
+
+    # Clear air
+    ca = result.get("clear_air") or {}
+    if ca.get("clear_to_t2"):     score += 20
+    elif ca.get("clear_to_t1"):   score += 10
+    else:                         score -= 15
+
+    # Late penalty
+    if late: score -= 20
+
+    return max(0, score)
+
+
+# =============================================
 # OPTIONS
 # =============================================
 
@@ -1074,7 +1240,14 @@ def scan_all_symbols():
         et_hour    = et_now.hour + et_now.minute / 60.0
         late_entry = et_hour >= 14.0
 
-        key_levels = get_key_levels(daily, bars_1hr, bars_4hr)
+        key_levels  = get_key_levels(daily, bars_1hr, bars_4hr)
+
+        # 1hr trend confirmation
+        trend_1hr, trend_desc, trend_score = get_1hr_trend(bars_1hr)
+
+        # Time-adjusted volume (index of current bar in today's session)
+        bar_idx                = len(intraday) - 1
+        time_vol_ratio, tv_lbl = get_time_vol_ratio(intraday, daily, bar_idx)
 
         result["price"]      = round(price, 2)
         result["vwap"]       = round(vwap, 2)
@@ -1084,8 +1257,13 @@ def scan_all_symbols():
         result["gap_pct"]    = gap_pct
         result["gap_dir"]    = gap_dir
         result["rs"]         = rs
-        result["late_entry"] = late_entry
-        result["key_levels"] = key_levels
+        result["late_entry"]     = late_entry
+        result["key_levels"]     = key_levels
+        result["trend_1hr"]      = trend_1hr
+        result["trend_desc"]     = trend_desc
+        result["trend_score"]    = trend_score
+        result["time_vol_ratio"] = time_vol_ratio
+        result["time_vol_lbl"]   = tv_lbl
 
         if orb_range > 0:
             result["und_call_t1"]   = round(price + orb_range, 2)
@@ -1185,12 +1363,25 @@ def scan_all_symbols():
             symbol, direction, grade, grade_pts,
             result["aligned"], clear_air["clear_to_t1"], clear_air["context"]))
 
+    # Compute composite rank score for every confirmed signal
+    for r in results:
+        if r.get("status") in ("SIGNAL", "SIGNAL (no options)"):
+            r["rank_score"] = compute_rank_score(r)
+        else:
+            r["rank_score"] = 0
+
+    # Tag the top-ranked signal as PRIMARY
+    active = [r for r in results if r.get("rank_score", 0) > 0]
+    if active:
+        best = max(active, key=lambda r: r["rank_score"])
+        best["is_primary"] = True
+
     def sort_key(r):
-        s = r.get("status", "")
-        p = -r.get("grade_pts", r.get("score", 0))
-        if s == "SIGNAL":              return (0, p)
-        if s == "SIGNAL (no options)": return (1, p)
-        if s == "WATCHING":            return (2, p)
+        s  = r.get("status", "")
+        rs = -r.get("rank_score", 0)
+        if s == "SIGNAL":              return (0, rs)
+        if s == "SIGNAL (no options)": return (1, rs)
+        if s == "WATCHING":            return (2, -r.get("score", 0))
         return (4, 0)
 
     results.sort(key=sort_key)
@@ -1409,7 +1600,31 @@ def render_dashboard():
         rec_plo   = rec.get("prem_est_low", "-")
         rec_phi   = rec.get("prem_est_high", "-")
 
+        # Trend + time vol from result
+        trend_1hr    = s.get("trend_1hr", "MIXED")
+        trend_desc   = s.get("trend_desc", "")
+        trend_score  = s.get("trend_score", 0.0)
+        tv_lbl       = s.get("time_vol_lbl", "")
+        tv_ratio     = s.get("time_vol_ratio", 1.0)
+        is_primary   = s.get("is_primary", False)
+        rank_score   = s.get("rank_score", 0)
+
+        # Trend confirmation vs direction
+        if direction == "CALL":
+            trend_aligned = trend_1hr == "BULL"
+            trend_opposes = trend_1hr == "BEAR"
+        else:
+            trend_aligned = trend_1hr == "BEAR"
+            trend_opposes = trend_1hr == "BULL"
+
+        trend_col = "#3fb950" if trend_aligned else "#f85149" if trend_opposes else "#8b949e"
+        trend_icon = "&#9650;" if trend_1hr == "BULL" else "&#9660;" if trend_1hr == "BEAR" else "&#8212;"
+        tv_col = "#3fb950" if tv_ratio >= 2.0 else "#e3b341" if tv_ratio >= 1.3 else "#8b949e" if tv_ratio >= 0.8 else "#f85149"
+
         # Badges
+        primary_badge = ("<span style='background:#1f6feb;color:#fff;padding:2px 8px;"
+                         "border-radius:3px;font-size:10px;font-weight:700;"
+                         "margin-left:6px;letter-spacing:.3px'>PRIMARY</span>" if is_primary else "")
         late_badge = ("<span style='background:#9e6a03;color:#fff;padding:2px 6px;"
                       "border-radius:3px;font-size:10px;font-weight:600;"
                       "margin-left:6px'>LATE</span>" if late else "")
@@ -1460,12 +1675,16 @@ def render_dashboard():
   <div style='background:{dbg};padding:12px 14px;display:flex;
               align-items:center;justify-content:space-between;
               border-bottom:1px solid {dborder}'>
-    <div style='display:flex;align-items:center;gap:10px'>
+    <div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap'>
       <span style='font-size:18px;font-weight:800;letter-spacing:.5px'>{sym}</span>
       <span style='color:{dc};font-size:14px;font-weight:700'>{arr} {d}</span>
-      {late_badge}{ct_badge}
+      {primary_badge}{late_badge}{ct_badge}
     </div>
-    <div style='display:flex;align-items:center;gap:12px'>
+    <div style='display:flex;align-items:center;gap:14px'>
+      <div style='text-align:right'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.4px'>Rank</div>
+        <div style='font-size:14px;font-weight:700;color:#e6edf3'>{rank}</div>
+      </div>
       <div style='text-align:center'>
         <div style='font-size:28px;font-weight:900;color:{gc};line-height:1'>{grade}</div>
         <div style='font-size:10px;color:#8b949e;margin-top:1px'>{gpts}pts</div>
@@ -1505,23 +1724,23 @@ def render_dashboard():
         </div>
       </div>
 
-      <!-- Context: Gap / RS / SPY -->
+      <!-- Context: Gap / RS / Trend / Vol -->
       <div style='background:#0d1117;border-radius:6px;padding:10px'>
         <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
-                    letter-spacing:.5px;margin-bottom:6px'>Market Context</div>
+                    letter-spacing:.5px;margin-bottom:6px'>Context</div>
         <div style='font-size:12px;line-height:1.9;font-family:monospace'>
           <span style='color:#8b949e'>GAP</span>
           <span style='color:{gapc};font-weight:600'> {gap_str}</span><br>
           <span style='color:#8b949e'>R/S</span>
           <span style='color:{rsc};font-weight:600'> {rs:+.2f}%</span><br>
-          <span style='color:#8b949e'>SPY</span>
-          <span style='font-weight:600'> {spy:+.2f}%</span>
+          <span style='color:#8b949e'>1HR</span>
+          <span style='color:{trend_col};font-weight:600'> {trend_icon} {trend_1hr}</span>
         </div>
       </div>
     </div>
 
-    <!-- Row 2: Clear air + Contract rec side by side -->
-    <div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:0'>
+    <!-- Row 2: Key levels | Volume | Rec contract -->
+    <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:0'>
 
       <!-- Clear air -->
       <div style='background:#0d1117;border-radius:6px;padding:10px;
@@ -1531,6 +1750,17 @@ def render_dashboard():
         <div style='font-size:12px;color:{ca_col};font-weight:600'>
           {ca_icon} {ca_label}
         </div>
+      </div>
+
+      <!-- Time-adjusted volume -->
+      <div style='background:#0d1117;border-radius:6px;padding:10px;
+                  border-left:3px solid {tv_col}'>
+        <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:4px'>Volume Signal</div>
+        <div style='font-size:12px;color:{tv_col};font-weight:600'>
+          {tv_lbl}
+        </div>
+        <div style='font-size:10px;color:#8b949e;margin-top:2px'>vs time-of-day avg</div>
       </div>
 
       <!-- Recommended contract -->
@@ -1553,7 +1783,8 @@ def render_dashboard():
             sym=sym, d=d, arr=arr, dc=dc,
             dbg=dir_bg, dborder=dir_border,
             grade=grade, gpts=grade_pts, gc=grade_color,
-            late_badge=late_badge, ct_badge=ct_badge,
+            primary_badge=primary_badge, late_badge=late_badge, ct_badge=ct_badge,
+            rank=rank_score,
             price=price,
             vwap=s.get("vwap","-"),
             vs_vwap=s.get("vs_vwap",""),
@@ -1563,7 +1794,9 @@ def render_dashboard():
             gapc=gap_c, gap_str=gap_str,
             rsc=rs_c, rs=rs,
             spy=spy_chg,
+            trend_col=trend_col, trend_icon=trend_icon, trend_1hr=trend_1hr,
             ca_col=ca_col, ca_icon=ca_icon, ca_label=ca_label,
+            tv_col=tv_col, tv_lbl=tv_lbl,
             rec_str=rec_str, rec_desc=rec_desc,
             rec_plo=rec_plo, rec_phi=rec_phi,
             option_section=option_section
