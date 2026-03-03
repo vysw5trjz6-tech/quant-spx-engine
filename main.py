@@ -33,14 +33,6 @@ DATA_URL  = "https://data.alpaca.markets/v2/stocks/{}/bars"
 QUOTE_URL = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
 CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
 
-# Tradier - options data source (real ATM 0DTE chains)
-TRADIER_TOKEN   = os.getenv("TRADIER_TOKEN", "").strip()
-TRADIER_URL     = "https://sandbox.tradier.com/v1"
-TRADIER_HEADERS = {
-    "Authorization": "Bearer {}".format(os.getenv("TRADIER_TOKEN", "").strip()),
-    "Accept":        "application/json"
-}
-
 ALERT_FILE = "/tmp/last_alert.json"
 DB_FILE    = "/tmp/trades.db"
 
@@ -1024,103 +1016,87 @@ def compute_rank_score(result):
 
 def get_liquid_option(symbol, direction, underlying_price=None):
     """
-    Fetch a real 0DTE ATM option via Tradier API.
-    Steps:
-      1. Get today expiration date from Tradier expirations endpoint
-      2. Fetch full options chain for that expiration
-      3. Filter to ATM strikes (within 2% of underlying)
-      4. Select best by delta closest to 0.40
+    Fetch a 0DTE ATM option via Alpaca's options snapshot API.
+    Uses the same ALPACA_KEY / ALPACA_SECRET already configured.
+
+    Endpoint: GET https://data.alpaca.markets/v1beta1/options/snapshots/{symbol}
+    Filters:  today's expiration, correct type, ATM strikes within 2%
     Returns (premium, strike, is_live)
     """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        log("Alpaca keys not set - cannot fetch options")
+        return None, None, False
+
     option_type = "call" if direction == "CALL" else "put"
     et          = pytz.timezone("America/New_York")
     today_str   = datetime.now(et).strftime("%Y-%m-%d")
 
-    if not TRADIER_TOKEN:
-        log("TRADIER_TOKEN not set - cannot fetch options")
-        return None, None, False
+    # ATM strike window: 2% either side of underlying
+    if underlying_price:
+        lo = round(underlying_price * 0.98, 2)
+        hi = round(underlying_price * 1.02, 2)
+    else:
+        lo, hi = None, None
+
+    params = {
+        "feed":            "indicative",
+        "expiration_date": today_str,
+        "type":            option_type,
+        "limit":           50,
+    }
+    if lo is not None:
+        params["strike_price_gte"] = lo
+        params["strike_price_lte"] = hi
+
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
 
     try:
-        # Step 1: Get available expirations and confirm today is 0DTE
-        exp_url = "{}/markets/options/expirations".format(TRADIER_URL)
-        r = requests.get(exp_url, headers=TRADIER_HEADERS,
-                         params={"symbol": symbol, "includeAllRoots": "true"},
-                         timeout=10)
-        log("Tradier expirations {}: HTTP {}".format(symbol, r.status_code))
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        log("Alpaca options {} {} {}: HTTP {}".format(
+            symbol, option_type, today_str, r.status_code))
+
+        if r.status_code == 422:
+            log("  No 0DTE options available for {} today".format(symbol))
+            return None, None, False
         if r.status_code != 200:
-            log("  Expirations error: {}".format(r.text[:150]))
+            log("  Options error: {}".format(r.text[:150]))
             return None, None, False
 
-        expirations = r.json().get("expirations", {}) or {}
-        exp_dates   = expirations.get("date", [])
-        if isinstance(exp_dates, str):
-            exp_dates = [exp_dates]
+        snapshots = r.json().get("snapshots", {})
+        log("  {} contracts returned".format(len(snapshots)))
 
-        # Use today if available, else nearest expiration
-        if today_str in exp_dates:
-            target_exp = today_str
-            log("  0DTE expiration found: {}".format(target_exp))
-        elif exp_dates:
-            target_exp = exp_dates[0]
-            log("  No 0DTE today, using nearest: {}".format(target_exp))
-        else:
-            log("  No expirations available for {}".format(symbol))
-            return None, None, False
-
-        # Step 2: Fetch options chain for target expiration
-        chain_url = "{}/markets/options/chains".format(TRADIER_URL)
-        r2 = requests.get(chain_url, headers=TRADIER_HEADERS,
-                          params={"symbol":     symbol,
-                                  "expiration": target_exp,
-                                  "greeks":     "true"},
-                          timeout=10)
-        log("Tradier chain {} {}: HTTP {}".format(symbol, target_exp, r2.status_code))
-        if r2.status_code != 200:
-            log("  Chain error: {}".format(r2.text[:150]))
-            return None, None, False
-
-        options = r2.json().get("options", {}) or {}
-        chain   = options.get("option", [])
-        if isinstance(chain, dict):
-            chain = [chain]
-
-        log("  Chain returned {} contracts".format(len(chain)))
-
-        # Step 3: Filter to correct type and ATM strikes
         candidates = []
-        for opt in chain:
-            if opt.get("option_type", "").lower() != option_type[0]:
-                continue  # wrong type
-
-            strike = float(opt.get("strike", 0))
-            if strike == 0:
+        for contract_sym, snap in snapshots.items():
+            # Extract strike from contract symbol (format: SPY250303C00590000)
+            try:
+                # Strike is last 8 digits / 1000
+                strike = int(contract_sym[-8:]) / 1000.0
+            except Exception:
                 continue
 
-            # Strike within 2% of underlying
-            if underlying_price:
-                pct_diff = abs(strike - underlying_price) / underlying_price
-                if pct_diff > 0.02:
-                    continue
+            # Get bid/ask from latestQuote
+            quote = snap.get("latestQuote") or {}
+            bid   = float(quote.get("bp") or 0)
+            ask   = float(quote.get("ap") or 0)
 
-            # Get mid price from bid/ask
-            bid = float(opt.get("bid") or 0)
-            ask = float(opt.get("ask") or 0)
             if bid > 0 and ask > 0:
                 mid = round((bid + ask) / 2, 2)
             elif ask > 0:
-                mid = ask
+                mid = round(ask, 2)
             else:
                 continue
 
             # Realistic 0DTE premium range
-            if not (0.05 <= mid <= 30.00):
+            if not (0.05 <= mid <= 50.00):
                 continue
 
-            greeks = opt.get("greeks") or {}
+            greeks = snap.get("greeks") or {}
             delta  = abs(float(greeks.get("delta") or 0))
-            iv     = float(greeks.get("mid_iv") or 0)
-            volume = int(opt.get("volume") or 0)
-            oi     = int(opt.get("open_interest") or 0)
+            iv     = float(snap.get("impliedVolatility") or 0)
 
             candidates.append({
                 "strike": strike,
@@ -1129,27 +1105,30 @@ def get_liquid_option(symbol, direction, underlying_price=None):
                 "ask":    ask,
                 "delta":  delta,
                 "iv":     iv,
-                "volume": volume,
-                "oi":     oi,
             })
 
         log("  {} ATM candidates for {} {}".format(
             len(candidates), symbol, option_type))
 
         if not candidates:
-            log("  No ATM candidates found - check strike range")
+            log("  No liquid ATM options found")
             return None, None, False
 
-        # Step 4: Sort by closest delta to 0.40 (ATM sweet spot for 0DTE)
-        candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
+        # Sort by closest delta to 0.40 (ATM sweet spot for 0DTE)
+        # Fall back to closest-to-ATM strike if no delta available
+        if any(c["delta"] > 0 for c in candidates):
+            candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
+        else:
+            if underlying_price:
+                candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
+
         best = candidates[0]
-        log("  Selected: strike={} delta={:.3f} bid={} ask={} mid={} vol={} oi={}".format(
-            best["strike"], best["delta"], best["bid"], best["ask"],
-            best["price"], best["volume"], best["oi"]))
+        log("  Selected: strike={} delta={:.3f} bid={} ask={} mid={}".format(
+            best["strike"], best["delta"], best["bid"], best["ask"], best["price"]))
         return best["price"], best["strike"], True
 
     except Exception as e:
-        log("Tradier exception {}: {}".format(symbol, e))
+        log("Alpaca options exception {}: {}".format(symbol, e))
         return None, None, False
 
 
@@ -1523,8 +1502,7 @@ def render_dashboard():
             break
     bias_color = "#3fb950" if market_bias == "BULL" else "#f85149" if market_bias == "BEAR" else "#e3b341"
 
-    et     = pytz.timezone("America/New_York")
-    et_now = datetime.now(et)
+    spy_chg = float(spy_chg) if spy_chg is not None else 0.0
 
     # - Build signal cards -
     active_signals  = [s for s in signals if s.get("status") in ("SIGNAL", "SIGNAL (no options)")]
@@ -1538,14 +1516,14 @@ def render_dashboard():
         status = s.get("status", "")
 
         grade       = s.get("grade") or "-"
-        grade_pts   = s.get("grade_pts") or 0
+        grade_pts   = float(s.get("grade_pts") or 0)
         grade_color = s.get("grade_color") or "#8b949e"
 
-        gap_pct  = s.get("gap_pct") or 0
+        gap_pct  = float(s.get("gap_pct") or 0)
         gap_dir  = s.get("gap_dir") or "FLAT"
-        rs       = s.get("rs") or 0
-        late     = s.get("late_entry", False)
-        aligned  = s.get("aligned", True)
+        rs       = float(s.get("rs") or 0)
+        late     = bool(s.get("late_entry", False))
+        aligned  = bool(s.get("aligned", True))
         t1_prob  = int(s.get("t1_prob") or 50)
         t2_prob  = int(s.get("t2_prob") or 25)
 
@@ -1601,16 +1579,16 @@ def render_dashboard():
         rec_phi   = rec.get("prem_est_high", "-")
 
         # Trend + time vol from result
-        trend_1hr    = s.get("trend_1hr", "MIXED")
-        trend_desc   = s.get("trend_desc", "")
-        trend_score  = s.get("trend_score", 0.0)
-        tv_lbl       = s.get("time_vol_lbl", "")
-        tv_ratio     = s.get("time_vol_ratio", 1.0)
-        is_primary   = s.get("is_primary", False)
-        rank_score   = s.get("rank_score", 0)
+        trend_1hr    = str(s.get("trend_1hr") or "MIXED")
+        trend_desc   = str(s.get("trend_desc") or "")
+        trend_score  = float(s.get("trend_score") or 0.0)
+        tv_lbl       = str(s.get("time_vol_lbl") or "N/A")
+        tv_ratio     = float(s.get("time_vol_ratio") or 1.0)
+        is_primary   = bool(s.get("is_primary", False))
+        rank_score   = int(s.get("rank_score") or 0)
 
-        # Trend confirmation vs direction
-        if direction == "CALL":
+        # Trend confirmation vs direction (use d, not direction)
+        if d == "CALL":
             trend_aligned = trend_1hr == "BULL"
             trend_opposes = trend_1hr == "BEAR"
         else:
@@ -2044,7 +2022,14 @@ def render_dashboard():
 
 @app.route("/")
 def home():
-    return render_dashboard()
+    try:
+        return render_dashboard()
+    except Exception as _e:
+        import traceback
+        tb = traceback.format_exc()
+        return ("<pre style='background:#0d1117;color:#f85149;padding:20px;"
+                "font-size:12px;white-space:pre-wrap'>"
+                + tb + "</pre>"), 500
 
 
 @app.route("/take")
@@ -2312,39 +2297,51 @@ def alpaca_test():
     return jsonify(results)
 
 
-@app.route("/tradier-test")
-def tradier_test():
-    """Test Tradier options data for SPY - shows live chain."""
-    results = {"token_set": bool(TRADIER_TOKEN)}
+@app.route("/options-test")
+def options_test():
+    """Test Alpaca options data for SPY - shows live ATM chain."""
     et        = pytz.timezone("America/New_York")
     today_str = datetime.now(et).strftime("%Y-%m-%d")
+    spy_price = get_current_price("SPY") or 550.0
+    lo = round(spy_price * 0.99, 2)
+    hi = round(spy_price * 1.01, 2)
+    results = {
+        "keys_set":   bool(ALPACA_KEY and ALPACA_SECRET),
+        "today":      today_str,
+        "spy_price":  spy_price,
+        "strike_range": "{} - {}".format(lo, hi),
+    }
     try:
-        r = requests.get("{}/markets/options/expirations".format(TRADIER_URL),
-                         headers=TRADIER_HEADERS,
-                         params={"symbol": "SPY", "includeAllRoots": "true"},
-                         timeout=10)
-        results["expirations"] = {"status": r.status_code,
-                                   "body": r.json() if r.status_code==200 else r.text[:300]}
-    except Exception as e:
-        results["expirations"] = {"error": str(e)}
-    try:
-        r2 = requests.get("{}/markets/options/chains".format(TRADIER_URL),
-                          headers=TRADIER_HEADERS,
-                          params={"symbol": "SPY", "expiration": today_str,
-                                  "greeks": "true"},
-                          timeout=10)
-        body = r2.json() if r2.status_code == 200 else r2.text[:500]
-        # Trim chain to first 5 ATM contracts only for readability
-        if r2.status_code == 200:
-            chain = (body.get("options") or {}).get("option", [])
-            if isinstance(chain, dict):
-                chain = [chain]
-            results["chain_total"]  = len(chain)
-            results["chain_sample"] = chain[:5]
+        headers = {
+            "APCA-API-KEY-ID":     ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        }
+        r = requests.get(
+            "https://data.alpaca.markets/v1beta1/options/snapshots/SPY",
+            headers=headers,
+            params={"feed": "indicative", "expiration_date": today_str,
+                    "type": "put", "strike_price_gte": lo,
+                    "strike_price_lte": hi, "limit": 10},
+            timeout=10)
+        results["status"] = r.status_code
+        if r.status_code == 200:
+            snaps = r.json().get("snapshots", {})
+            results["contracts_returned"] = len(snaps)
+            sample = []
+            for sym, s in list(snaps.items())[:5]:
+                q = s.get("latestQuote") or {}
+                g = s.get("greeks") or {}
+                sample.append({
+                    "symbol": sym,
+                    "bid": q.get("bp"), "ask": q.get("ap"),
+                    "delta": g.get("delta"),
+                    "iv": s.get("impliedVolatility"),
+                })
+            results["sample"] = sample
         else:
-            results["chain_error"]  = body
+            results["error"] = r.text[:300]
     except Exception as e:
-        results["chain"] = {"error": str(e)}
+        results["exception"] = str(e)
     return jsonify(results)
 
 
