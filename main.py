@@ -2917,7 +2917,7 @@ def take_trade():
                 gap or "?", gdir or "?", rs or "?"))
     except Exception as e:
         log("Take trade error: {}".format(e))
-    return redirect("/?toast=logged:{}+{}".format(sym, d))
+    return redirect("/?toast=logged:{}+{}".format(sym, dir_))
 
 
 @app.route("/close")
