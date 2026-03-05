@@ -1284,39 +1284,51 @@ def compute_rank_score(result):
 # OPTIONS
 # =============================================
 
+def _next_expiry_dates(n=4):
+    """
+    Returns today + next N expiry dates (skipping weekends).
+    Individual stocks only have weekly (Fri) options.
+    ETFs like SPY/QQQ have daily options.
+    """
+    import datetime as _dt
+    et   = pytz.timezone("America/New_York")
+    base = datetime.now(et).date()
+    dates = []
+    d = base
+    while len(dates) < n + 1:
+        dates.append(d.strftime("%Y-%m-%d"))
+        d = d + _dt.timedelta(days=1)
+        while d.weekday() >= 5:
+            d = d + _dt.timedelta(days=1)
+    return dates
+
+
 def get_liquid_option(symbol, direction, underlying_price=None):
     """
-    Fetch a 0DTE ATM option via Alpaca's options snapshot API.
-    Uses the same ALPACA_KEY / ALPACA_SECRET already configured.
+    Fetch the nearest available ATM option via Alpaca options snapshot API.
 
-    Endpoint: GET https://data.alpaca.markets/v1beta1/options/snapshots/{symbol}
-    Filters:  today's expiration, correct type, ATM strikes within 2%
-    Returns (premium, strike, is_live)
+    SPY/QQQ have daily 0DTE options.
+    Individual stocks (TSLA, AMD, etc.) only have weekly options (Fri expiry).
+    We try today first, then fall back up to 5 trading days out.
+
+    Returns (premium, strike, is_live, dte_label)
+      dte_label: '0DTE', '1DTE', '2DTE' etc. shown on card
     """
+    import datetime as _dt
+
     if not ALPACA_KEY or not ALPACA_SECRET:
         log("Alpaca keys not set - cannot fetch options")
-        return None, None, False
+        return None, None, False, None
 
     option_type = "call" if direction == "CALL" else "put"
     et          = pytz.timezone("America/New_York")
-    today_str   = datetime.now(et).strftime("%Y-%m-%d")
+    today_date  = datetime.now(et).date()
 
-    # ATM strike window: 2% either side of underlying
     if underlying_price:
         lo = round(underlying_price * 0.98, 2)
         hi = round(underlying_price * 1.02, 2)
     else:
         lo, hi = None, None
-
-    params = {
-        "feed":            "indicative",
-        "expiration_date": today_str,
-        "type":            option_type,
-        "limit":           50,
-    }
-    if lo is not None:
-        params["strike_price_gte"] = lo
-        params["strike_price_lte"] = hi
 
     headers = {
         "APCA-API-KEY-ID":     ALPACA_KEY,
@@ -1324,84 +1336,95 @@ def get_liquid_option(symbol, direction, underlying_price=None):
     }
     url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
 
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        log("Alpaca options {} {} {}: HTTP {}".format(
-            symbol, option_type, today_str, r.status_code))
+    expiry_dates = _next_expiry_dates(n=5)
 
-        if r.status_code == 422:
-            log("  No 0DTE options available for {} today".format(symbol))
-            return None, None, False
-        if r.status_code != 200:
-            log("  Options error: {}".format(r.text[:150]))
-            return None, None, False
+    for expiry_str in expiry_dates:
+        params = {
+            "feed":            "indicative",
+            "expiration_date": expiry_str,
+            "type":            option_type,
+            "limit":           50,
+        }
+        if lo is not None:
+            params["strike_price_gte"] = lo
+            params["strike_price_lte"] = hi
 
-        snapshots = r.json().get("snapshots", {})
-        log("  {} contracts returned".format(len(snapshots)))
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            log("Alpaca options {} {} {}: HTTP {}".format(
+                symbol, option_type, expiry_str, r.status_code))
 
-        candidates = []
-        for contract_sym, snap in snapshots.items():
-            # Extract strike from contract symbol (format: SPY250303C00590000)
-            try:
-                # Strike is last 8 digits / 1000
-                strike = int(contract_sym[-8:]) / 1000.0
-            except Exception:
+            if r.status_code == 422:
+                log("  No options for {} on {} -- trying next expiry".format(symbol, expiry_str))
+                continue
+            if r.status_code != 200:
+                log("  Options error {}: {}".format(r.status_code, r.text[:150]))
+                return None, None, False, None
+
+            snapshots = r.json().get("snapshots", {})
+            log("  {} contracts for {} {}".format(len(snapshots), symbol, expiry_str))
+
+            candidates = []
+            for contract_sym, snap in snapshots.items():
+                try:
+                    strike = int(contract_sym[-8:]) / 1000.0
+                except Exception:
+                    continue
+
+                quote = snap.get("latestQuote") or {}
+                bid   = float(quote.get("bp") or 0)
+                ask   = float(quote.get("ap") or 0)
+
+                if bid > 0 and ask > 0:
+                    mid = round((bid + ask) / 2, 2)
+                elif ask > 0:
+                    mid = round(ask, 2)
+                else:
+                    continue
+
+                if not (0.05 <= mid <= 50.00):
+                    continue
+
+                greeks = snap.get("greeks") or {}
+                delta  = abs(float(greeks.get("delta") or 0))
+                iv     = float(snap.get("impliedVolatility") or 0)
+
+                candidates.append({
+                    "strike": strike,
+                    "price":  mid,
+                    "bid":    bid,
+                    "ask":    ask,
+                    "delta":  delta,
+                    "iv":     iv,
+                })
+
+            if not candidates:
+                log("  No liquid ATM candidates on {} -- trying next".format(expiry_str))
                 continue
 
-            # Get bid/ask from latestQuote
-            quote = snap.get("latestQuote") or {}
-            bid   = float(quote.get("bp") or 0)
-            ask   = float(quote.get("ap") or 0)
-
-            if bid > 0 and ask > 0:
-                mid = round((bid + ask) / 2, 2)
-            elif ask > 0:
-                mid = round(ask, 2)
-            else:
-                continue
-
-            # Realistic 0DTE premium range
-            if not (0.05 <= mid <= 50.00):
-                continue
-
-            greeks = snap.get("greeks") or {}
-            delta  = abs(float(greeks.get("delta") or 0))
-            iv     = float(snap.get("impliedVolatility") or 0)
-
-            candidates.append({
-                "strike": strike,
-                "price":  mid,
-                "bid":    bid,
-                "ask":    ask,
-                "delta":  delta,
-                "iv":     iv,
-            })
-
-        log("  {} ATM candidates for {} {}".format(
-            len(candidates), symbol, option_type))
-
-        if not candidates:
-            log("  No liquid ATM options found")
-            return None, None, False
-
-        # Sort by closest delta to 0.40 (ATM sweet spot for 0DTE)
-        # Fall back to closest-to-ATM strike if no delta available
-        if any(c["delta"] > 0 for c in candidates):
-            candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
-        else:
-            if underlying_price:
+            if any(c["delta"] > 0 for c in candidates):
+                candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
+            elif underlying_price:
                 candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
 
-        best = candidates[0]
-        log("  Selected: strike={} delta={:.3f} bid={} ask={} mid={}".format(
-            best["strike"], best["delta"], best["bid"], best["ask"], best["price"]))
-        return best["price"], best["strike"], True
+            best = candidates[0]
 
-    except Exception as e:
-        log("Alpaca options exception {}: {}".format(symbol, e))
-        return None, None, False
+            exp_date  = _dt.datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            dte       = (exp_date - today_date).days
+            dte_label = "{}DTE".format(dte) if dte > 0 else "0DTE"
 
+            log("  Selected {} {}: strike={} delta={:.3f} mid={} ({})".format(
+                symbol, option_type, best["strike"], best["delta"],
+                best["price"], dte_label))
 
+            return best["price"], best["strike"], True, dte_label
+
+        except Exception as e:
+            log("Alpaca options exception {} {}: {}".format(symbol, expiry_str, e))
+            return None, None, False, None
+
+    log("  No options found for {} across all expiries".format(symbol))
+    return None, None, False, None
 # =============================================
 # RISK ENGINE
 # =============================================
@@ -1633,7 +1656,7 @@ def scan_all_symbols():
                     grade = "B"; grade_color = "#e3b341"; grade_pts = min(grade_pts + 10, 74)
                 result["grade_pts"] += 5  # small bonus in rank
 
-        premium, strike, is_live = get_liquid_option(symbol, direction, price)
+        premium, strike, is_live, dte_label = get_liquid_option(symbol, direction, price)
 
         if premium and is_live:
             contracts, stp, tgt = calculate_contracts(premium, score)
@@ -1642,6 +1665,7 @@ def scan_all_symbols():
             result["contracts"] = contracts
             result["stop"]      = stp
             result["target"]    = tgt
+            result["dte_label"] = dte_label or "0DTE"
             result["status"]    = "SIGNAL"
         else:
             result["status"] = "SIGNAL (no options)"
@@ -2211,7 +2235,34 @@ def telegram_poller():
 # DASHBOARD
 # =============================================
 
-def render_dashboard():
+def render_dashboard(toast=""):
+    # Build toast banner if present
+    toast_html = ""
+    if toast:
+        if toast.startswith("logged:"):
+            detail    = toast[7:].replace("+", " ")
+            toast_msg = "Trade logged: {}".format(detail)
+            toast_bg  = "#238636"
+        elif toast.startswith("closed:"):
+            outcome   = toast[7:]
+            toast_msg = "Trade closed: {}".format(outcome)
+            toast_bg  = "#238636" if outcome == "WIN" else "#da3633"
+        else:
+            toast_msg = toast
+            toast_bg  = "#1f6feb"
+        toast_html = """
+<div id='toast' style='position:fixed;top:60px;left:50%;transform:translateX(-50%);
+     background:{bg};color:#fff;padding:10px 24px;border-radius:8px;
+     font-size:13px;font-weight:700;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.4);
+     letter-spacing:.3px'>
+  {msg}
+</div>
+<script>
+  setTimeout(function(){{
+    var t = document.getElementById('toast');
+    if(t) t.style.display='none';
+  }}, 3000);
+</script>""".format(bg=toast_bg, msg=toast_msg)
     with state_lock:
         signals  = list(all_signals)
         secs     = max(0, int(next_scan_at - time.time()))
@@ -2351,6 +2402,9 @@ def render_dashboard():
 
         # Premium / action section
         has_options = (status == "SIGNAL")
+        dte_lbl     = str(s.get("dte_label") or "0DTE")
+        dte_color   = "#3fb950" if dte_lbl == "0DTE" else "#e3b341"
+
         if has_options:
             prem     = s.get("premium", "-")
             stp_opt  = s.get("stop", "-")
@@ -2366,7 +2420,10 @@ def render_dashboard():
                   border:1px solid #238636'>
         <div>
           <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
-                      letter-spacing:.5px;margin-bottom:3px'>Option Premium</div>
+                      letter-spacing:.5px;margin-bottom:3px'>
+            Option Premium
+            <span style='color:{dte_color};margin-left:6px;font-weight:700'>{dte_lbl}</span>
+          </div>
           <div style='font-size:18px;font-weight:700;font-family:monospace'>${prem}</div>
           <div style='font-size:10px;color:#8b949e;margin-top:2px'>
             Stop ${sopt} &nbsp;|&nbsp; Target ${topt} &nbsp;|&nbsp; {con}x contracts
@@ -2375,7 +2432,9 @@ def render_dashboard():
         <a href='{url}' style='background:#238636;color:#fff;padding:10px 20px;
            border-radius:6px;text-decoration:none;font-size:13px;font-weight:700;
            letter-spacing:.3px;white-space:nowrap'>LOG TRADE</a>
-      </div>""".format(prem=prem, sopt=stp_opt, topt=tgt_opt, con=con, url=take_url)
+      </div>""".format(
+                prem=prem, sopt=stp_opt, topt=tgt_opt, con=con,
+                url=take_url, dte_lbl=dte_lbl, dte_color=dte_color)
         else:
             option_section = """
       <div style='background:#0d1117;border-radius:6px;padding:10px 12px;
@@ -2693,6 +2752,8 @@ def render_dashboard():
 </style>
 </head><body>
 
+{toast_html}
+
 <!-- TOP BAR -->
 <div class="topbar">
   <div class="topbar-left">
@@ -2762,6 +2823,7 @@ def render_dashboard():
 </div>
 
 </body></html>""".format(
+        toast_html=toast_html,
         mc=mkt_color, ml=mkt_label,
         ai_panel=ai_panel,
         bias=market_bias, biasc=bias_color, spy=spy_chg,
@@ -2810,7 +2872,8 @@ def render_dashboard():
 @app.route("/")
 def home():
     try:
-        return render_dashboard()
+        toast = request.args.get("toast", "")
+        return render_dashboard(toast=toast)
     except Exception as _e:
         import traceback
         tb = traceback.format_exc()
@@ -2852,7 +2915,7 @@ def take_trade():
                 gap or "?", gdir or "?", rs or "?"))
     except Exception as e:
         log("Take trade error: {}".format(e))
-    return redirect("/")
+    return redirect("/?toast=logged:{}+{}".format(sym, d))
 
 
 @app.route("/close")
@@ -2866,7 +2929,7 @@ def close_trade():
             trade_id, exit_p, outcome))
     except Exception as e:
         log("Close trade error: {}".format(e))
-    return redirect("/")
+    return redirect("/?toast=closed:{}".format(outcome))
 
 
 @app.route("/stats")
