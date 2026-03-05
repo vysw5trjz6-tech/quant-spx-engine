@@ -219,6 +219,21 @@ def init_db():
         )
     """)
 
+    # AI structural proposals (new strategies / indicators / signal types)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_proposals (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            TEXT,
+            proposal_type TEXT,
+            title         TEXT,
+            summary       TEXT,
+            evidence      TEXT,
+            spec          TEXT,
+            status        TEXT DEFAULT 'pending',
+            dismissed_at  TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -293,6 +308,70 @@ def db_get_ai_analyses(limit=10):
     except Exception as e:
         log("DB get ai_analyses error: {}".format(e))
         return []
+
+
+def db_save_proposal(proposal_type, title, summary, evidence, spec):
+    """Save a new structural proposal from the AI."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        # Avoid saving exact duplicate titles
+        c.execute("SELECT id FROM ai_proposals WHERE title=? AND status='pending'", (title,))
+        if c.fetchone():
+            conn.close()
+            return None
+        c.execute("""
+            INSERT INTO ai_proposals
+            (ts, proposal_type, title, summary, evidence, spec, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            datetime.now(pytz.utc).isoformat(),
+            proposal_type, title, summary, evidence, spec
+        ))
+        pid = c.lastrowid
+        conn.commit()
+        conn.close()
+        return pid
+    except Exception as e:
+        log("DB save proposal error: {}".format(e))
+        return None
+
+
+def db_get_proposals(status=None, limit=20):
+    """Get proposals, optionally filtered by status."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        if status:
+            c.execute("""
+                SELECT id, ts, proposal_type, title, summary, evidence, spec, status
+                FROM ai_proposals WHERE status=?
+                ORDER BY id DESC LIMIT ?
+            """, (status, limit))
+        else:
+            c.execute("""
+                SELECT id, ts, proposal_type, title, summary, evidence, spec, status
+                FROM ai_proposals ORDER BY id DESC LIMIT ?
+            """, (limit,))
+        rows = c.fetchall()
+        conn.close()
+        cols = ["id","ts","proposal_type","title","summary","evidence","spec","status"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        log("DB get proposals error: {}".format(e))
+        return []
+
+
+def db_dismiss_proposal(proposal_id):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("UPDATE ai_proposals SET status='dismissed', dismissed_at=? WHERE id=?",
+                  (datetime.now(pytz.utc).isoformat(), proposal_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log("DB dismiss proposal error: {}".format(e))
 
 
 def db_get_all_closed_trades():
@@ -1927,10 +2006,147 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
         )
         send_telegram(msg)
 
+        # --- Phase 2: Structural proposals ---
+        _run_proposal_analysis(trades, stats)
+
     except json.JSONDecodeError as e:
         log("AI: JSON parse error: {} | raw: {}".format(e, raw[:200]))
     except Exception as e:
         log("AI: Exception: {}".format(e))
+
+def _run_proposal_analysis(trades, stats):
+    """
+    Second AI pass: looks for structural improvements the config system
+    cannot handle -- new strategies, indicators, signal types.
+    Saves proposals to DB and sends top one via Telegram.
+    """
+    if not ANTHROPIC_KEY or len(trades) < 10:
+        return
+
+    log("AI: Running structural proposal analysis...")
+
+    # Pull any pending proposals so we don't repeat them
+    existing = db_get_proposals(status="pending", limit=10)
+    existing_titles = [p["title"] for p in existing]
+
+    cfg = get_config()
+
+    prompt = """You are an expert quant analyzing a 0DTE options day trading scanner.
+Your job is to identify structural improvements that CANNOT be done by tuning config numbers.
+These are new strategies, new signal types, or new indicator calculations that require new code.
+
+## Current Scanner Capabilities
+- ORB (Opening Range Breakout): detects price breaking above ORB high or below ORB low with VWAP confirmation
+- Confluence grading: breakout strength, volume, gap alignment, relative strength vs SPY, time of day
+- 1hr trend confirmation: HH/HL or LH/LL pattern on 1hr bars
+- VWAP reclaim: price reclaims VWAP after being below/above it (currently enabled/disabled via config)
+- Key levels: previous day high/low, weekly high/low, 4hr and 1hr swing points
+- Clear air check: detects key levels blocking path to targets
+
+## Trade Statistics
+```json
+{stats}
+```
+
+## Already Pending Proposals (do not repeat these)
+{existing}
+
+## Your Task
+Based on the trade data, identify up to 2 structural proposals. Each proposal must:
+1. Be justified by a clear pattern in the data (or a notable gap where data is thin)
+2. Be something that requires new code -- not just a config number change
+3. Be specific enough for a developer to implement in one session
+
+Proposal types to consider:
+- NEW_STRATEGY: entirely new signal type (e.g. gap fill, VWAP band touch, opening drive)
+- NEW_INDICATOR: new calculation added to existing signals (e.g. pre-market volume, sector RS, options flow)
+- NEW_FILTER: new condition to filter out low quality signals (e.g. earnings filter, news filter)
+- NEW_SIZING: new position sizing logic (e.g. scale size by grade AND vol regime together)
+- DASHBOARD: new display or alert that helps decision making
+
+Respond ONLY with valid JSON, no markdown:
+{{
+  "proposals": [
+    {{
+      "type": "NEW_STRATEGY|NEW_INDICATOR|NEW_FILTER|NEW_SIZING|DASHBOARD",
+      "title": "<short title, max 60 chars>",
+      "summary": "<1-2 sentences: what it is and why it helps>",
+      "evidence": "<what in the trade data specifically suggests this would help>",
+      "spec": "<detailed implementation spec: trigger conditions, parameters, how it integrates with existing grading system, expected impact on win rate>"
+    }}
+  ]
+}}
+
+If the data does not yet support any specific proposal, return: {{"proposals": []}}""".format(
+        stats=json.dumps(stats, indent=2),
+        existing=", ".join(existing_titles) if existing_titles else "none"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-sonnet-4-20250514",
+                "max_tokens": 1500,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+
+        if resp.status_code != 200:
+            log("AI proposals: API error {}".format(resp.status_code))
+            return
+
+        raw = resp.json()["content"][0]["text"].strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"): raw = raw[4:]
+        raw = raw.strip()
+
+        parsed   = json.loads(raw)
+        proposals = parsed.get("proposals", [])
+        log("AI proposals: {} proposals generated".format(len(proposals)))
+
+        saved = []
+        for p in proposals:
+            pid = db_save_proposal(
+                proposal_type = p.get("type", "NEW_STRATEGY"),
+                title         = p.get("title", ""),
+                summary       = p.get("summary", ""),
+                evidence      = p.get("evidence", ""),
+                spec          = p.get("spec", "")
+            )
+            if pid:
+                saved.append(p)
+                log("AI proposal saved: [{}] {}".format(p.get("type"), p.get("title")))
+
+        # Telegram: send the top new proposal
+        if saved:
+            top = saved[0]
+            tg_msg = (
+                "AI STRUCTURAL PROPOSAL\n\n"
+                "[{ptype}] {title}\n\n"
+                "{summary}\n\n"
+                "Evidence: {evidence}\n\n"
+                "View full spec at /ai"
+            ).format(
+                ptype   = top.get("type",""),
+                title   = top.get("title",""),
+                summary = top.get("summary",""),
+                evidence= top.get("evidence","")[:200]
+            )
+            send_telegram(tg_msg)
+
+    except json.JSONDecodeError as e:
+        log("AI proposals: JSON parse error: {}".format(e))
+    except Exception as e:
+        log("AI proposals: Exception: {}".format(e))
+
 
 def background_scheduler():
     global _ai_last_run_date, _ai_last_trade_cnt
@@ -2848,6 +3064,10 @@ def ai_page():
     """Full AI analysis history, current config, and manual run trigger."""
     cfg       = get_config()
     analyses  = db_get_ai_analyses(limit=20)
+    proposals = db_get_proposals(limit=30)
+
+    pending   = [p for p in proposals if p["status"] == "pending"]
+    dismissed = [p for p in proposals if p["status"] == "dismissed"]
 
     # Config table rows
     skip_keys = {"ai_insight", "ai_focus", "updated_at", "updated_by"}
@@ -2897,6 +3117,108 @@ def ai_page():
                          "No AI analyses yet. Need 5+ closed trades to trigger first run."
                          "</div>")
 
+    # --- Proposal cards ---
+    type_colors = {
+        "NEW_STRATEGY":  ("#1f6feb", "#58a6ff"),
+        "NEW_INDICATOR": ("#1a472a", "#3fb950"),
+        "NEW_FILTER":    ("#3d1a00", "#e3b341"),
+        "NEW_SIZING":    ("#2d1b69", "#a371f7"),
+        "DASHBOARD":     ("#1b2a3d", "#79c0ff"),
+    }
+
+    def proposal_card(p, show_dismiss=True):
+        bg, fg   = type_colors.get(p["proposal_type"], ("#161b22", "#8b949e"))
+        spec_id  = "spec_{}".format(p["id"])
+        copy_id  = "copy_{}".format(p["id"])
+        dismiss  = ""
+        if show_dismiss:
+            dismiss = ("<a href='/ai/dismiss?id={id}' style='color:#8b949e;"
+                       "font-size:10px;text-decoration:none;margin-left:10px'>"
+                       "dismiss</a>").format(id=p["id"])
+
+        # Build the copyable brief for pasting to Claude
+        paste_text = (
+            "AI PROPOSAL: {title}\\n\\n"
+            "Type: {ptype}\\n"
+            "Summary: {summary}\\n\\n"
+            "Evidence from trade data: {evidence}\\n\\n"
+            "Implementation spec:\\n{spec}"
+        ).format(
+            title   = p["title"],
+            ptype   = p["proposal_type"],
+            summary = p["summary"],
+            evidence= p["evidence"],
+            spec    = p["spec"]
+        ).replace("'", "\\'").replace("\n", "\\n")
+
+        return """
+<div style='background:#161b22;border:1px solid {bg};border-radius:8px;
+            padding:14px;margin-bottom:10px;position:relative'>
+  <div style='display:flex;align-items:flex-start;justify-content:space-between;
+              margin-bottom:8px;gap:10px'>
+    <div>
+      <span style='background:{bg};color:{fg};font-size:9px;font-weight:700;
+                   text-transform:uppercase;letter-spacing:.6px;padding:2px 8px;
+                   border-radius:3px'>{ptype}</span>
+      <span style='font-size:13px;font-weight:700;margin-left:8px'>{title}</span>
+      {dismiss}
+    </div>
+    <div style='font-size:10px;color:#8b949e;white-space:nowrap'>{ts}</div>
+  </div>
+  <div style='font-size:12px;color:#e6edf3;margin-bottom:6px'>{summary}</div>
+  <div style='font-size:11px;color:#8b949e;margin-bottom:10px'>
+    <span style='color:#e3b341'>Evidence:</span> {evidence}
+  </div>
+  <details style='margin-bottom:10px'>
+    <summary style='font-size:11px;color:#58a6ff;cursor:pointer;
+                    list-style:none;margin-bottom:6px'>
+      View implementation spec &#9660;
+    </summary>
+    <div id='{spec_id}' style='background:#0d1117;border-radius:6px;padding:10px;
+                font-size:11px;color:#e6edf3;line-height:1.6;
+                font-family:monospace;white-space:pre-wrap'>{spec}</div>
+  </details>
+  <button id='{copy_id}'
+    onclick="
+      var txt = '{paste}';
+      txt = txt.replace(/\\\\n/g, '\\n');
+      navigator.clipboard.writeText(txt).then(function(){{
+        document.getElementById('{copy_id}').textContent = 'Copied!';
+        setTimeout(function(){{
+          document.getElementById('{copy_id}').textContent = 'Copy to send to Claude';
+        }}, 2000);
+      }});
+    "
+    style='background:#1f6feb;color:#fff;border:none;padding:8px 16px;
+           border-radius:6px;font-size:12px;font-weight:700;cursor:pointer'>
+    Copy to send to Claude
+  </button>
+</div>""".format(
+            bg=bg, fg=fg,
+            ptype  = p["proposal_type"],
+            title  = p["title"],
+            dismiss= dismiss,
+            ts     = p["ts"][:16],
+            summary= p["summary"],
+            evidence=p["evidence"],
+            spec_id= spec_id,
+            spec   = p["spec"],
+            copy_id= copy_id,
+            paste  = paste_text
+        )
+
+    pending_html = "".join(proposal_card(p) for p in pending)
+    if not pending_html:
+        pending_html = ("<div style='padding:16px;text-align:center;color:#8b949e;"
+                        "font-size:12px'>No pending proposals -- AI will generate "
+                        "these after analyzing trade patterns.</div>")
+
+    dismissed_html = ""
+    if dismissed:
+        dismissed_html = """
+<h2 style='color:#8b949e'>Dismissed Proposals</h2>
+{}""".format("".join(proposal_card(p, show_dismiss=False) for p in dismissed))
+
     can_run   = bool(ANTHROPIC_KEY)
     run_btn   = ""
     if can_run:
@@ -2921,6 +3243,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 th{{padding:7px 10px;text-align:left;color:#8b949e;border-bottom:1px solid #21262d;
     font-size:10px;text-transform:uppercase;letter-spacing:.5px}}
 a.nav{{color:#58a6ff;text-decoration:none;font-size:12px}}
+details summary::-webkit-details-marker {{ display:none }}
 </style></head><body>
 <div style='margin-bottom:12px;display:flex;align-items:center;gap:16px'>
   <a class='nav' href='/'>&#8592; Dashboard</a>
@@ -2933,6 +3256,14 @@ a.nav{{color:#58a6ff;text-decoration:none;font-size:12px}}
   <span style='color:#e3b341'>{insight}</span>
 </div>
 
+<h2>Structural Proposals
+  <span style='font-size:11px;color:#8b949e;font-weight:400;margin-left:8px'>
+    -- copy any proposal and paste it to Claude to implement
+  </span>
+</h2>
+{pending_html}
+{dismissed_html}
+
 <h2>Current Config</h2>
 <div class='card'>
   <table><tr><th>Parameter</th><th>Value</th></tr>{cfg_rows}</table>
@@ -2942,13 +3273,15 @@ a.nav{{color:#58a6ff;text-decoration:none;font-size:12px}}
 {analyses}
 
 </body></html>""".format(
-        run_btn=run_btn,
-        ver=cfg.get("ai_version", 0),
-        by=cfg.get("updated_by", "default"),
-        upd=cfg.get("updated_at", "never"),
-        insight=cfg.get("ai_insight", ""),
-        cfg_rows=cfg_rows,
-        analyses=analysis_rows
+        run_btn      = run_btn,
+        ver          = cfg.get("ai_version", 0),
+        by           = cfg.get("updated_by", "default"),
+        upd          = cfg.get("updated_at", "never"),
+        insight      = cfg.get("ai_insight", ""),
+        pending_html = pending_html,
+        dismissed_html=dismissed_html,
+        cfg_rows     = cfg_rows,
+        analyses     = analysis_rows
     )
 
 
@@ -2966,6 +3299,20 @@ def ai_run_manual():
         daemon=True
     ).start()
     return redirect("/ai")
+
+
+@app.route("/ai/dismiss")
+def ai_dismiss_proposal():
+    pid = request.args.get("id", "")
+    if pid:
+        try:
+            db_dismiss_proposal(int(pid))
+        except Exception as e:
+            log("Dismiss proposal error: {}".format(e))
+    return redirect("/ai")
+
+
+@app.route("/debug")
 def debug_route():
     with state_lock:
         return jsonify({"signals": all_signals, "log": debug_log[-50:]})
