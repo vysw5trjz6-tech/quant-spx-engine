@@ -33,14 +33,97 @@ DATA_URL  = "https://data.alpaca.markets/v2/stocks/{}/bars"
 QUOTE_URL = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
 CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
 
-ALERT_FILE = "/tmp/last_alert.json"
-DB_FILE    = "/tmp/trades.db"
+ALERT_FILE     = "/tmp/last_alert.json"
+DB_FILE        = "/tmp/trades.db"
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
 state_lock   = threading.Lock()
 debug_log    = []
 all_signals  = []
 next_scan_at = 0
 bot_enabled  = True
+
+# =============================================
+# SCANNER CONFIG  (AI-tunable parameters)
+# =============================================
+
+DEFAULT_CONFIG = {
+    "version":        1,
+    "updated_at":     "default",
+    "updated_by":     "default",
+
+    # --- Confluence grade weights (should sum to ~100) ---
+    "weight_breakout": 25,
+    "weight_volume":   20,
+    "weight_gap":      20,
+    "weight_rs":       20,
+    "weight_time":     15,
+
+    # --- Grade thresholds ---
+    "grade_a_min": 75,
+    "grade_b_min": 55,
+    "grade_c_min": 35,
+
+    # --- Breakout strength % thresholds ---
+    "bs_strong": 0.50,
+    "bs_medium": 0.30,
+    "bs_weak":   0.15,
+
+    # --- Volume ratio thresholds ---
+    "vol_high": 2.0,
+    "vol_med":  1.5,
+    "vol_low":  1.2,
+
+    # --- Time of day (ET hour) ---
+    "time_prime_end":  11.0,
+    "time_decent_end": 13.0,
+    "time_risky_end":  14.0,
+    "late_entry_hour": 14.0,
+
+    # --- Rank score bonuses/penalties ---
+    "rank_align_bonus":    20,
+    "rank_align_penalty":  -15,
+    "rank_trend_full":     20,
+    "rank_trend_partial":  10,
+    "rank_trend_oppose":   -10,
+    "rank_vol_exceptional": 15,
+    "rank_vol_elevated":    8,
+    "rank_vol_light":       -10,
+    "rank_clear_t2":        20,
+    "rank_clear_t1":        10,
+    "rank_blocked":         -15,
+    "rank_late_penalty":    -20,
+
+    # --- VWAP reclaim strategy ---
+    "vwap_reclaim_enabled":     False,
+    "vwap_reclaim_vol_min":     1.3,
+    "vwap_reclaim_lookback":    6,
+
+    # --- Filter strictness ---
+    "counter_trend_allowed":    True,
+    "min_grade":                "C",
+
+    # --- AI state ---
+    "ai_insight": "Baseline config -- collecting trade data to begin optimization.",
+    "ai_focus":   "Trade all A/B/C grade signals and log outcomes to build the dataset.",
+    "ai_version": 0,
+}
+
+# Live config -- loaded from DB on startup, updated by AI
+_scanner_config = dict(DEFAULT_CONFIG)
+_config_lock    = threading.Lock()
+
+def get_config():
+    with _config_lock:
+        return dict(_scanner_config)
+
+def update_config(new_values, updated_by="ai"):
+    with _config_lock:
+        _scanner_config.update(new_values)
+        _scanner_config["updated_by"] = updated_by
+        et = pytz.timezone("America/New_York")
+        _scanner_config["updated_at"] = datetime.now(et).strftime("%Y-%m-%d %H:%M")
+        _scanner_config["ai_version"] = _scanner_config.get("ai_version", 0) + 1
 
 
 # =============================================
@@ -101,7 +184,7 @@ def init_db():
             entry_hour REAL
         )
     """)
-    # Migrate existing tables that may not have new columns
+    # Migrate existing trades table
     for col, coltype in [("grade","TEXT"), ("grade_pts","INTEGER"),
                           ("gap_pct","REAL"), ("gap_dir","TEXT"),
                           ("rs","REAL"), ("entry_hour","REAL")]:
@@ -109,8 +192,128 @@ def init_db():
             conn.execute("ALTER TABLE trades ADD COLUMN {} {}".format(col, coltype))
         except:
             pass
+
+    # AI config history
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_config (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts         TEXT,
+            version    INTEGER,
+            config_json TEXT,
+            trigger    TEXT
+        )
+    """)
+
+    # AI analysis log
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_analyses (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT,
+            trades_used INTEGER,
+            win_rate    REAL,
+            insight     TEXT,
+            focus       TEXT,
+            reasoning   TEXT,
+            config_diff TEXT,
+            raw_response TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def db_save_ai_config(config, trigger="scheduled"):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("""
+            INSERT INTO ai_config (ts, version, config_json, trigger)
+            VALUES (?, ?, ?, ?)
+        """, (
+            datetime.now(pytz.utc).isoformat(),
+            config.get("ai_version", 0),
+            json.dumps(config),
+            trigger
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log("DB save ai_config error: {}".format(e))
+
+
+def db_save_ai_analysis(trades_used, win_rate, insight, focus, reasoning,
+                         config_diff, raw_response):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("""
+            INSERT INTO ai_analyses
+            (ts, trades_used, win_rate, insight, focus, reasoning, config_diff, raw_response)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now(pytz.utc).isoformat(),
+            trades_used, win_rate, insight, focus, reasoning,
+            json.dumps(config_diff), raw_response
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log("DB save ai_analysis error: {}".format(e))
+
+
+def db_load_latest_config():
+    """Load most recent AI config from DB into memory on startup."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("SELECT config_json FROM ai_config ORDER BY id DESC LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        if row:
+            saved = json.loads(row[0])
+            update_config(saved, updated_by="db_restore")
+            log("AI config v{} restored from DB".format(saved.get("ai_version", "?")))
+    except Exception as e:
+        log("DB load config error: {}".format(e))
+
+
+def db_get_ai_analyses(limit=10):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("""
+            SELECT ts, trades_used, win_rate, insight, focus, reasoning, config_diff
+            FROM ai_analyses ORDER BY id DESC LIMIT ?
+        """, (limit,))
+        rows = c.fetchall()
+        conn.close()
+        cols = ["ts","trades_used","win_rate","insight","focus","reasoning","config_diff"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        log("DB get ai_analyses error: {}".format(e))
+        return []
+
+
+def db_get_all_closed_trades():
+    """All closed trades for AI analysis."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("""
+            SELECT symbol, direction, outcome, pnl, r_mult,
+                   grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts
+            FROM trades WHERE outcome != 'OPEN'
+            ORDER BY ts DESC
+        """)
+        rows = c.fetchall()
+        conn.close()
+        cols = ["symbol","direction","outcome","pnl","r_mult",
+                "grade","grade_pts","gap_pct","gap_dir","rs","entry_hour","ts"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        log("DB get all closed trades error: {}".format(e))
+        return []
 
 
 def db_log_signal(sig):
@@ -580,110 +783,95 @@ def confluence_grade(breakout_strength, vol_ratio, vol_mult,
                      gap_pct, gap_direction, rs, direction,
                      et_hour):
     """
-    Scores 0-100 across 5 factors, returns grade A/B/C/D and score.
-
-    Factor weights:
-      - Breakout strength  25pts  (how far past ORB)
-      - Volume confirmation 20pts  (volume vs prior bar)
-      - Gap alignment       20pts  (gap in same direction as trade)
-      - Relative strength   20pts  (outperforming/underperforming SPY)
-      - Time of day         15pts  (earlier = better for 0DTE)
+    Scores 0-100 across 5 factors using AI-tunable weights from SCANNER_CONFIG.
     """
+    cfg = get_config()
     pts = 0
 
-    # 1. Breakout strength (0-25)
-    # breakout_strength is pct as decimal e.g. 0.005 = 0.5%
+    # 1. Breakout strength
     bs_pct = breakout_strength * 100
-    if bs_pct >= 0.5:
-        pts += 25
-    elif bs_pct >= 0.3:
-        pts += 18
-    elif bs_pct >= 0.15:
-        pts += 12
+    w      = cfg["weight_breakout"]
+    if bs_pct >= cfg["bs_strong"]:
+        pts += w
+    elif bs_pct >= cfg["bs_medium"]:
+        pts += int(w * 0.72)
+    elif bs_pct >= cfg["bs_weak"]:
+        pts += int(w * 0.48)
     else:
-        pts += 6
+        pts += int(w * 0.24)
 
-    # 2. Volume ratio (0-20)
-    if vol_ratio >= 2.0:
-        pts += 20
-    elif vol_ratio >= 1.5:
-        pts += 15
-    elif vol_ratio >= 1.2:
-        pts += 10
+    # 2. Volume ratio
+    w = cfg["weight_volume"]
+    if vol_ratio >= cfg["vol_high"]:
+        pts += w
+    elif vol_ratio >= cfg["vol_med"]:
+        pts += int(w * 0.75)
+    elif vol_ratio >= cfg["vol_low"]:
+        pts += int(w * 0.50)
     else:
-        pts += 4
+        pts += int(w * 0.20)
 
-    # 3. Gap alignment (0-20)
-    # Gap in same direction as trade = bullish confluence
+    # 3. Gap alignment
+    w = cfg["weight_gap"]
     if direction == "CALL":
         if gap_direction == "UP" and gap_pct >= 0.5:
-            pts += 20
+            pts += w
         elif gap_direction == "UP":
-            pts += 14
+            pts += int(w * 0.70)
         elif gap_direction == "FLAT":
-            pts += 8
+            pts += int(w * 0.40)
         else:
-            pts += 2   # gap against trade direction
-    else:  # PUT
-        if gap_direction == "DOWN" and abs(gap_pct) >= 0.5:
-            pts += 20
-        elif gap_direction == "DOWN":
-            pts += 14
-        elif gap_direction == "FLAT":
-            pts += 8
-        else:
-            pts += 2
-
-    # 4. Relative strength (0-20)
-    if direction == "CALL":
-        if rs >= 0.3:
-            pts += 20
-        elif rs >= 0.1:
-            pts += 14
-        elif rs >= -0.1:
-            pts += 8
-        else:
-            pts += 2   # underperforming SPY on a CALL = bad
-    else:  # PUT
-        if rs <= -0.3:
-            pts += 20
-        elif rs <= -0.1:
-            pts += 14
-        elif rs <= 0.1:
-            pts += 8
-        else:
-            pts += 2
-
-    # 5. Time of day (0-15)
-    # Best window: 9:30-11:00 AM ET (momentum window)
-    # Decent: 11:00-1:00 PM
-    # Risky: 1:00-2:00 PM
-    # Late: 2:00+ PM (theta decay accelerates)
-    if et_hour < 11:
-        pts += 15
-    elif et_hour < 13:
-        pts += 10
-    elif et_hour < 14:
-        pts += 5
+            pts += int(w * 0.10)
     else:
-        pts += 1   # after 2pm, almost no value
+        if gap_direction == "DOWN" and abs(gap_pct) >= 0.5:
+            pts += w
+        elif gap_direction == "DOWN":
+            pts += int(w * 0.70)
+        elif gap_direction == "FLAT":
+            pts += int(w * 0.40)
+        else:
+            pts += int(w * 0.10)
+
+    # 4. Relative strength
+    w = cfg["weight_rs"]
+    if direction == "CALL":
+        if rs >= 0.3:    pts += w
+        elif rs >= 0.1:  pts += int(w * 0.70)
+        elif rs >= -0.1: pts += int(w * 0.40)
+        else:            pts += int(w * 0.10)
+    else:
+        if rs <= -0.3:   pts += w
+        elif rs <= -0.1: pts += int(w * 0.70)
+        elif rs <= 0.1:  pts += int(w * 0.40)
+        else:            pts += int(w * 0.10)
+
+    # 5. Time of day
+    w = cfg["weight_time"]
+    if et_hour < cfg["time_prime_end"]:
+        pts += w
+    elif et_hour < cfg["time_decent_end"]:
+        pts += int(w * 0.67)
+    elif et_hour < cfg["time_risky_end"]:
+        pts += int(w * 0.33)
+    else:
+        pts += int(w * 0.07)
 
     # Apply vol regime modifier
     pts = int(pts * vol_mult)
     pts = min(pts, 100)
 
-    if pts >= 75:
-        grade = "A"
-        color = "#3fb950"   # green
-    elif pts >= 55:
-        grade = "B"
-        color = "#e3b341"   # yellow
-    elif pts >= 35:
-        grade = "C"
-        color = "#f0883e"   # orange
+    a_min = cfg["grade_a_min"]
+    b_min = cfg["grade_b_min"]
+    c_min = cfg["grade_c_min"]
+
+    if pts >= a_min:
+        grade = "A"; color = "#3fb950"
+    elif pts >= b_min:
+        grade = "B"; color = "#e3b341"
+    elif pts >= c_min:
+        grade = "C"; color = "#f0883e"
     else:
-        grade = "D"
-        color = "#f85149"   # red
+        grade = "D"; color = "#f85149"
 
     return grade, pts, color
 
@@ -960,18 +1148,10 @@ def get_time_vol_ratio(intraday_today, daily_bars, current_bar_idx):
 
 def compute_rank_score(result):
     """
-    Single number 0-200 for ranking signals against each other.
-    Combines every quality dimension we have.
-
-    Factors:
-      grade_pts      0-100  (base score)
-      alignment      +20 if trend-aligned, -15 if counter
-      1hr trend      +20 if confirms direction, +10 partial, -10 opposes
-      time-adj vol   +15 exceptional, +8 elevated, 0 normal, -10 light
-      clear air      +20 clear to T2, +10 clear to T1, -15 blocked
-      late penalty   -20 after 2pm
-    Max possible: 175
+    Single number 0-200 for ranking signals. All bonuses/penalties
+    driven by SCANNER_CONFIG so the AI can tune them.
     """
+    cfg        = get_config()
     grade_pts  = result.get("grade_pts", 0)
     aligned    = result.get("aligned", True)
     direction  = result.get("direction", "")
@@ -979,33 +1159,44 @@ def compute_rank_score(result):
 
     score = grade_pts
 
-    # Alignment bonus/penalty
-    score += 20 if aligned else -15
+    # Alignment
+    score += cfg["rank_align_bonus"] if aligned else cfg["rank_align_penalty"]
 
     # 1hr trend
     trend     = result.get("trend_1hr", "MIXED")
     trend_scr = result.get("trend_score", 0.0)
     if direction == "CALL":
-        if trend == "BULL":   score += 20 if trend_scr >= 1.0 else 10
-        elif trend == "BEAR": score -= 10
+        if trend == "BULL":
+            score += cfg["rank_trend_full"] if trend_scr >= 1.0 else cfg["rank_trend_partial"]
+        elif trend == "BEAR":
+            score += cfg["rank_trend_oppose"]
     elif direction == "PUT":
-        if trend == "BEAR":   score += 20 if trend_scr <= -1.0 else 10
-        elif trend == "BULL": score -= 10
+        if trend == "BEAR":
+            score += cfg["rank_trend_full"] if trend_scr <= -1.0 else cfg["rank_trend_partial"]
+        elif trend == "BULL":
+            score += cfg["rank_trend_oppose"]
 
     # Time-adjusted volume
     tv_ratio = result.get("time_vol_ratio", 1.0)
-    if tv_ratio >= 3.0:   score += 15
-    elif tv_ratio >= 2.0: score += 8
-    elif tv_ratio < 0.8:  score -= 10
+    if tv_ratio >= 3.0:
+        score += cfg["rank_vol_exceptional"]
+    elif tv_ratio >= 2.0:
+        score += cfg["rank_vol_elevated"]
+    elif tv_ratio < 0.8:
+        score += cfg["rank_vol_light"]
 
     # Clear air
     ca = result.get("clear_air") or {}
-    if ca.get("clear_to_t2"):     score += 20
-    elif ca.get("clear_to_t1"):   score += 10
-    else:                         score -= 15
+    if ca.get("clear_to_t2"):
+        score += cfg["rank_clear_t2"]
+    elif ca.get("clear_to_t1"):
+        score += cfg["rank_clear_t1"]
+    else:
+        score += cfg["rank_blocked"]
 
     # Late penalty
-    if late: score -= 20
+    if late:
+        score += cfg["rank_late_penalty"]
 
     return max(0, score)
 
@@ -1152,6 +1343,7 @@ def calculate_contracts(premium, score=80):
 
 def scan_all_symbols():
     results = []
+    cfg = get_config()  # snapshot config for this entire scan
 
     # Broad market alignment
     spy_chg_global = get_spy_change()
@@ -1289,6 +1481,13 @@ def scan_all_symbols():
             (direction == "PUT"  and market_bias == "BULL")
         )
 
+        # If counter-trend not allowed by config, skip signal
+        if not result["aligned"] and not cfg["counter_trend_allowed"]:
+            result["status"] = "counter-trend filtered"
+            results.append(result)
+            log("{}: SKIP counter-trend (config disabled)".format(symbol))
+            continue
+
         grade, grade_pts, grade_color = confluence_grade(
             breakout_strength, vol_ratio, vol_mult,
             gap_pct, gap_dir, rs, direction, et_hour)
@@ -1318,6 +1517,42 @@ def scan_all_symbols():
             results.append(result)
             log("{}: SKIP D grade {}pts".format(symbol, grade_pts))
             continue
+
+        # -------------------------------------------------------
+        # VWAP RECLAIM STRATEGY (AI-enabled secondary signal)
+        # Detects: price reclaimed VWAP after being below/above it
+        # -------------------------------------------------------
+        vwap_reclaim_signal = False
+        if cfg.get("vwap_reclaim_enabled") and len(intraday) >= cfg.get("vwap_reclaim_lookback", 6) + 1:
+            lookback = int(cfg.get("vwap_reclaim_lookback", 6))
+            prev_bars = intraday[-(lookback+1):-1]
+            cur_close = intraday[-1]["c"]
+            cur_open  = intraday[-1]["o"]
+
+            if direction == "CALL":
+                # At least half of lookback bars were below VWAP, now above
+                below_count = sum(1 for b in prev_bars if b["c"] < vwap)
+                just_reclaimed = cur_close > vwap and intraday[-2]["c"] < vwap
+                if just_reclaimed and below_count >= lookback // 2:
+                    if time_vol_ratio >= cfg.get("vwap_reclaim_vol_min", 1.3):
+                        vwap_reclaim_signal = True
+                        log("{}: VWAP RECLAIM detected (CALL) vol={:.1f}x".format(
+                            symbol, time_vol_ratio))
+            else:
+                above_count = sum(1 for b in prev_bars if b["c"] > vwap)
+                just_lost = cur_close < vwap and intraday[-2]["c"] > vwap
+                if just_lost and above_count >= lookback // 2:
+                    if time_vol_ratio >= cfg.get("vwap_reclaim_vol_min", 1.3):
+                        vwap_reclaim_signal = True
+                        log("{}: VWAP RECLAIM detected (PUT) vol={:.1f}x".format(
+                            symbol, time_vol_ratio))
+
+            if vwap_reclaim_signal:
+                result["signal_type"] = "VWAP_RECLAIM"
+                # Bump grade one level for clean VWAP reclaim with volume
+                if grade == "C":
+                    grade = "B"; grade_color = "#e3b341"; grade_pts = min(grade_pts + 10, 74)
+                result["grade_pts"] += 5  # small bonus in rank
 
         premium, strike, is_live = get_liquid_option(symbol, direction, price)
 
@@ -1436,15 +1671,303 @@ def run_signal_scan():
 
 
 # =============================================
-# BACKGROUND THREADS
+# AI IMPROVEMENT ENGINE
 # =============================================
 
+_ai_last_run_date  = ""   # tracks last calendar day AI ran
+_ai_last_trade_cnt = 0    # tracks trade count at last AI run
+
+def _build_stats_summary(trades):
+    """Build a compact stats dict for the AI prompt."""
+    if not trades:
+        return {}
+
+    total  = len(trades)
+    wins   = [t for t in trades if t["outcome"] == "WIN"]
+    losses = [t for t in trades if t["outcome"] == "LOSS"]
+    wr     = round(len(wins) / total * 100, 1) if total else 0
+    avg_r  = round(sum(t["r_mult"] or 0 for t in trades) / total, 2) if total else 0
+    total_pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
+
+    def breakdown(key):
+        groups = {}
+        for t in trades:
+            k = str(t.get(key) or "?")
+            if k not in groups: groups[k] = {"w": 0, "l": 0, "pnl": 0}
+            if t["outcome"] == "WIN":  groups[k]["w"] += 1
+            else:                      groups[k]["l"] += 1
+            groups[k]["pnl"] = round(groups[k]["pnl"] + (t["pnl"] or 0), 2)
+        result = {}
+        for k, v in groups.items():
+            n = v["w"] + v["l"]
+            result[k] = {
+                "trades": n,
+                "win_rate": round(v["w"] / n * 100, 1) if n else 0,
+                "pnl": v["pnl"]
+            }
+        return result
+
+    # Time buckets
+    def time_bucket(h):
+        if h < 10:   return "9:30-10:00"
+        elif h < 11: return "10:00-11:00"
+        elif h < 12: return "11:00-12:00"
+        elif h < 13: return "12:00-1:00"
+        elif h < 14: return "1:00-2:00"
+        else:        return "2:00+"
+
+    time_groups = {}
+    for t in trades:
+        k = time_bucket(t["entry_hour"] or 9.5)
+        if k not in time_groups: time_groups[k] = {"w": 0, "l": 0, "pnl": 0}
+        if t["outcome"] == "WIN":  time_groups[k]["w"] += 1
+        else:                      time_groups[k]["l"] += 1
+        time_groups[k]["pnl"] = round(time_groups[k]["pnl"] + (t["pnl"] or 0), 2)
+    by_time = {}
+    for k, v in time_groups.items():
+        n = v["w"] + v["l"]
+        by_time[k] = {"trades": n, "win_rate": round(v["w"]/n*100,1) if n else 0, "pnl": v["pnl"]}
+
+    # RS sign breakdown
+    rs_pos = [t for t in trades if (t["rs"] or 0) > 0]
+    rs_neg = [t for t in trades if (t["rs"] or 0) <= 0]
+    rs_breakdown = {
+        "rs_positive": {
+            "trades": len(rs_pos),
+            "win_rate": round(sum(1 for t in rs_pos if t["outcome"]=="WIN") / len(rs_pos) * 100, 1) if rs_pos else 0
+        },
+        "rs_negative": {
+            "trades": len(rs_neg),
+            "win_rate": round(sum(1 for t in rs_neg if t["outcome"]=="WIN") / len(rs_neg) * 100, 1) if rs_neg else 0
+        }
+    }
+
+    return {
+        "total_trades": total,
+        "win_rate":     wr,
+        "avg_r_mult":   avg_r,
+        "total_pnl":    total_pnl,
+        "by_symbol":    breakdown("symbol"),
+        "by_grade":     breakdown("grade"),
+        "by_direction": breakdown("direction"),
+        "by_gap_dir":   breakdown("gap_dir"),
+        "by_time":      by_time,
+        "rs_breakdown": rs_breakdown,
+        "recent_10":    trades[:10]
+    }
+
+
+def run_ai_improvement(trigger="scheduled"):
+    """
+    Calls Claude API with trade history + current config.
+    Gets back updated parameters and insight.
+    Applies changes immediately to live scanner.
+    """
+    global _ai_last_run_date, _ai_last_trade_cnt
+
+    if not ANTHROPIC_KEY:
+        log("AI: ANTHROPIC_API_KEY not set - skipping improvement run")
+        return
+
+    trades = db_get_all_closed_trades()
+    if len(trades) < 5:
+        log("AI: Only {} closed trades - need at least 5 to analyze".format(len(trades)))
+        return
+
+    log("AI: Starting improvement run ({} trades, trigger={})".format(len(trades), trigger))
+
+    stats   = _build_stats_summary(trades)
+    cfg     = get_config()
+
+    # Remove non-tunable keys from what we send
+    cfg_tunable = {k: v for k, v in cfg.items()
+                   if k not in ("ai_insight", "ai_focus", "updated_at", "updated_by")}
+
+    prompt = """You are an expert quantitative trader and algorithm optimizer.
+You are analyzing a 0DTE (zero days to expiration) options day trading scanner.
+Your ONLY goal is to maximize the scanner's win rate and present the highest-conviction trade each day.
+
+## Current Scanner Config
+```json
+{config}
+```
+
+## Trade Statistics
+```json
+{stats}
+```
+
+## Your Task
+Analyze the trade data and return an updated configuration that will improve win rate.
+Focus on:
+1. Which grade thresholds should shift based on actual win rates by grade?
+2. Which factor weights should increase/decrease based on which factors correlate with wins?
+3. Should counter-trend signals be filtered out entirely?
+4. Is the late_entry_hour cutoff optimal?
+5. Should VWAP reclaim strategy be enabled given the data?
+6. What is the single highest-conviction setup pattern in this data?
+
+## Rules
+- Only tune parameters that have statistical support (10+ trades in a group before drawing conclusions)
+- Be conservative -- never change a weight by more than 5 points in one update
+- Grade thresholds: A min must stay >= 65, C min must stay >= 25
+- The config changes must make mathematical sense (weights should roughly sum to 100)
+- If data is insufficient for a dimension, leave that parameter unchanged
+
+## Response Format
+Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
+{{
+  "config_updates": {{
+    "weight_breakout": <int>,
+    "weight_volume": <int>,
+    "weight_gap": <int>,
+    "weight_rs": <int>,
+    "weight_time": <int>,
+    "grade_a_min": <int>,
+    "grade_b_min": <int>,
+    "grade_c_min": <int>,
+    "late_entry_hour": <float>,
+    "counter_trend_allowed": <bool>,
+    "vwap_reclaim_enabled": <bool>,
+    "rank_align_bonus": <int>,
+    "rank_align_penalty": <int>,
+    "rank_late_penalty": <int>
+  }},
+  "insight": "<one sentence: the single most important pattern found>",
+  "focus": "<one sentence: what the scanner should prioritize tomorrow>",
+  "reasoning": "<3-5 sentences explaining the key config changes and why>"
+}}""".format(
+        config=json.dumps(cfg_tunable, indent=2),
+        stats=json.dumps(stats, indent=2)
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "messages":   [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        log("AI: Anthropic HTTP {}".format(resp.status_code))
+
+        if resp.status_code != 200:
+            log("AI: API error: {}".format(resp.text[:200]))
+            return
+
+        raw = resp.json()["content"][0]["text"].strip()
+        log("AI: Got response ({} chars)".format(len(raw)))
+
+        # Strip any accidental markdown fences
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        parsed = json.loads(raw)
+
+        updates      = parsed.get("config_updates", {})
+        insight      = parsed.get("insight", "")
+        focus        = parsed.get("focus", "")
+        reasoning    = parsed.get("reasoning", "")
+
+        # Compute diff for logging
+        old_cfg    = get_config()
+        config_diff = {k: {"old": old_cfg.get(k), "new": v}
+                       for k, v in updates.items()
+                       if old_cfg.get(k) != v}
+
+        # Apply to live config
+        updates["ai_insight"] = insight
+        updates["ai_focus"]   = focus
+        update_config(updates, updated_by="ai_v{}".format(
+            old_cfg.get("ai_version", 0) + 1))
+
+        new_cfg = get_config()
+        db_save_ai_config(new_cfg, trigger=trigger)
+        db_save_ai_analysis(
+            trades_used  = len(trades),
+            win_rate     = stats["win_rate"],
+            insight      = insight,
+            focus        = focus,
+            reasoning    = reasoning,
+            config_diff  = config_diff,
+            raw_response = raw
+        )
+
+        et = pytz.timezone("America/New_York")
+        _ai_last_run_date  = datetime.now(et).strftime("%Y-%m-%d")
+        _ai_last_trade_cnt = len(trades)
+
+        log("AI: Config updated to v{} | {}".format(new_cfg["ai_version"], insight))
+        if config_diff:
+            for k, v in config_diff.items():
+                log("AI:   {} {} -> {}".format(k, v["old"], v["new"]))
+
+        # Notify via Telegram
+        msg = (
+            "AI CONFIG UPDATE v{}\n\n"
+            "Insight: {}\n\n"
+            "Focus: {}\n\n"
+            "Changes: {}"
+        ).format(
+            new_cfg["ai_version"],
+            insight,
+            focus,
+            ", ".join("{}: {}->{}".format(k, v["old"], v["new"])
+                      for k, v in config_diff.items()) or "none"
+        )
+        send_telegram(msg)
+
+    except json.JSONDecodeError as e:
+        log("AI: JSON parse error: {} | raw: {}".format(e, raw[:200]))
+    except Exception as e:
+        log("AI: Exception: {}".format(e))
+
 def background_scheduler():
+    global _ai_last_run_date, _ai_last_trade_cnt
     log("Background scheduler started")
     time.sleep(10)
     while True:
         try:
             run_signal_scan()
+
+            # --- AI improvement triggers ---
+            et      = pytz.timezone("America/New_York")
+            now_et  = datetime.now(et)
+            today   = now_et.strftime("%Y-%m-%d")
+            et_hour = now_et.hour + now_et.minute / 60.0
+
+            # 1. End-of-day: run once after 4:05 PM ET
+            if et_hour >= 16.08 and _ai_last_run_date != today:
+                log("AI: End-of-day trigger")
+                threading.Thread(
+                    target=run_ai_improvement,
+                    args=("end_of_day",),
+                    daemon=True
+                ).start()
+
+            # 2. Intraday: run after every 5 new closed trades
+            all_closed = db_get_all_closed_trades()
+            n_closed   = len(all_closed)
+            if (n_closed >= 5 and
+                    n_closed - _ai_last_trade_cnt >= 5):
+                log("AI: Intraday trigger ({} new trades)".format(
+                    n_closed - _ai_last_trade_cnt))
+                threading.Thread(
+                    target=run_ai_improvement,
+                    args=("intraday_5trades",),
+                    daemon=True
+                ).start()
+
         except Exception as e:
             log("Scheduler error: {}".format(e))
         time.sleep(SCAN_INTERVAL)
@@ -1864,6 +2387,49 @@ def render_dashboard():
     no_open      = not open_trades
     no_closed    = not closed
 
+    # --- AI insight panel ---
+    cfg_now     = get_config()
+    ai_ver      = cfg_now.get("ai_version", 0)
+    ai_insight  = cfg_now.get("ai_insight", "")
+    ai_focus    = cfg_now.get("ai_focus", "")
+    ai_updated  = cfg_now.get("updated_at", "default")
+
+    if ai_ver > 0:
+        ai_panel = """
+<div style='margin:10px 14px 0;background:#161b22;border:1px solid #1f6feb;
+            border-radius:8px;padding:10px 14px;
+            border-left:3px solid #58a6ff'>
+  <div style='display:flex;align-items:center;justify-content:space-between;
+              margin-bottom:6px'>
+    <div style='font-size:10px;font-weight:700;color:#58a6ff;
+                text-transform:uppercase;letter-spacing:.6px'>
+      AI Engine &mdash; Config v{ver} &mdash; Updated {upd}
+    </div>
+    <a href='/ai' style='font-size:10px;color:#58a6ff;text-decoration:none'>
+      Full Analysis &#8594;
+    </a>
+  </div>
+  <div style='font-size:12px;color:#e6edf3;margin-bottom:4px'>
+    <span style='color:#8b949e'>Insight:</span> {insight}
+  </div>
+  <div style='font-size:12px;color:#e6edf3'>
+    <span style='color:#8b949e'>Focus:</span> {focus}
+  </div>
+</div>""".format(ver=ai_ver, upd=ai_updated, insight=ai_insight, focus=ai_focus)
+    else:
+        ai_panel = """
+<div style='margin:10px 14px 0;background:#161b22;border:1px solid #30363d;
+            border-radius:8px;padding:10px 14px'>
+  <div style='font-size:10px;font-weight:700;color:#8b949e;
+              text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px'>
+    AI Engine &mdash; Collecting Data
+  </div>
+  <div style='font-size:12px;color:#8b949e'>
+    {insight} &nbsp;
+    <a href='/ai' style='color:#58a6ff;text-decoration:none'>View AI panel &#8594;</a>
+  </div>
+</div>""".format(insight=ai_insight)
+
     html = """<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
@@ -1935,11 +2501,15 @@ def render_dashboard():
     </span>
   </div>
   <div class="topbar-right">
+    <a class="nav-link" href="/ai">AI</a>
     <a class="nav-link" href="/stats">Stats</a>
     <a class="nav-link" href="/alpaca-test">Alpaca</a>
     <a class="nav-link" href="/debug">Debug</a>
   </div>
 </div>
+
+<!-- AI INSIGHT PANEL -->
+{ai_panel}
 
 <!-- SIGNAL CARDS -->
 <div style="padding:12px 14px 0">
@@ -1977,6 +2547,7 @@ def render_dashboard():
 
 </body></html>""".format(
         mc=mkt_color, ml=mkt_label,
+        ai_panel=ai_panel,
         bias=market_bias, biasc=bias_color, spy=spy_chg,
         pc=pnl_color, pl=total_pnl,
         wrc=wr_color, wr=win_rate, nw=wins, nl=losses,
@@ -2272,7 +2843,129 @@ a.nav{{color:#58a6ff;text-decoration:none;font-size:12px}}
     return html
 
 
-@app.route("/debug")
+@app.route("/ai")
+def ai_page():
+    """Full AI analysis history, current config, and manual run trigger."""
+    cfg       = get_config()
+    analyses  = db_get_ai_analyses(limit=20)
+
+    # Config table rows
+    skip_keys = {"ai_insight", "ai_focus", "updated_at", "updated_by"}
+    cfg_rows  = ""
+    for k, v in sorted(cfg.items()):
+        if k in skip_keys:
+            continue
+        cfg_rows += (
+            "<tr style='border-bottom:1px solid #21262d'>"
+            "<td style='padding:7px 10px;color:#8b949e;font-family:monospace'>{}</td>"
+            "<td style='padding:7px 10px;font-weight:600;font-family:monospace'>{}</td>"
+            "</tr>"
+        ).format(k, v)
+
+    # Analysis history rows
+    analysis_rows = ""
+    for a in analyses:
+        diff  = json.loads(a["config_diff"]) if a["config_diff"] else {}
+        diffs = ", ".join("{}: {}->{}".format(k, v["old"], v["new"])
+                         for k, v in diff.items()) or "no changes"
+        wr_c  = "#3fb950" if (a["win_rate"] or 0) >= 55 else "#e3b341" if (a["win_rate"] or 0) >= 45 else "#f85149"
+        analysis_rows += """
+<div style='background:#161b22;border:1px solid #30363d;border-radius:8px;
+            padding:12px 14px;margin-bottom:10px'>
+  <div style='display:flex;justify-content:space-between;align-items:center;
+              margin-bottom:8px'>
+    <div style='font-size:11px;color:#8b949e'>{ts}</div>
+    <div>
+      <span style='color:{wrc};font-weight:700'>{wr}% WR</span>
+      <span style='color:#8b949e;font-size:11px'> &nbsp;{n} trades</span>
+    </div>
+  </div>
+  <div style='font-size:13px;font-weight:600;margin-bottom:4px'>{insight}</div>
+  <div style='font-size:12px;color:#e3b341;margin-bottom:6px'>{focus}</div>
+  <div style='font-size:11px;color:#8b949e;margin-bottom:4px'>{reasoning}</div>
+  <div style='font-size:10px;background:#0d1117;padding:6px 8px;border-radius:4px;
+              font-family:monospace;color:#58a6ff'>Changes: {diffs}</div>
+</div>""".format(
+            ts=a["ts"][:16], wrc=wr_c, wr=a["win_rate"] or 0,
+            n=a["trades_used"], insight=a["insight"] or "",
+            focus=a["focus"] or "", reasoning=a["reasoning"] or "",
+            diffs=diffs
+        )
+
+    if not analysis_rows:
+        analysis_rows = ("<div style='padding:20px;text-align:center;color:#8b949e;font-size:12px'>"
+                         "No AI analyses yet. Need 5+ closed trades to trigger first run."
+                         "</div>")
+
+    can_run   = bool(ANTHROPIC_KEY)
+    run_btn   = ""
+    if can_run:
+        run_btn = ("<a href='/ai/run' style='background:#1f6feb;color:#fff;"
+                   "padding:8px 18px;border-radius:6px;text-decoration:none;"
+                   "font-size:12px;font-weight:700'>Run AI Now</a>")
+    else:
+        run_btn = ("<span style='color:#f85149;font-size:12px'>"
+                   "ANTHROPIC_API_KEY not set</span>")
+
+    return """<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-serif;
+     padding:14px;margin:0;font-size:13px}}
+h2{{font-size:15px;color:#58a6ff;margin:18px 0 8px}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;
+       margin-bottom:14px;overflow:hidden}}
+.ch{{padding:10px 14px;border-bottom:1px solid #21262d;font-size:12px;
+     font-weight:700;display:flex;align-items:center;justify-content:space-between}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+th{{padding:7px 10px;text-align:left;color:#8b949e;border-bottom:1px solid #21262d;
+    font-size:10px;text-transform:uppercase;letter-spacing:.5px}}
+a.nav{{color:#58a6ff;text-decoration:none;font-size:12px}}
+</style></head><body>
+<div style='margin-bottom:12px;display:flex;align-items:center;gap:16px'>
+  <a class='nav' href='/'>&#8592; Dashboard</a>
+  {run_btn}
+</div>
+
+<h1 style='font-size:17px;margin-bottom:4px'>AI Optimization Engine</h1>
+<div style='font-size:11px;color:#8b949e;margin-bottom:14px'>
+  Config v{ver} &nbsp;|&nbsp; Updated by {by} at {upd} &nbsp;|&nbsp;
+  <span style='color:#e3b341'>{insight}</span>
+</div>
+
+<h2>Current Config</h2>
+<div class='card'>
+  <table><tr><th>Parameter</th><th>Value</th></tr>{cfg_rows}</table>
+</div>
+
+<h2>Analysis History</h2>
+{analyses}
+
+</body></html>""".format(
+        run_btn=run_btn,
+        ver=cfg.get("ai_version", 0),
+        by=cfg.get("updated_by", "default"),
+        upd=cfg.get("updated_at", "never"),
+        insight=cfg.get("ai_insight", ""),
+        cfg_rows=cfg_rows,
+        analyses=analysis_rows
+    )
+
+
+@app.route("/ai/run")
+def ai_run_manual():
+    """Manual AI improvement trigger."""
+    if not ANTHROPIC_KEY:
+        return ("<html><body style='background:#0d1117;color:#f85149;"
+                "font-family:Arial;padding:20px'>"
+                "<h2>ANTHROPIC_API_KEY not set</h2>"
+                "<a href='/ai' style='color:#58a6ff'>Back</a></body></html>")
+    threading.Thread(
+        target=run_ai_improvement,
+        args=("manual",),
+        daemon=True
+    ).start()
+    return redirect("/ai")
 def debug_route():
     with state_lock:
         return jsonify({"signals": all_signals, "log": debug_log[-50:]})
@@ -2393,6 +3086,7 @@ def token_check():
 # =============================================
 
 init_db()
+db_load_latest_config()   # restore AI config from last session
 threading.Thread(target=background_scheduler, daemon=True).start()
 threading.Thread(target=telegram_poller,      daemon=True).start()
 
