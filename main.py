@@ -2263,6 +2263,8 @@ def render_dashboard(toast=""):
     if(t) t.style.display='none';
   }}, 3000);
 </script>""".format(bg=toast_bg, msg=toast_msg)
+        # Escape any remaining braces so the outer dashboard .format() doesn't choke
+        toast_html = toast_html.replace("{", "{{").replace("}", "}}")
     with state_lock:
         signals  = list(all_signals)
         secs     = max(0, int(next_scan_at - time.time()))
