@@ -3074,6 +3074,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
   <div>
     <a class='nav-link' href='/'>0DTE</a>
     <a class='nav-link active' href='/swing'>Swing</a>
+    <a class='nav-link' href='/chat'>Chat</a>
     <a class='nav-link' href='/ai'>AI</a>
     <a class='nav-link' href='/stats'>Stats</a>
   </div>
@@ -3713,8 +3714,8 @@ def render_dashboard(toast=""):
   </div>
   <div class="topbar-right">
     <a class="nav-link" href="/swing">Swing</a>
+    <a class="nav-link" href="/chat">Chat</a>
     <a class="nav-link" href="/ai">AI</a>
-    <a class="nav-link" href="/swing">Swing</a>
     <a class="nav-link" href="/stats">Stats</a>
     <a class="nav-link" href="/alpaca-test">Alpaca</a>
     <a class="nav-link" href="/debug">Debug</a>
@@ -4326,6 +4327,342 @@ def swing_scan_now():
     """Manually trigger a swing scan."""
     threading.Thread(target=run_swing_scan, daemon=True).start()
     return redirect("/swing")
+
+
+def _build_scanner_context():
+    """Build a rich context string of current scanner state for the chat system prompt."""
+    et     = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    cfg    = get_config()
+
+    # 0DTE signals
+    with state_lock:
+        dte_sigs = list(all_signals)
+    active = [s for s in dte_sigs if s.get("status") in ("SIGNAL", "SIGNAL (no options)")]
+    watching = [s for s in dte_sigs if s.get("status") == "WATCHING"]
+
+    dte_lines = []
+    for s in active:
+        dte_lines.append(
+            "  {sym} {d} | Grade:{g}({gp}pts) | Price:{p} | VWAP:{vwap} | "
+            "T1:{t1} T2:{t2} | Stop:{stp} | Gap:{gap:.2f}% | RS:{rs:.2f}% | "
+            "1HR:{hr} | Vol:{vol} | Rank:{rank}".format(
+                sym=s["symbol"], d=s.get("direction",""),
+                g=s.get("grade","-"), gp=s.get("grade_pts",0),
+                p=s.get("price",0), vwap=round(s.get("vwap",0),2),
+                t1=s.get("t1",0), t2=s.get("t2",0),
+                stp=s.get("stop_loss",0),
+                gap=s.get("gap_pct",0), rs=s.get("rs",0),
+                hr=s.get("trend_1hr","?"),
+                vol=s.get("vol_signal","?"),
+                rank=s.get("rank_score",0)
+            ))
+
+    # Swing signals
+    with swing_lock:
+        sw_sigs = list(all_swing_signals)
+
+    sw_lines = []
+    for s in sw_sigs[:20]:  # top 20
+        opt = s.get("option") or {}
+        sw_lines.append(
+            "  {sym} {d} | {stype} | Prob:{prob}% | Price:{p} | "
+            "T1:{t1} T2:{t2} T3:{t3} | Stop:{stp} | R:R {rr} | RS:{rs:+.1f}% | "
+            "Option:{oprem} {dte}DTE".format(
+                sym=s["symbol"], d=s["direction"],
+                stype=s["signal_type"], prob=s["prob"],
+                p=s["price"],
+                t1=s.get("t1") or "-", t2=s.get("t2") or "-", t3=s.get("t3") or "-",
+                stp=s.get("stop","-"), rr=s.get("rr1",0),
+                rs=s.get("spy_rs",0),
+                oprem=opt.get("premium","-") if opt else "-",
+                dte=opt.get("dte","?") if opt else "?",
+            ))
+
+    # Today's trades
+    trades     = db_get_today_trades()
+    open_t     = db_get_open_trades()
+    closed_t   = [t for t in trades if t["outcome"] != "OPEN"]
+    wins       = len([t for t in closed_t if t["outcome"] == "WIN"])
+    losses     = len([t for t in closed_t if t["outcome"] == "LOSS"])
+    total_pnl  = round(sum(t["pnl"] or 0 for t in closed_t), 2)
+
+    open_lines = []
+    for t in open_t:
+        open_lines.append(
+            "  #{id} {sym} {d} | Entry:${e} x{c} | Stop:${stp} Target:${tgt}".format(
+                id=t["id"], sym=t["symbol"], d=t["direction"],
+                e=t["entry_price"], c=t["contracts"],
+                stp=t["stop_price"], tgt=t["target_price"]))
+
+    # Market
+    bias = "---"
+    spy_chg = 0.0
+    for s in dte_sigs:
+        if s.get("market_bias"):
+            bias    = s["market_bias"]
+            spy_chg = s.get("spy_chg", 0.0)
+            break
+
+    ctx = """=== SCANNER CONTEXT ({time} ET) ===
+
+MARKET: {bias} | SPY {spy:+.2f}% | {mkt}
+
+0DTE ACTIVE SIGNALS ({nact} setups):
+{dte_active}
+
+0DTE WATCHING ({nwatch} stocks):
+{dte_watch}
+
+SWING SETUPS (top 20 of {nsw} found):
+{sw}
+
+OPEN TRADES ({nopen}):
+{open_t}
+
+TODAY'S P&L: ${pnl} | {w}W {l}L
+
+AI CONFIG: v{ver} | Insight: {insight} | Focus: {focus}
+""".format(
+        time    = now_et.strftime("%H:%M"),
+        bias    = bias,
+        spy     = float(spy_chg or 0),
+        mkt     = "MARKET OPEN" if market_open() else "MARKET CLOSED",
+        nact    = len(active),
+        dte_active = "\n".join(dte_lines) or "  (none)",
+        nwatch  = len(watching),
+        dte_watch  = "  " + ", ".join(s["symbol"] for s in watching) if watching else "  (none)",
+        nsw     = len(sw_sigs),
+        sw      = "\n".join(sw_lines) or "  (none yet -- scan running)",
+        nopen   = len(open_t),
+        open_t  = "\n".join(open_lines) or "  (none)",
+        pnl     = total_pnl,
+        w       = wins,
+        l       = losses,
+        ver     = cfg.get("ai_version", 0),
+        insight = cfg.get("ai_insight", "none"),
+        focus   = cfg.get("ai_focus", "none"),
+    )
+    return ctx
+
+
+@app.route("/chat")
+def chat_page():
+    has_key = bool(ANTHROPIC_KEY)
+    return """<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-serif;
+     font-size:13px;display:flex;flex-direction:column;height:100vh}}
+.topbar{{background:#161b22;border-bottom:1px solid #30363d;padding:0 14px;
+         display:flex;align-items:center;justify-content:space-between;
+         height:48px;flex-shrink:0}}
+.brand{{font-size:13px;font-weight:800;letter-spacing:1px;color:#e6edf3;
+        text-transform:uppercase}}
+.nav-link{{color:#58a6ff;text-decoration:none;font-size:11px;font-weight:500;margin-left:14px}}
+.nav-link:hover{{text-decoration:underline}}
+.nav-active{{color:#e6edf3;border-bottom:2px solid #58a6ff;padding-bottom:2px}}
+#msgs{{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}}
+.msg-user{{align-self:flex-end;background:#1f6feb;color:#fff;border-radius:16px 16px 4px 16px;
+           padding:10px 14px;max-width:82%;font-size:13px;line-height:1.5}}
+.msg-ai{{align-self:flex-start;background:#161b22;border:1px solid #30363d;
+         border-radius:4px 16px 16px 16px;padding:10px 14px;max-width:92%;
+         font-size:13px;line-height:1.6;white-space:pre-wrap}}
+.msg-ai strong{{color:#58a6ff}}
+.msg-system{{align-self:center;color:#8b949e;font-size:11px;font-style:italic}}
+.typing{{color:#8b949e;font-size:12px;font-style:italic;padding:4px 14px}}
+.input-row{{background:#161b22;border-top:1px solid #30363d;padding:10px 12px;
+            display:flex;gap:8px;flex-shrink:0}}
+#inp{{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:20px;
+      color:#e6edf3;font-size:13px;padding:10px 16px;outline:none;
+      font-family:-apple-system,Arial,sans-serif}}
+#inp:focus{{border-color:#58a6ff}}
+#send-btn{{background:#1f6feb;color:#fff;border:none;border-radius:20px;
+           padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer;
+           white-space:nowrap}}
+#send-btn:disabled{{background:#21262d;color:#8b949e;cursor:not-allowed}}
+.chip{{display:inline-block;background:#21262d;color:#8b949e;font-size:11px;
+       padding:4px 10px;border-radius:12px;cursor:pointer;margin:3px;
+       border:1px solid #30363d}}
+.chip:hover{{border-color:#58a6ff;color:#58a6ff}}
+</style>
+</head><body>
+
+<div class='topbar'>
+  <span class='brand'>Scanner Chat</span>
+  <div>
+    <a class='nav-link' href='/'>0DTE</a>
+    <a class='nav-link' href='/swing'>Swing</a>
+    <a class='nav-link nav-active' href='/chat'>Chat</a>
+    <a class='nav-link' href='/ai'>AI</a>
+    <a class='nav-link' href='/stats'>Stats</a>
+  </div>
+</div>
+
+<div id='msgs'>
+  <div class='msg-system'>Context is refreshed each message with live scanner data.</div>
+  <div class='msg-ai'><strong>Scanner AI</strong>
+I have full access to your live 0DTE signals, swing setups, open trades, P&L, and scanner config. Ask me anything:
+
+<div style='margin-top:10px'>
+<span class='chip' onclick='ask(this)'>What's the best setup right now?</span>
+<span class='chip' onclick='ask(this)'>Explain the top 0DTE signal</span>
+<span class='chip' onclick='ask(this)'>Any swing trades worth taking today?</span>
+<span class='chip' onclick='ask(this)'>Should I be bullish or bearish today?</span>
+<span class='chip' onclick='ask(this)'>What are my open positions?</span>
+<span class='chip' onclick='ask(this)'>Compare the top 3 swing setups</span>
+</div></div>
+</div>
+
+<div id='typing' class='typing' style='display:none'>Scanner AI is thinking...</div>
+
+<div class='input-row'>
+  <input id='inp' placeholder='{ph}' {dis} autocomplete='off'
+         onkeydown='if(event.key==="Enter"&&!event.shiftKey){{event.preventDefault();send()}}'>
+  <button id='send-btn' onclick='send()' {dis}>Send</button>
+</div>
+
+<script>
+var history = [];
+
+function ask(el) {{
+  document.getElementById('inp').value = el.textContent;
+  send();
+}}
+
+function addMsg(role, text) {{
+  var div = document.createElement('div');
+  div.className = role === 'user' ? 'msg-user' : 'msg-ai';
+  if (role === 'assistant') {{
+    div.innerHTML = '<strong>Scanner AI</strong>\\n' + escHtml(text);
+  }} else {{
+    div.textContent = text;
+  }}
+  document.getElementById('msgs').appendChild(div);
+  div.scrollIntoView({{behavior:'smooth'}});
+  return div;
+}}
+
+function escHtml(t) {{
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+
+function send() {{
+  var inp = document.getElementById('inp');
+  var txt = inp.value.trim();
+  if (!txt) return;
+  inp.value = '';
+  addMsg('user', txt);
+  history.push({{role:'user', content:txt}});
+
+  var btn = document.getElementById('send-btn');
+  btn.disabled = true;
+  inp.disabled = true;
+  document.getElementById('typing').style.display = 'block';
+
+  fetch('/chat/send', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{history: history}})
+  }})
+  .then(r => r.json())
+  .then(data => {{
+    document.getElementById('typing').style.display = 'none';
+    btn.disabled = false;
+    inp.disabled = false;
+    inp.focus();
+    if (data.error) {{
+      addMsg('assistant', 'Error: ' + data.error);
+    }} else {{
+      addMsg('assistant', data.reply);
+      history.push({{role:'assistant', content:data.reply}});
+      // Keep history to last 20 turns to avoid token overflow
+      if (history.length > 40) history = history.slice(history.length - 40);
+    }}
+  }})
+  .catch(err => {{
+    document.getElementById('typing').style.display = 'none';
+    btn.disabled = false;
+    inp.disabled = false;
+    addMsg('assistant', 'Network error: ' + err);
+  }});
+}}
+</script>
+</body></html>""".format(
+        ph  = "Ask about signals, stocks, setups..." if has_key else "ANTHROPIC_API_KEY not set",
+        dis = "" if has_key else "disabled",
+    )
+
+
+@app.route("/chat/send", methods=["POST"])
+def chat_send():
+    if not ANTHROPIC_KEY:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"})
+
+    try:
+        data    = request.get_json(force=True)
+        history = data.get("history", [])
+        if not history:
+            return jsonify({"error": "No message"})
+
+        # Cap history at last 20 turns
+        if len(history) > 20:
+            history = history[-20:]
+
+        # Build live context
+        ctx = _build_scanner_context()
+
+        system_prompt = """You are an expert trading assistant embedded inside a live 0DTE and swing options scanner. You have direct access to the scanner's current state shown below.
+
+You help the trader:
+- Interpret and rank the current signals
+- Explain what the scanner is seeing and why
+- Discuss individual stocks and option setups
+- Give conviction ratings on specific trades
+- Compare 0DTE vs swing opportunities
+- Flag risks (counter-trend, low volume, extended moves)
+- Answer general questions about options, technical analysis, and market structure
+
+Be concise and direct -- this is a trading app on mobile. Use short paragraphs. Lead with the most actionable insight. Use dollar signs and percentages as shown in the data.
+
+When discussing options: always mention the DTE, the delta, and whether the setup is 0DTE or swing (multi-day hold).
+
+--- LIVE SCANNER DATA ---
+{ctx}
+--- END SCANNER DATA ---
+
+You have full knowledge of this scanner's methodology:
+- 0DTE signals use ORB breakouts, VWAP, confluence grading (A/B/C), volume, gap alignment, RS vs SPY, 1hr trend
+- Swing signals use Post-Earnings Continuation, Gap & Go, and Institutional Accumulation/Distribution
+- Fibonacci extensions (1.272 / 1.618 / 2.0) are price targets; 0.618 retrace is the stop level
+- Swing options target delta ~0.55, 2-week expiry; 0DTE options target delta ~0.40""".format(ctx=ctx)
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-sonnet-4-20250514",
+                "max_tokens": 1024,
+                "system":     system_prompt,
+                "messages":   history,
+            },
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            return jsonify({"error": "API error {}".format(response.status_code)})
+
+        reply = response.json()["content"][0]["text"]
+        return jsonify({"reply": reply})
+
+    except Exception as e:
+        log("Chat error: {}".format(e))
+        return jsonify({"error": str(e)})
 
 
 @app.route("/debug")
