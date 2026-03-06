@@ -2,6 +2,7 @@ from flask import Flask, jsonify, render_template_string, request, redirect
 import requests
 import os
 import statistics
+import math
 import threading
 import time
 import json
@@ -117,9 +118,28 @@ DEFAULT_CONFIG = {
     "rank_late_penalty":    -20,
 
     # --- VWAP reclaim strategy ---
-    "vwap_reclaim_enabled":     False,
+    "vwap_reclaim_enabled":     True,
     "vwap_reclaim_vol_min":     1.3,
     "vwap_reclaim_lookback":    6,
+
+    # --- VWAP trend strategy (Zarattini & Aziz SSRN 2023) ---
+    "vwap_trend_enabled":       True,
+    "vwap_trend_min_bars":      8,
+    "vwap_trend_min_dist_pct":  0.15,
+    "vwap_trend_vol_min":       0.9,
+    "vwap_trend_trend_pct":     0.55,
+
+    # --- VWAP mean reversion strategy ---
+    "vwap_mr_enabled":          True,
+    "vwap_mr_band_std":         2.0,
+    "vwap_mr_min_bars":         12,
+    "vwap_mr_vol_min":          0.8,
+
+    # --- Initial Balance extension strategy (Market Profile) ---
+    "ib_ext_enabled":           True,
+    "ib_ext_multiplier":        1.0,
+    "ib_ext_min_hour":          10.5,
+    "ib_ext_vol_min":           1.2,
 
     # --- Filter strictness ---
     "counter_trend_allowed":    True,
@@ -797,6 +817,304 @@ def calculate_vwap(bars):
         pv  += typ * b["v"]
         vol += b["v"]
     return pv / vol if vol else None
+
+
+# =============================================
+# VWAP DEVIATION BANDS
+# =============================================
+
+def calculate_vwap_bands(bars, num_std=2.0):
+    """
+    Calculate VWAP and standard deviation bands for intraday bars.
+    Returns: (vwap, upper_band, lower_band, std_dev)
+    """
+    if not bars or len(bars) < 3:
+        return None, None, None, None
+
+    cum_pv  = 0.0
+    cum_vol = 0.0
+    for b in bars:
+        typ  = (b["h"] + b["l"] + b["c"]) / 3.0
+        cum_pv  += typ * b["v"]
+        cum_vol += b["v"]
+    if cum_vol == 0:
+        return None, None, None, None
+
+    vwap = cum_pv / cum_vol
+
+    cum_var = 0.0
+    for b in bars:
+        typ  = (b["h"] + b["l"] + b["c"]) / 3.0
+        cum_var += b["v"] * (typ - vwap) ** 2
+    std_dev = math.sqrt(cum_var / cum_vol) if cum_vol > 0 else 0.0
+
+    upper = round(vwap + num_std * std_dev, 4)
+    lower = round(vwap - num_std * std_dev, 4)
+    return round(vwap, 4), upper, lower, round(std_dev, 4)
+
+
+# =============================================
+# STRATEGY: VWAP TREND FOLLOWING
+# (Zarattini & Aziz, SSRN 2023 — Sharpe 2.1 on QQQ)
+# =============================================
+
+def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
+                      gap_pct, gap_dir, rs, market_bias,
+                      time_vol_ratio, vol_mult):
+    """
+    When price stays consistently on one side of VWAP with trending
+    structure (HH/HL or LH/LL), it's a high-prob continuation signal.
+    Catches trending days where ORB breakout didn't cleanly trigger.
+
+    Returns signal dict or None.
+    """
+    if not cfg.get("vwap_trend_enabled", True):
+        return None
+    if not intraday or not vwap:
+        return None
+
+    min_bars = cfg.get("vwap_trend_min_bars", 8)
+    # Need enough bars past the ORB window
+    if len(intraday) < min_bars + 6:
+        return None
+
+    price = intraday[-1]["c"]
+
+    # Check consecutive bars on same side of VWAP
+    recent = intraday[-min_bars:]
+    above_count = sum(1 for b in recent if b["c"] > vwap)
+    below_count = sum(1 for b in recent if b["c"] < vwap)
+
+    if above_count < min_bars and below_count < min_bars:
+        return None
+
+    direction = "CALL" if above_count >= min_bars else "PUT"
+
+    # Trending structure: higher lows (CALL) or lower highs (PUT)
+    trend_bars = intraday[-min_bars:]
+    if direction == "CALL":
+        hl_count = sum(1 for i in range(1, len(trend_bars))
+                       if trend_bars[i]["l"] >= trend_bars[i-1]["l"])
+        trend_pct = hl_count / (len(trend_bars) - 1)
+    else:
+        lh_count = sum(1 for i in range(1, len(trend_bars))
+                       if trend_bars[i]["h"] <= trend_bars[i-1]["h"])
+        trend_pct = lh_count / (len(trend_bars) - 1)
+
+    if trend_pct < cfg.get("vwap_trend_trend_pct", 0.55):
+        return None
+
+    # Distance from VWAP must be meaningful
+    vwap_dist_pct = abs(price - vwap) / vwap * 100
+    if vwap_dist_pct < cfg.get("vwap_trend_min_dist_pct", 0.15):
+        return None
+
+    # Volume filter
+    if time_vol_ratio < cfg.get("vwap_trend_vol_min", 0.9):
+        return None
+
+    # Counter-trend filter
+    if not cfg.get("counter_trend_allowed", True):
+        if (direction == "CALL" and market_bias == "BEAR") or \
+           (direction == "PUT" and market_bias == "BULL"):
+            return None
+
+    # Compute targets using recent range
+    avg_range = statistics.mean([b["h"] - b["l"] for b in intraday[-min_bars:]])
+    if direction == "CALL":
+        t1   = round(price + avg_range * 1.5, 2)
+        t2   = round(price + avg_range * 3.0, 2)
+        stop = round(vwap - avg_range * 0.5, 2)
+    else:
+        t1   = round(price - avg_range * 1.5, 2)
+        t2   = round(price - avg_range * 3.0, 2)
+        stop = round(vwap + avg_range * 0.5, 2)
+
+    # Score: base 50 + adjustments
+    score = 50 + (trend_pct * 20) + min(vwap_dist_pct * 10, 15)
+    score = score * vol_mult
+
+    log("{}: VWAP_TREND {} | dist={:.2f}% | trend={:.0f}% | vol={:.1f}x".format(
+        intraday[-1].get("t", "?")[:5] if isinstance(intraday[-1].get("t"), str) else "?",
+        direction, vwap_dist_pct, trend_pct * 100, time_vol_ratio))
+
+    return {
+        "signal_type":  "VWAP_TREND",
+        "direction":    direction,
+        "score":        round(score, 2),
+        "t1":           t1,
+        "t2":           t2,
+        "stop":         stop,
+        "vwap_dist":    round(vwap_dist_pct, 2),
+        "trend_pct":    round(trend_pct * 100, 1),
+    }
+
+
+# =============================================
+# STRATEGY: VWAP MEAN REVERSION
+# (Deviation band snap-back — works on range-bound days)
+# =============================================
+
+def detect_vwap_mean_reversion(intraday, daily, vwap, cfg, et_hour,
+                                time_vol_ratio, vol_mult):
+    """
+    When price extends to VWAP deviation bands and shows reversal,
+    trade the snap-back toward VWAP. Works best on range-bound days
+    where ORB breakouts fail.
+
+    Returns signal dict or None.
+    """
+    if not cfg.get("vwap_mr_enabled", True):
+        return None
+    min_bars = cfg.get("vwap_mr_min_bars", 12)
+    if not intraday or len(intraday) < min_bars:
+        return None
+
+    num_std = cfg.get("vwap_mr_band_std", 2.0)
+    vwap_val, upper, lower, std_dev = calculate_vwap_bands(intraday, num_std)
+    if not vwap_val or not upper or not lower or std_dev == 0:
+        return None
+
+    price     = intraday[-1]["c"]
+    prev_close = intraday[-2]["c"]
+
+    # Volume filter
+    if time_vol_ratio < cfg.get("vwap_mr_vol_min", 0.8):
+        return None
+
+    # Detect reversal from upper band (short/PUT signal)
+    if prev_close >= upper and price < upper:
+        direction = "PUT"
+        band_tag  = "upper"
+        t1   = round(vwap_val, 2)
+        t2   = round(lower, 2)
+        stop = round(upper + std_dev * 0.5, 2)
+    # Detect reversal from lower band (long/CALL signal)
+    elif prev_close <= lower and price > lower:
+        direction = "CALL"
+        band_tag  = "lower"
+        t1   = round(vwap_val, 2)
+        t2   = round(upper, 2)
+        stop = round(lower - std_dev * 0.5, 2)
+    else:
+        return None
+
+    # Score: distance from band matters, volume matters
+    band_dist = abs(price - vwap_val) / vwap_val * 100 if vwap_val else 0
+    score = 45 + min(band_dist * 8, 20) + min(time_vol_ratio * 5, 15)
+    score = score * vol_mult
+
+    log("{}: VWAP_MR {} from {} band | dist={:.2f}% | vol={:.1f}x".format(
+        "?", direction, band_tag, band_dist, time_vol_ratio))
+
+    return {
+        "signal_type":  "VWAP_MEAN_REV",
+        "direction":    direction,
+        "score":        round(score, 2),
+        "t1":           t1,
+        "t2":           t2,
+        "stop":         stop,
+        "band_tag":     band_tag,
+        "band_dist":    round(band_dist, 2),
+        "upper_band":   round(upper, 2),
+        "lower_band":   round(lower, 2),
+    }
+
+
+# =============================================
+# STRATEGY: INITIAL BALANCE EXTENSION
+# (Market Profile — Dalton/Steidlmayer, 65-70% continuation)
+# =============================================
+
+def detect_ib_extension(intraday, daily, vwap, cfg, et_hour,
+                        time_vol_ratio, vol_mult, market_bias):
+    """
+    The Initial Balance is the first hour's range (bars 0-11 at 5min).
+    When price moves 1x IB range beyond IB high/low, it signals strong
+    directional conviction.
+
+    Fires AFTER 10:30 AM ET — catches midday momentum that ORB misses.
+
+    Returns signal dict or None.
+    """
+    if not cfg.get("ib_ext_enabled", True):
+        return None
+    if not intraday or len(intraday) < 14:
+        return None
+
+    # Only fire after IB period ends
+    min_hour = cfg.get("ib_ext_min_hour", 10.5)
+    if et_hour < min_hour:
+        return None
+
+    # Initial Balance = first 12 bars (1 hour of 5min bars)
+    ib_bars = intraday[:12]
+    ib_high = max(b["h"] for b in ib_bars)
+    ib_low  = min(b["l"] for b in ib_bars)
+    ib_range = ib_high - ib_low
+
+    if ib_range <= 0:
+        return None
+
+    price = intraday[-1]["c"]
+    multiplier = cfg.get("ib_ext_multiplier", 1.0)
+
+    # Check for IB extension
+    if price > ib_high + (ib_range * multiplier):
+        direction = "CALL"
+        extension = (price - ib_high) / ib_range
+    elif price < ib_low - (ib_range * multiplier):
+        direction = "PUT"
+        extension = (ib_low - price) / ib_range
+    else:
+        return None
+
+    # Volume confirmation
+    if time_vol_ratio < cfg.get("ib_ext_vol_min", 1.2):
+        return None
+
+    # VWAP alignment check (price should be on the same side as direction)
+    if vwap:
+        if direction == "CALL" and price < vwap:
+            return None  # Extension without VWAP support = likely false
+        if direction == "PUT" and price > vwap:
+            return None
+
+    # Counter-trend filter
+    if not cfg.get("counter_trend_allowed", True):
+        if (direction == "CALL" and market_bias == "BEAR") or \
+           (direction == "PUT" and market_bias == "BULL"):
+            return None
+
+    # Targets: use IB range for projection
+    if direction == "CALL":
+        t1   = round(price + ib_range * 0.5, 2)
+        t2   = round(price + ib_range * 1.0, 2)
+        stop = round(ib_high - ib_range * 0.3, 2)
+    else:
+        t1   = round(price - ib_range * 0.5, 2)
+        t2   = round(price - ib_range * 1.0, 2)
+        stop = round(ib_low + ib_range * 0.3, 2)
+
+    # Score: extension magnitude + volume
+    score = 55 + min(extension * 15, 25) + min(time_vol_ratio * 5, 15)
+    score = score * vol_mult
+
+    log("{}: IB_EXT {} | ext={:.1f}x IB | vol={:.1f}x".format(
+        "?", direction, extension, time_vol_ratio))
+
+    return {
+        "signal_type":  "IB_EXTENSION",
+        "direction":    direction,
+        "score":        round(score, 2),
+        "t1":           t1,
+        "t2":           t2,
+        "stop":         stop,
+        "ib_high":      round(ib_high, 2),
+        "ib_low":       round(ib_low, 2),
+        "ib_range":     round(ib_range, 2),
+        "extension":    round(extension, 2),
+    }
 
 
 def volatility_score(daily_bars):
@@ -1588,7 +1906,7 @@ def scan_all_symbols():
             "spy_chg": spy_chg_global, "late_entry": False,
             "market_bias": market_bias, "aligned": True,
             "key_levels": [], "clear_air": None, "rec_contract": None,
-            "t1_prob": 50, "t2_prob": 25,
+            "t1_prob": 50, "t2_prob": 25, "signal_type": "ORB",
         }
 
         intraday = get_intraday(symbol)
@@ -1678,6 +1996,113 @@ def scan_all_symbols():
             result["vs_orb"]  = "-{:.3f}%".format(abs(vs_orb_low))
             result["vs_vwap"] = "-{:.3f}%".format(abs(vs_vwap))
         else:
+            # --- No ORB breakout: try alternative strategies ---
+            alt_signal = None
+
+            # 1. VWAP Trend Following (Zarattini & Aziz)
+            if not alt_signal:
+                alt_signal = detect_vwap_trend(
+                    intraday, daily, vwap, cfg, et_hour,
+                    gap_pct, gap_dir, rs, market_bias,
+                    time_vol_ratio, vol_mult)
+
+            # 2. VWAP Mean Reversion (deviation band snap-back)
+            if not alt_signal:
+                alt_signal = detect_vwap_mean_reversion(
+                    intraday, daily, vwap, cfg, et_hour,
+                    time_vol_ratio, vol_mult)
+
+            # 3. Initial Balance Extension (Market Profile)
+            if not alt_signal:
+                alt_signal = detect_ib_extension(
+                    intraday, daily, vwap, cfg, et_hour,
+                    time_vol_ratio, vol_mult, market_bias)
+
+            if alt_signal:
+                # We have an alternative signal — promote to full signal
+                direction = alt_signal["direction"]
+                result["signal_type"] = alt_signal["signal_type"]
+                result["direction"]   = direction
+                result["vs_vwap"]     = "{:+.3f}%".format(vs_vwap)
+                result["vs_orb"]      = "{:.2f}% from ORB {}".format(
+                    abs(vs_orb_high if price > vwap else vs_orb_low),
+                    "high" if price > vwap else "low")
+
+                # Use alt signal's targets
+                if direction == "CALL":
+                    result["und_call_t1"]   = alt_signal.get("t1", result.get("und_call_t1"))
+                    result["und_call_t2"]   = alt_signal.get("t2", result.get("und_call_t2"))
+                    result["und_call_stop"] = alt_signal.get("stop", result.get("und_call_stop"))
+                else:
+                    result["und_put_t1"]    = alt_signal.get("t1", result.get("und_put_t1"))
+                    result["und_put_t2"]    = alt_signal.get("t2", result.get("und_put_t2"))
+                    result["und_put_stop"]  = alt_signal.get("stop", result.get("und_put_stop"))
+
+                # Grade the alt signal (use moderate breakout strength proxy)
+                vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+                breakout_strength = abs(price - vwap) / vwap if vwap else 0
+                score = alt_signal["score"]
+
+                result["aligned"] = not (
+                    (direction == "CALL" and market_bias == "BEAR") or
+                    (direction == "PUT"  and market_bias == "BULL")
+                )
+
+                grade, grade_pts, grade_color = confluence_grade(
+                    breakout_strength, vol_ratio, vol_mult,
+                    gap_pct, gap_dir, rs, direction, et_hour)
+
+                # Alt strategies get a slight grade bump for passing their own filters
+                grade_pts = min(grade_pts + 5, 100)
+
+                t1_key = "und_call_t1" if direction == "CALL" else "und_put_t1"
+                t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
+                clear_air = check_clear_air(price, direction,
+                                            result.get(t1_key), result.get(t2_key),
+                                            key_levels)
+                result["clear_air"] = clear_air
+
+                if not clear_air["clear_to_t1"]:
+                    grade_pts = min(grade_pts, 52)
+                    if grade in ("A", "B"):
+                        grade = "C"; grade_color = "#f0883e"
+
+                result["rec_contract"] = recommend_contract(symbol, direction, price, orb_range)
+
+                if grade == "D":
+                    result["status"]    = "low grade"
+                    result["score"]     = round(score, 2)
+                    result["grade"]     = grade
+                    result["grade_pts"] = grade_pts
+                    results.append(result)
+                    log("{}: ALT {} SKIP D grade {}pts".format(
+                        symbol, alt_signal["signal_type"], grade_pts))
+                    continue
+
+                premium, strike, is_live, dte_label = get_liquid_option(symbol, direction, price)
+
+                if premium and is_live:
+                    contracts, stp, tgt = calculate_contracts(premium, score)
+                    result["premium"]   = round(premium, 2)
+                    result["strike"]    = strike
+                    result["contracts"] = contracts
+                    result["stop"]      = stp
+                    result["target"]    = tgt
+                    result["dte_label"] = dte_label or "0DTE"
+                    result["status"]    = "SIGNAL"
+                else:
+                    result["status"] = "SIGNAL (no options)"
+
+                result["score"]       = round(score, 2)
+                result["grade"]       = grade
+                result["grade_pts"]   = grade_pts
+                result["grade_color"] = grade_color
+                results.append(result)
+                log("{} {} | {} {} {}pts | alt_strategy".format(
+                    symbol, direction, alt_signal["signal_type"], grade, grade_pts))
+                continue
+
+            # No alternative signal either — fall through to WATCHING
             result["direction"] = "CALL" if price > vwap else "PUT"
             result["vs_vwap"]   = "{:+.3f}%".format(vs_vwap)
             result["vs_orb"]    = "{:.2f}% from ORB {}".format(
@@ -1849,7 +2274,7 @@ def run_signal_scan():
         if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
             db_log_signal(sig)
             msg = (
-                "INSTITUTIONAL BREAKOUT\n\n"
+                "{sig_type} SIGNAL\n\n"
                 "Symbol: {}\nDirection: {}\nScore: {}\n\n"
                 "Underlying: ${}\nStrike: {}\nPremium: ${}\n\n"
                 "Contracts: {}\nStop: ${}\nTarget: ${}\n\n"
@@ -1858,7 +2283,8 @@ def run_signal_scan():
                 sig["symbol"], sig["direction"], sig["score"],
                 sig["price"], sig["strike"], sig["premium"],
                 sig["contracts"], sig["stop"], sig["target"],
-                sig.get("vol_mult", 1.0)
+                sig.get("vol_mult", 1.0),
+                sig_type=sig.get("signal_type", "ORB")
             )
             send_telegram(msg)
             break  # Only alert best signal
@@ -4005,6 +4431,22 @@ def render_dashboard(toast=""):
         tv_col = "#3fb950" if tv_ratio >= 2.0 else "#e3b341" if tv_ratio >= 1.3 else "#8b949e" if tv_ratio >= 0.8 else "#f85149"
 
         # Badges
+        sig_type_0dte = s.get("signal_type", "ORB")
+        sig_type_colors = {
+            "ORB":           ("#21262d", "#58a6ff"),
+            "VWAP_TREND":    ("#0b3d1a", "#3fb950"),
+            "VWAP_MEAN_REV": ("#3d1a00", "#e3b341"),
+            "IB_EXTENSION":  ("#1a1a3d", "#a371f7"),
+            "VWAP_RECLAIM":  ("#1a2d3d", "#79c0ff"),
+        }
+        stc_bg, stc_fg = sig_type_colors.get(sig_type_0dte, ("#21262d", "#8b949e"))
+        sig_type_badge = ("<span style='background:{bg};color:{fg};padding:2px 7px;"
+                          "border-radius:3px;font-size:9px;font-weight:700;"
+                          "margin-left:6px;letter-spacing:.3px;border:1px solid {fg}'>"
+                          "{lbl}</span>".format(
+                              bg=stc_bg, fg=stc_fg,
+                              lbl=sig_type_0dte.replace("_", " ")))
+
         primary_badge = ("<span style='background:#1f6feb;color:#fff;padding:2px 8px;"
                          "border-radius:3px;font-size:10px;font-weight:700;"
                          "margin-left:6px;letter-spacing:.3px'>PRIMARY</span>" if is_primary else "")
@@ -4069,7 +4511,7 @@ def render_dashboard(toast=""):
     <div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap'>
       <span style='font-size:18px;font-weight:800;letter-spacing:.5px'>{sym}</span>
       <span style='color:{dc};font-size:14px;font-weight:700'>{arr} {d}</span>
-      {primary_badge}{late_badge}{ct_badge}
+      {sig_type_badge}{primary_badge}{late_badge}{ct_badge}
     </div>
     <div style='display:flex;align-items:center;gap:14px'>
       <div style='text-align:right'>
@@ -4175,6 +4617,7 @@ def render_dashboard(toast=""):
             dbg=dir_bg, dborder=dir_border,
             grade=grade, gpts=grade_pts, gc=grade_color,
             primary_badge=primary_badge, late_badge=late_badge, ct_badge=ct_badge,
+            sig_type_badge=sig_type_badge,
             rank=rank_score,
             price=price,
             vwap=s.get("vwap","-"),
@@ -5314,7 +5757,11 @@ When discussing options: always mention the DTE, the delta, and whether the setu
 
 You have full knowledge of this scanner's methodology:
 - 0DTE signals use ORB breakouts, VWAP, confluence grading (A/B/C), volume, gap alignment, RS vs SPY, 1hr trend
-- Swing signals use Post-Earnings Continuation, Gap & Go, and Institutional Accumulation/Distribution
+- VWAP Trend signals fire when price stays consistently on one side of VWAP with trending structure (based on Zarattini & Aziz SSRN 2023 research)
+- VWAP Mean Reversion signals fire when price touches VWAP deviation bands and reverses back toward the mean (best on range-bound days)
+- IB Extension signals fire after 10:30 AM when price moves beyond the Initial Balance range (Market Profile methodology)
+- VWAP Reclaim signals detect when price reclaims VWAP after being on the wrong side, with volume confirmation
+- Swing signals use O'Neil Pivot Breakout, Wyckoff Spring, 52-Week Breakout, and Post-Earnings Continuation
 - Fibonacci extensions (1.272 / 1.618 / 2.0) are price targets; 0.618 retrace is the stop level
 - Swing options target delta ~0.55, 2-week expiry; 0DTE options target delta ~0.40""".format(ctx=ctx)
 
