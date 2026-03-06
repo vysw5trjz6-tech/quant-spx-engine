@@ -21,6 +21,24 @@ ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
 SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN"]
 
+# Broader universe for swing scanner - liquid, optionable stocks
+SWING_UNIVERSE = [
+    # Mega-cap tech
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD", "AVGO", "CRM",
+    # Semis & hardware
+    "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "MRVL", "ON", "SMCI",
+    # Finance
+    "JPM", "GS", "MS", "BAC", "C", "V", "MA", "AXP", "BX", "KKR",
+    # Healthcare & biotech
+    "LLY", "UNH", "ABBV", "MRK", "PFE", "JNJ", "GILD", "REGN", "BIIB", "MRNA",
+    # Energy & industrials
+    "XOM", "CVX", "OXY", "SLB", "CAT", "DE", "HON", "RTX", "LMT", "GE",
+    # Consumer & retail
+    "COST", "WMT", "HD", "NKE", "SBUX", "MCD", "TGT", "LULU", "DECK", "RH",
+    # ETFs with strong options
+    "SPY", "QQQ", "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
+]
+
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 
@@ -42,6 +60,10 @@ debug_log    = []
 all_signals  = []
 next_scan_at = 0
 bot_enabled  = True
+
+swing_signals    = []
+next_swing_scan  = 0
+
 
 # =============================================
 # SCANNER CONFIG  (AI-tunable parameters)
@@ -231,6 +253,30 @@ def init_db():
             spec          TEXT,
             status        TEXT DEFAULT 'pending',
             dismissed_at  TEXT
+        )
+    """)
+
+    # Swing trade signal cache (for history across scans)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS swing_signals (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            TEXT,
+            symbol        TEXT,
+            signal_type   TEXT,
+            direction     TEXT,
+            price         REAL,
+            score         REAL,
+            prob_pct      INTEGER,
+            fib_support   TEXT,
+            t1            REAL,
+            t2            REAL,
+            t3            REAL,
+            stop          REAL,
+            option_expiry TEXT,
+            option_strike REAL,
+            option_prem   REAL,
+            dte           INTEGER,
+            notes         TEXT
         )
     """)
 
@@ -1425,6 +1471,74 @@ def get_liquid_option(symbol, direction, underlying_price=None):
 
     log("  No options found for {} across all expiries".format(symbol))
     return None, None, False, None
+
+
+# =============================================
+# SWING ENGINE -- DATA FETCHERS
+# =============================================
+
+def get_daily_extended(symbol, limit=90):
+    try:
+        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                         params={"timeframe": "1Day", "limit": limit}, timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json().get("bars", [])
+    except:
+        return None
+
+
+def get_weekly_bars(symbol, limit=52):
+    try:
+        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                         params={"timeframe": "1Week", "limit": limit}, timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json().get("bars", [])
+    except:
+        return None
+
+
+# =============================================
+# SWING ENGINE -- FIBONACCI
+# =============================================
+
+FIBO_RETRACE = [0.236, 0.382, 0.500, 0.618, 0.786]
+FIBO_EXTEND  = [1.000, 1.272, 1.618, 2.000, 2.618]
+
+
+def fibonacci_levels(swing_low, swing_high, direction="CALL"):
+    """
+    Retracements = pullback support (CALL) or bounce resistance (PUT).
+    Extensions   = upside targets (CALL) or downside targets (PUT).
+    """
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return {}, {}
+    retrace = {}
+    extend  = {}
+    if direction == "CALL":
+        for r in FIBO_RETRACE:
+            retrace[r] = round(swing_high - rng * r, 2)
+        for e in FIBO_EXTEND:
+            extend[e]  = round(swing_low  + rng * e, 2)
+    else:
+        for r in FIBO_RETRACE:
+            retrace[r] = round(swing_low  + rng * r, 2)
+        for e in FIBO_EXTEND:
+            extend[e]  = round(swing_high - rng * e, 2)
+    return retrace, extend
+
+
+def nearest_fib(price, levels):
+    if not levels:
+        return None, None, None
+    best_r = min(levels, key=lambda r: abs(levels[r] - price))
+    best_v = levels[best_r]
+    pct    = round(abs(price - best_v) / price * 100, 2)
+    return best_v, best_r, pct
+
+
 # =============================================
 # RISK ENGINE
 # =============================================
@@ -2172,13 +2286,831 @@ If the data does not yet support any specific proposal, return: {{"proposals": [
         log("AI proposals: Exception: {}".format(e))
 
 
+# =============================================
+# SWING TRADE SCANNER
+# =============================================
+
+def get_daily_bars(symbol, limit=60):
+    """Fetch daily OHLCV bars from Alpaca."""
+    try:
+        r = requests.get(
+            DATA_URL.format(symbol),
+            headers=HEADERS,
+            params={"timeframe": "1Day", "limit": limit, "adjustment": "split"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return []
+        return r.json().get("bars", [])
+    except Exception as e:
+        log("daily_bars {}: {}".format(symbol, e))
+        return []
+
+
+def swing_fibonacci(bars, direction="CALL"):
+    """
+    Find the dominant swing low and swing high in last 20 daily bars.
+    Returns dict with retracement supports and extension targets.
+    direction: CALL = bullish (extensions above price), PUT = bearish
+    """
+    if len(bars) < 10:
+        return None
+
+    recent = bars[-20:]
+    highs  = [b["h"] for b in recent]
+    lows   = [b["l"] for b in recent]
+
+    swing_high = max(highs)
+    swing_low  = min(lows)
+    rng        = swing_high - swing_low
+
+    if rng <= 0:
+        return None
+
+    if direction == "CALL":
+        # Bullish: measure from swing low up
+        base   = swing_low
+        top    = swing_high
+        retrace_levels = {
+            "23.6": round(top - rng * 0.236, 2),
+            "38.2": round(top - rng * 0.382, 2),
+            "50.0": round(top - rng * 0.500, 2),
+            "61.8": round(top - rng * 0.618, 2),
+            "78.6": round(top - rng * 0.786, 2),
+        }
+        ext_levels = {
+            "127.2": round(base + rng * 1.272, 2),
+            "161.8": round(base + rng * 1.618, 2),
+            "200.0": round(base + rng * 2.000, 2),
+            "261.8": round(base + rng * 2.618, 2),
+        }
+    else:
+        # Bearish: measure from swing high down
+        base   = swing_high
+        top    = swing_low
+        retrace_levels = {
+            "23.6": round(top + rng * 0.236, 2),
+            "38.2": round(top + rng * 0.382, 2),
+            "50.0": round(top + rng * 0.500, 2),
+            "61.8": round(top + rng * 0.618, 2),
+            "78.6": round(top + rng * 0.786, 2),
+        }
+        ext_levels = {
+            "127.2": round(base - rng * 1.272, 2),
+            "161.8": round(base - rng * 1.618, 2),
+            "200.0": round(base - rng * 2.000, 2),
+            "261.8": round(base - rng * 2.618, 2),
+        }
+
+    return {
+        "swing_low":  swing_low,
+        "swing_high": swing_high,
+        "range":      round(rng, 2),
+        "retracements": retrace_levels,
+        "extensions":   ext_levels,
+    }
+
+
+def _avg_volume(bars, lookback=20):
+    if not bars or len(bars) < 3:
+        return 1
+    vols = [b["v"] for b in bars[-lookback:] if b.get("v", 0) > 0]
+    return statistics.mean(vols) if vols else 1
+
+
+def detect_earnings_continuation(symbol, bars):
+    """
+    Proxy for post-earnings continuation: look for a single day with
+    gap >3% AND volume >2.5x average in last 15 days -- that's an earnings-like event.
+    Score higher if price is still above that gap day's close and holding.
+
+    Returns (score, notes) or None
+    """
+    if len(bars) < 20:
+        return None
+
+    avg_vol    = _avg_volume(bars, 20)
+    recent     = bars[-15:]
+    event_idx  = None
+    event_bar  = None
+
+    for i in range(1, len(recent)):
+        prev_close = recent[i-1]["c"]
+        this_open  = recent[i]["o"]
+        gap_pct    = (this_open - prev_close) / prev_close * 100
+        vol_ratio  = recent[i]["v"] / avg_vol if avg_vol else 0
+
+        if abs(gap_pct) >= 3.0 and vol_ratio >= 2.5:
+            # Prefer the most recent qualifying event
+            event_idx = i
+            event_bar = recent[i]
+
+    if not event_bar:
+        return None
+
+    event_close  = event_bar["c"]
+    current_close = bars[-1]["c"]
+    gap_pct_val   = (event_bar["o"] - bars[recent.index(event_bar) - 1 + (len(bars)-15)]["c"]) / \
+                     bars[recent.index(event_bar) - 1 + (len(bars)-15)]["c"] * 100
+    direction     = "CALL" if event_bar["o"] > bars[-16]["c"] else "PUT"
+
+    # Is price still holding above (CALL) or below (PUT) the event close?
+    if direction == "CALL":
+        holding = current_close >= event_close * 0.97
+    else:
+        holding = current_close <= event_close * 1.03
+
+    if not holding:
+        return None
+
+    # Check volume trend: recent bars still above average
+    last3_vol = [b["v"] for b in bars[-3:]]
+    vol_elevated = statistics.mean(last3_vol) > avg_vol * 0.9
+
+    days_ago = len(bars) - 1 - (len(bars) - 15 + event_idx)
+    recency_bonus = max(0, 15 - days_ago)  # fresher = higher bonus
+
+    score = 40 + recency_bonus * 2 + (10 if vol_elevated else 0)
+    score = min(score, 75)
+
+    notes = "Earnings-like gap {:.1f}% ({} days ago), vol {:.1f}x avg, price holding".format(
+        abs(gap_pct_val), days_ago,
+        event_bar["v"] / avg_vol if avg_vol else 0)
+
+    return {
+        "type":       "POST_EARNINGS",
+        "direction":  direction,
+        "score":      score,
+        "event_close": event_close,
+        "notes":      notes,
+        "days_ago":   days_ago,
+    }
+
+
+def detect_gap_and_go(symbol, bars):
+    """
+    Gap-and-go: today or yesterday gapped significantly and is following through.
+    Signs: gap >1.5%, volume >2x avg, price closed near HOD (>60% of range from low).
+    """
+    if len(bars) < 10:
+        return None
+
+    avg_vol = _avg_volume(bars, 20)
+
+    for lookback in [1, 2]:  # check today and yesterday
+        if len(bars) < lookback + 2:
+            continue
+        bar      = bars[-lookback]
+        prev_bar = bars[-lookback - 1]
+
+        gap_pct  = (bar["o"] - prev_bar["c"]) / prev_bar["c"] * 100
+        vol_ratio = bar["v"] / avg_vol if avg_vol else 0
+
+        if abs(gap_pct) < 1.5 or vol_ratio < 2.0:
+            continue
+
+        direction = "CALL" if gap_pct > 0 else "PUT"
+        bar_range = bar["h"] - bar["l"]
+
+        # Measure follow-through: close position in bar's range
+        if bar_range > 0:
+            if direction == "CALL":
+                follow_pct = (bar["c"] - bar["l"]) / bar_range
+            else:
+                follow_pct = (bar["h"] - bar["c"]) / bar_range
+        else:
+            follow_pct = 0.5
+
+        if follow_pct < 0.45:  # closed in lower/upper half -- no follow-through
+            continue
+
+        # If gap was 2 days ago, verify yesterday continued in same direction
+        if lookback == 2:
+            yesterday = bars[-1]
+            if direction == "CALL" and yesterday["c"] < bar["c"] * 0.98:
+                continue
+            if direction == "PUT" and yesterday["c"] > bar["c"] * 1.02:
+                continue
+
+        score = 35 + min(25, vol_ratio * 5) + int(follow_pct * 20)
+        score = min(score, 80)
+
+        return {
+            "type":      "GAP_AND_GO",
+            "direction": direction,
+            "score":     score,
+            "gap_pct":   round(gap_pct, 2),
+            "vol_ratio": round(vol_ratio, 2),
+            "notes":     "Gap {}{:.1f}% on {:.1f}x vol, {:.0f}% follow-through".format(
+                "+" if gap_pct > 0 else "", gap_pct, vol_ratio, follow_pct * 100),
+        }
+
+    return None
+
+
+def detect_institutional_accumulation(symbol, bars):
+    """
+    Institutional accumulation: multi-day pattern of higher lows + higher highs
+    on expanding or elevated volume -- suggests large buyer(s) building position.
+    Looks for: 5+ day uptrend, pullbacks on declining volume, recent breakout.
+    """
+    if len(bars) < 25:
+        return None
+
+    avg_vol = _avg_volume(bars, 20)
+    recent  = bars[-10:]
+    closes  = [b["c"] for b in recent]
+    vols    = [b["v"] for b in recent]
+
+    # Count higher closes in last 7 days
+    higher_closes = sum(1 for i in range(1, 7)
+                        if closes[-(i)] > closes[-(i+1)])
+
+    if higher_closes < 4:
+        return None
+
+    # Check: recent pullback days (down closes) had lower volume than up days
+    up_vols   = [vols[i] for i in range(1, len(recent))
+                 if closes[i] >= closes[i-1]]
+    down_vols = [vols[i] for i in range(1, len(recent))
+                 if closes[i] < closes[i-1]]
+
+    avg_up_vol   = statistics.mean(up_vols)   if up_vols   else 0
+    avg_down_vol = statistics.mean(down_vols) if down_vols else 1
+    vol_confirm  = avg_up_vol > avg_down_vol
+
+    # Is current price near a 20-day high?
+    highs_20     = [b["h"] for b in bars[-20:]]
+    near_breakout = bars[-1]["c"] >= max(highs_20) * 0.97
+
+    # Trend slope: simple linear regression on closes
+    n       = len(closes)
+    mean_x  = (n - 1) / 2
+    mean_y  = statistics.mean(closes)
+    slope   = sum((i - mean_x) * (closes[i] - mean_y) for i in range(n)) / \
+              max(1, sum((i - mean_x) ** 2 for i in range(n)))
+    slope_pct = slope / mean_y * 100 if mean_y else 0
+
+    if slope_pct < 0.1:  # not actually trending up
+        return None
+
+    score = 30
+    score += higher_closes * 5
+    if vol_confirm:   score += 15
+    if near_breakout: score += 20
+    score = min(score, 82)
+
+    notes = "{}/{} up days, vol confirms: {}, near 20d high: {}".format(
+        higher_closes, 7,
+        "yes" if vol_confirm else "no",
+        "yes" if near_breakout else "no")
+
+    return {
+        "type":       "INST_ACCUM",
+        "direction":  "CALL",
+        "score":      score,
+        "notes":      notes,
+        "slope_pct":  round(slope_pct, 3),
+    }
+
+
+def _swing_option_expiries(min_dte=14, target_dte=35, max_dte=60):
+    """
+    Build a list of candidate expiry dates for swing options (weekly/monthly).
+    Prefers 21-45 DTE. Returns date strings sorted nearest first.
+    """
+    import datetime as _dt
+    et         = pytz.timezone("America/New_York")
+    today      = datetime.now(et).date()
+    candidates = []
+    d          = today + _dt.timedelta(days=min_dte)
+    end        = today + _dt.timedelta(days=max_dte)
+    while d <= end:
+        if d.weekday() == 4:  # Fridays are standard expiry
+            dte = (d - today).days
+            candidates.append((d.strftime("%Y-%m-%d"), dte))
+        d += _dt.timedelta(days=1)
+    # Sort by closeness to target_dte
+    candidates.sort(key=lambda x: abs(x[1] - target_dte))
+    return candidates
+
+
+def get_swing_option(symbol, direction, price, target_delta=0.40):
+    """
+    Find a swing-appropriate option: 21-45 DTE, near ATM.
+    Returns (premium, strike, expiry_str, dte, delta) or Nones.
+    """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return None, None, None, None, None
+
+    option_type = "call" if direction == "CALL" else "put"
+    lo = round(price * 0.93, 2)
+    hi = round(price * 1.07, 2)
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
+
+    expiries = _swing_option_expiries(min_dte=14, target_dte=35, max_dte=60)
+
+    for expiry_str, dte in expiries:
+        params = {
+            "feed":              "indicative",
+            "expiration_date":   expiry_str,
+            "type":              option_type,
+            "limit":             50,
+            "strike_price_gte":  lo,
+            "strike_price_lte":  hi,
+        }
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code == 422:
+                continue
+            if r.status_code != 200:
+                log("Swing option {} {}: HTTP {}".format(symbol, expiry_str, r.status_code))
+                return None, None, None, None, None
+
+            snaps = r.json().get("snapshots", {})
+            candidates = []
+            for csym, snap in snaps.items():
+                try:
+                    strike = int(csym[-8:]) / 1000.0
+                except Exception:
+                    continue
+                quote = snap.get("latestQuote") or {}
+                bid   = float(quote.get("bp") or 0)
+                ask   = float(quote.get("ap") or 0)
+                if bid > 0 and ask > 0:
+                    mid = round((bid + ask) / 2, 2)
+                elif ask > 0:
+                    mid = round(ask, 2)
+                else:
+                    continue
+                if not (0.10 <= mid <= 100.0):
+                    continue
+                greeks = snap.get("greeks") or {}
+                delta  = abs(float(greeks.get("delta") or 0))
+                candidates.append({
+                    "strike": strike, "price": mid,
+                    "bid": bid, "ask": ask, "delta": delta,
+                    "expiry": expiry_str, "dte": dte,
+                })
+
+            if not candidates:
+                continue
+
+            if any(c["delta"] > 0 for c in candidates):
+                candidates.sort(key=lambda x: abs(x["delta"] - target_delta))
+            else:
+                candidates.sort(key=lambda x: abs(x["strike"] - price))
+
+            best = candidates[0]
+            log("Swing opt {}: {} strike={} mid={} dte={}".format(
+                symbol, expiry_str, best["strike"], best["price"], dte))
+            return best["price"], best["strike"], expiry_str, dte, round(best["delta"], 3)
+
+        except Exception as e:
+            log("Swing option exception {} {}: {}".format(symbol, expiry_str, e))
+            return None, None, None, None, None
+
+    return None, None, None, None, None
+
+
+def swing_probability(signals, fib, direction, bars):
+    """
+    Combine signal scores + Fibonacci confluence + trend quality
+    into a final probability estimate (0-100).
+    """
+    if not signals:
+        return 0
+
+    base_score = max(s["score"] for s in signals)
+    multi_bonus = (len(signals) - 1) * 8
+
+    # Fib confluence bonus: is current price near a key fib level?
+    fib_bonus = 0
+    if fib:
+        price = bars[-1]["c"]
+        if direction == "CALL":
+            # Near a retracement support = high conviction
+            for lvl_name, lvl_price in fib["retracements"].items():
+                if abs(price - lvl_price) / price < 0.015:
+                    fib_bonus = 12
+                    break
+        else:
+            for lvl_name, lvl_price in fib["retracements"].items():
+                if abs(price - lvl_price) / price < 0.015:
+                    fib_bonus = 12
+                    break
+
+    # Volume trend over last 5 days
+    avg_vol   = _avg_volume(bars, 20)
+    recent_vol = statistics.mean(b["v"] for b in bars[-5:])
+    vol_bonus  = 8 if recent_vol > avg_vol * 1.1 else 0
+
+    total = min(95, base_score + multi_bonus + fib_bonus + vol_bonus)
+    return int(total)
+
+
+def swing_price_targets(price, direction, fib):
+    """
+    Given current price and fib levels, return T1/T2/T3 and a stop.
+    Uses Fibonacci extensions as targets.
+    """
+    if not fib:
+        # Simple ATR-based fallback
+        if direction == "CALL":
+            return (round(price * 1.03, 2),
+                    round(price * 1.06, 2),
+                    round(price * 1.10, 2),
+                    round(price * 0.96, 2))
+        else:
+            return (round(price * 0.97, 2),
+                    round(price * 0.94, 2),
+                    round(price * 0.90, 2),
+                    round(price * 1.04, 2))
+
+    exts = fib["extensions"]
+    rets = fib["retracements"]
+
+    if direction == "CALL":
+        ext_vals = sorted(exts.values())
+        targets  = [v for v in ext_vals if v > price][:3]
+        while len(targets) < 3:
+            targets.append(round(targets[-1] * 1.03 if targets else price * 1.03, 2))
+        # Stop: just below nearest retracement below price
+        supports = sorted([v for v in rets.values() if v < price], reverse=True)
+        stop     = round(supports[0] * 0.993, 2) if supports else round(price * 0.96, 2)
+    else:
+        ext_vals = sorted(exts.values(), reverse=True)
+        targets  = [v for v in ext_vals if v < price][:3]
+        while len(targets) < 3:
+            targets.append(round(targets[-1] * 0.97 if targets else price * 0.97, 2))
+        resistances = sorted([v for v in rets.values() if v > price])
+        stop        = round(resistances[0] * 1.007, 2) if resistances else round(price * 1.04, 2)
+
+    return targets[0], targets[1], targets[2], stop
+
+
+def scan_swing_symbol(symbol):
+    """
+    Run all swing detectors on a single symbol.
+    Returns a signal dict or None.
+    """
+    bars = get_daily_bars(symbol, limit=60)
+    if not bars or len(bars) < 20:
+        return None
+
+    price = bars[-1]["c"]
+
+    # Run all detectors
+    detected = []
+    ec = detect_earnings_continuation(symbol, bars)
+    gg = detect_gap_and_go(symbol, bars)
+    ia = detect_institutional_accumulation(symbol, bars)
+
+    if ec: detected.append(ec)
+    if gg: detected.append(gg)
+    if ia: detected.append(ia)
+
+    if not detected:
+        return None
+
+    # Use the highest-score signal's direction as primary
+    primary    = max(detected, key=lambda x: x["score"])
+    direction  = primary["direction"]
+    sig_types  = [s["type"] for s in detected]
+
+    # Fibonacci analysis
+    fib     = swing_fibonacci(bars, direction)
+    prob    = swing_probability(detected, fib, direction, bars)
+    t1, t2, t3, stop = swing_price_targets(price, direction, fib)
+
+    # Fibonacci support summary string
+    fib_support = ""
+    if fib:
+        rets = fib["retracements"]
+        if direction == "CALL":
+            levels = sorted([v for v in rets.values() if v < price], reverse=True)[:2]
+        else:
+            levels = sorted([v for v in rets.values() if v > price])[:2]
+        fib_support = " / ".join("${:.2f}".format(v) for v in levels)
+
+    # Get swing option
+    prem, strike, expiry, dte, delta = get_swing_option(symbol, direction, price)
+
+    notes = " | ".join(s["notes"] for s in detected)
+
+    return {
+        "symbol":       symbol,
+        "price":        price,
+        "direction":    direction,
+        "signal_types": sig_types,
+        "signals":      detected,
+        "prob":         prob,
+        "t1":           t1,
+        "t2":           t2,
+        "t3":           t3,
+        "stop":         stop,
+        "fib_support":  fib_support,
+        "fib":          fib,
+        "option_prem":  prem,
+        "option_strike": strike,
+        "option_expiry": expiry,
+        "option_dte":   dte,
+        "option_delta": delta,
+        "notes":        notes,
+        "ts":           datetime.now(pytz.utc).isoformat(),
+    }
+
+
+def run_swing_scan():
+    """
+    Scan the full SWING_UNIVERSE, rank by probability, update global state.
+    Runs in its own thread -- does NOT block the 0DTE scanner.
+    """
+    global swing_signals, next_swing_scan
+    log("Swing scan started ({} symbols)".format(len(SWING_UNIVERSE)))
+    results = []
+
+    for symbol in SWING_UNIVERSE:
+        try:
+            sig = scan_swing_symbol(symbol)
+            if sig:
+                results.append(sig)
+                log("  Swing {}: {} {} prob={}% ({})".format(
+                    symbol, sig["direction"],
+                    "+".join(sig["signal_types"]),
+                    sig["prob"], sig["notes"][:60]))
+        except Exception as e:
+            log("  Swing {} error: {}".format(symbol, e))
+
+    # Sort by probability descending
+    results.sort(key=lambda x: x["prob"], reverse=True)
+
+    with state_lock:
+        swing_signals    = results
+        next_swing_scan  = time.time() + 900  # 15 min
+
+    log("Swing scan done: {} signals found".format(len(results)))
+
+
+def render_swing_dashboard():
+    """Render the swing trade scanner page."""
+    with state_lock:
+        sigs = list(swing_signals)
+        secs = max(0, int(next_swing_scan - time.time()))
+
+    type_labels = {
+        "POST_EARNINGS": ("POST-EARNINGS", "#1f6feb", "#58a6ff"),
+        "GAP_AND_GO":    ("GAP & GO",      "#1a472a", "#3fb950"),
+        "INST_ACCUM":    ("INST ACCUM",    "#3d1a00", "#e3b341"),
+    }
+
+    cards_html = ""
+    for s in sigs:
+        prob      = s["prob"]
+        direction = s["direction"]
+        price     = s["price"]
+        symbol    = s["symbol"]
+
+        # Probability color
+        if prob >= 70:
+            prob_color = "#3fb950"
+        elif prob >= 55:
+            prob_color = "#e3b341"
+        else:
+            prob_color = "#f85149"
+
+        dir_color = "#3fb950" if direction == "CALL" else "#f85149"
+        dir_arrow = "&#9650;" if direction == "CALL" else "&#9660;"
+
+        # Signal type badges
+        badges = ""
+        for stype in s["signal_types"]:
+            lbl, bg, fg = type_labels.get(stype, (stype, "#21262d", "#8b949e"))
+            badges += ("<span style='background:{};color:{};font-size:9px;font-weight:700;"
+                       "text-transform:uppercase;letter-spacing:.6px;padding:2px 7px;"
+                       "border-radius:3px;margin-right:4px'>{}</span>").format(bg, fg, lbl)
+
+        # Fibonacci info
+        fib      = s.get("fib") or {}
+        fib_html = ""
+        if fib:
+            if direction == "CALL":
+                ext_items = sorted(fib["extensions"].items(), key=lambda x: x[1])[:3]
+            else:
+                ext_items = sorted(fib["extensions"].items(), key=lambda x: x[1], reverse=True)[:3]
+            fib_lines = "".join(
+                "<div style='display:flex;justify-content:space-between'>"
+                "<span style='color:#8b949e'>{} ext</span>"
+                "<span style='color:#e6edf3;font-family:monospace'>${:.2f}</span></div>".format(
+                    k, v) for k, v in ext_items)
+            fib_html = """
+<div style='background:#0d1117;border-radius:6px;padding:8px 10px;margin-bottom:8px'>
+  <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
+              letter-spacing:.6px;margin-bottom:5px'>Fibonacci Extensions</div>
+  <div style='font-size:11px'>{}
+  </div>
+  <div style='font-size:10px;color:#8b949e;margin-top:4px'>
+    Swing: ${:.2f} &ndash; ${:.2f} &nbsp; Range: ${:.2f}
+  </div>
+</div>""".format(fib_lines,
+                 fib.get("swing_low", 0),
+                 fib.get("swing_high", 0),
+                 fib.get("range", 0))
+
+        # Option section
+        prem  = s.get("option_prem")
+        opt_html = ""
+        if prem:
+            exp_short = (s.get("option_expiry") or "")[-5:].replace("-", "/")
+            opt_html = """
+<div style='background:#0d1117;border-radius:6px;padding:8px 10px;
+            border:1px solid #238636;margin-bottom:8px'>
+  <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
+              letter-spacing:.6px;margin-bottom:4px'>Recommended Option</div>
+  <div style='display:flex;justify-content:space-between;align-items:center'>
+    <div>
+      <span style='font-size:16px;font-weight:700;font-family:monospace'>${:.2f}</span>
+      <span style='font-size:10px;color:#8b949e;margin-left:6px'>premium</span>
+    </div>
+    <div style='text-align:right;font-size:11px'>
+      <div style='color:#e6edf3'>${} {} &nbsp; <span style='color:#e3b341'>{} DTE</span></div>
+      <div style='color:#8b949e'>exp {}</div>
+    </div>
+  </div>
+  <div style='font-size:10px;color:#8b949e;margin-top:3px'>
+    Delta ~{:.2f} &nbsp;|&nbsp; Stop if premium &lt; ${:.2f} &nbsp;|&nbsp; T1 target ${:.2f}
+  </div>
+</div>""".format(
+                prem,
+                s.get("option_strike","?"),
+                direction,
+                s.get("option_dte","?"),
+                exp_short,
+                s.get("option_delta") or 0,
+                round(prem * 0.50, 2),
+                s.get("t1", 0)
+            )
+        else:
+            opt_html = ("<div style='background:#0d1117;border-radius:6px;padding:8px 10px;"
+                        "border:1px solid #30363d;font-size:11px;color:#8b949e;"
+                        "margin-bottom:8px'>No options data -- check broker for near-term expiry</div>")
+
+        cards_html += """
+<div style='background:#161b22;border:1px solid #30363d;border-radius:10px;
+            margin-bottom:12px;padding:14px'>
+  <!-- Header -->
+  <div style='display:flex;justify-content:space-between;align-items:flex-start;
+              margin-bottom:10px'>
+    <div>
+      <span style='font-size:20px;font-weight:800;letter-spacing:-.3px'>{sym}</span>
+      <span style='color:{dc};font-size:13px;font-weight:700;margin-left:8px'>
+        {darrow} {dir}
+      </span>
+      <div style='margin-top:5px'>{badges}</div>
+    </div>
+    <div style='text-align:right'>
+      <div style='font-size:24px;font-weight:800;color:{pc}'>{prob}%</div>
+      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px'>
+        probability
+      </div>
+    </div>
+  </div>
+
+  <!-- Price + Targets -->
+  <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px'>
+    <div style='background:#0d1117;border-radius:6px;padding:8px'>
+      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
+                  letter-spacing:.5px;margin-bottom:3px'>Price</div>
+      <div style='font-size:15px;font-weight:700;font-family:monospace'>${price}</div>
+      <div style='font-size:10px;color:#8b949e;margin-top:2px'>
+        Stop ${stop}
+      </div>
+    </div>
+    <div style='background:#0d1117;border-radius:6px;padding:8px'>
+      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
+                  letter-spacing:.5px;margin-bottom:3px'>Fib Targets</div>
+      <div style='font-size:11px'>
+        <div><span style='color:#8b949e'>T1</span>
+             <span style='color:#58a6ff;font-family:monospace;margin-left:4px'>${t1}</span></div>
+        <div><span style='color:#8b949e'>T2</span>
+             <span style='color:#58a6ff;font-family:monospace;margin-left:4px'>${t2}</span></div>
+        <div><span style='color:#8b949e'>T3</span>
+             <span style='color:#58a6ff;font-family:monospace;margin-left:4px'>${t3}</span></div>
+      </div>
+    </div>
+    <div style='background:#0d1117;border-radius:6px;padding:8px'>
+      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
+                  letter-spacing:.5px;margin-bottom:3px'>Fib Support</div>
+      <div style='font-size:11px;color:#e3b341;font-family:monospace'>
+        {fib_sup}
+      </div>
+      <div style='font-size:9px;color:#8b949e;margin-top:4px'>
+        key retracement levels
+      </div>
+    </div>
+  </div>
+
+  {fib_html}
+  {opt_html}
+
+  <!-- Notes -->
+  <div style='font-size:10px;color:#8b949e;line-height:1.5;
+              border-top:1px solid #21262d;padding-top:8px'>
+    {notes}
+  </div>
+</div>""".format(
+            sym     = symbol,
+            dc      = dir_color,
+            darrow  = dir_arrow,
+            dir     = direction,
+            badges  = badges,
+            prob    = prob,
+            pc      = prob_color,
+            price   = price,
+            stop    = s.get("stop", "?"),
+            t1      = s.get("t1", "?"),
+            t2      = s.get("t2", "?"),
+            t3      = s.get("t3", "?"),
+            fib_sup = s.get("fib_support") or "calculating...",
+            fib_html= fib_html,
+            opt_html= opt_html,
+            notes   = s.get("notes", "")[:220],
+        )
+
+    if not cards_html:
+        cards_html = ("<div style='padding:40px;text-align:center;color:#8b949e;font-size:13px'>"
+                      "Swing scan running... check back in a moment.<br>"
+                      "<a href='/swing' style='color:#58a6ff;font-size:11px;margin-top:8px;"
+                      "display:block'>Refresh</a></div>")
+
+    next_str = "{}s".format(secs) if secs > 0 else "running now"
+
+    return """<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<meta http-equiv='refresh' content='120'>
+<title>Swing Scanner</title>
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-serif;
+     padding:0;margin:0;font-size:13px}}
+.topbar{{position:sticky;top:0;background:#161b22;border-bottom:1px solid #30363d;
+         padding:10px 14px;display:flex;justify-content:space-between;
+         align-items:center;z-index:100}}
+.nav-link{{color:#58a6ff;text-decoration:none;font-size:11px;font-weight:600;
+           padding:4px 10px;border-radius:5px;border:1px solid #30363d;margin-left:4px}}
+.nav-link.active{{background:#1f6feb;border-color:#1f6feb;color:#fff}}
+.content{{padding:12px 14px}}
+</style></head><body>
+<div class='topbar'>
+  <div style='font-size:14px;font-weight:800;color:#58a6ff;letter-spacing:-.3px'>
+    SWING ENGINE
+    <span style='font-size:10px;color:#8b949e;font-weight:400;margin-left:6px'>
+      {nsig} setups &nbsp;|&nbsp; next scan {next}
+    </span>
+  </div>
+  <div>
+    <a class='nav-link' href='/'>0DTE</a>
+    <a class='nav-link active' href='/swing'>Swing</a>
+    <a class='nav-link' href='/ai'>AI</a>
+    <a class='nav-link' href='/stats'>Stats</a>
+  </div>
+</div>
+
+<div class='content'>
+  <div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
+              letter-spacing:.8px;margin-bottom:10px;margin-top:4px'>
+    {nsig} ACTIVE SETUP{pl} &mdash; RANKED BY CONTINUATION PROBABILITY
+  </div>
+  {cards}
+</div>
+</body></html>""".format(
+        nsig  = len(sigs),
+        next  = next_str,
+        pl    = "S" if len(sigs) != 1 else "",
+        cards = cards_html,
+    )
+
+
+# =============================================
+# END SWING SCANNER
+# =============================================
+
 def background_scheduler():
     global _ai_last_run_date, _ai_last_trade_cnt
     log("Background scheduler started")
     time.sleep(10)
+    # Kick off first swing scan immediately in background (daily bars, non-blocking)
+    threading.Thread(target=run_swing_scan, daemon=True).start()
     while True:
         try:
             run_signal_scan()
+
+            # --- Swing scan (every 15 min) ---
+            if time.time() >= next_swing_scan:
+                threading.Thread(target=run_swing_scan, daemon=True).start()
 
             # --- AI improvement triggers ---
             et      = pytz.timezone("America/New_York")
@@ -2780,7 +3712,9 @@ def render_dashboard(toast=""):
     </span>
   </div>
   <div class="topbar-right">
+    <a class="nav-link" href="/swing">Swing</a>
     <a class="nav-link" href="/ai">AI</a>
+    <a class="nav-link" href="/swing">Swing</a>
     <a class="nav-link" href="/stats">Stats</a>
     <a class="nav-link" href="/alpaca-test">Alpaca</a>
     <a class="nav-link" href="/debug">Debug</a>
@@ -3375,6 +4309,23 @@ def ai_dismiss_proposal():
         except Exception as e:
             log("Dismiss proposal error: {}".format(e))
     return redirect("/ai")
+
+
+@app.route("/swing")
+def swing_page():
+    try:
+        return render_swing_dashboard()
+    except Exception as e:
+        import traceback
+        return ("<pre style='background:#0d1117;color:#f85149;padding:20px;"
+                "font-size:12px;white-space:pre-wrap'>" + traceback.format_exc() + "</pre>"), 500
+
+
+@app.route("/swing/scan")
+def swing_scan_now():
+    """Manually trigger a swing scan."""
+    threading.Thread(target=run_swing_scan, daemon=True).start()
+    return redirect("/swing")
 
 
 @app.route("/debug")
