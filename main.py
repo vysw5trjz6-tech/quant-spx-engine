@@ -52,8 +52,8 @@ DATA_URL  = "https://data.alpaca.markets/v2/stocks/{}/bars"
 QUOTE_URL = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
 CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
 
-ALERT_FILE     = "/tmp/last_alert.json"
-DB_FILE        = "/tmp/trades.db"
+ALERT_FILE     = os.getenv("DATA_DIR", "/tmp") + "/last_alert.json"
+DB_FILE        = os.getenv("DATA_DIR", "/tmp") + "/trades.db"
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
 state_lock   = threading.Lock()
@@ -2413,8 +2413,8 @@ def run_ai_improvement(trigger="scheduled"):
         return
 
     trades = db_get_all_closed_trades()
-    if len(trades) < 5:
-        log("AI: Only {} closed trades - need at least 5 to analyze".format(len(trades)))
+    if len(trades) < 3:
+        log("AI: Only {} closed trades - need at least 3 to analyze".format(len(trades)))
         return
 
     log("AI: Starting improvement run ({} trades, trigger={})".format(len(trades), trigger))
@@ -2584,7 +2584,7 @@ def _run_proposal_analysis(trades, stats):
     cannot handle -- new strategies, indicators, signal types.
     Saves proposals to DB and sends top one via Telegram.
     """
-    if not ANTHROPIC_KEY or len(trades) < 10:
+    if not ANTHROPIC_KEY or len(trades) < 5:
         return
 
     log("AI: Running structural proposal analysis...")
@@ -4234,11 +4234,11 @@ def background_scheduler():
                     daemon=True
                 ).start()
 
-            # 2. Intraday: run after every 5 new closed trades
+            # 2. Intraday: run after every 3 new closed trades
             all_closed = db_get_all_closed_trades()
             n_closed   = len(all_closed)
-            if (n_closed >= 5 and
-                    n_closed - _ai_last_trade_cnt >= 5):
+            if (n_closed >= 3 and
+                    n_closed - _ai_last_trade_cnt >= 3):
                 log("AI: Intraday trigger ({} new trades)".format(
                     n_closed - _ai_last_trade_cnt))
                 threading.Thread(
@@ -4727,6 +4727,29 @@ def render_dashboard(toast=""):
     ai_focus    = cfg_now.get("ai_focus", "")
     ai_updated  = cfg_now.get("updated_at", "default")
 
+    # Count all closed trades for AI readiness indicator
+    all_closed_trades = db_get_all_closed_trades()
+    n_closed_all      = len(all_closed_trades)
+    n_open_all        = len(db_get_open_trades())
+    ai_ready          = n_closed_all >= 3
+    ai_data_line = (
+        "<div style='font-size:11px;margin-top:6px;padding-top:6px;"
+        "border-top:1px solid #21262d'>"
+        "<span style='color:{dc}'>{icon}</span> "
+        "<span style='color:#8b949e'>AI Data:</span> "
+        "<span style='color:#e6edf3'>{nc} closed</span>"
+        "<span style='color:#8b949e'> / {no} open</span>"
+        " &mdash; {status}"
+        "</div>"
+    ).format(
+        dc="#3fb950" if ai_ready else "#e3b341",
+        icon="&#10003;" if ai_ready else "&#9888;",
+        nc=n_closed_all, no=n_open_all,
+        status=("<span style='color:#3fb950'>Learning active</span>" if ai_ready
+                else "<span style='color:#e3b341'>Need {} more closed trades"
+                     " (close open trades with WIN/LOSS buttons)</span>".format(3 - n_closed_all))
+    )
+
     if ai_ver > 0:
         ai_panel = """
 <div style='margin:10px 14px 0;background:#161b22;border:1px solid #1f6feb;
@@ -4748,7 +4771,9 @@ def render_dashboard(toast=""):
   <div style='font-size:12px;color:#e6edf3'>
     <span style='color:#8b949e'>Focus:</span> {focus}
   </div>
-</div>""".format(ver=ai_ver, upd=ai_updated, insight=ai_insight, focus=ai_focus)
+  {ai_data}
+</div>""".format(ver=ai_ver, upd=ai_updated, insight=ai_insight, focus=ai_focus,
+                  ai_data=ai_data_line)
     else:
         ai_panel = """
 <div style='margin:10px 14px 0;background:#161b22;border:1px solid #30363d;
@@ -4761,7 +4786,8 @@ def render_dashboard(toast=""):
     {insight} &nbsp;
     <a href='/ai' style='color:#58a6ff;text-decoration:none'>View AI panel &#8594;</a>
   </div>
-</div>""".format(insight=ai_insight)
+  {ai_data}
+</div>""".format(insight=ai_insight, ai_data=ai_data_line)
 
     html = """<!DOCTYPE html>
 <html lang="en"><head>
@@ -5789,6 +5815,58 @@ You have full knowledge of this scanner's methodology:
 
     except Exception as e:
         log("Chat error: {}".format(e))
+        return jsonify({"error": str(e)})
+
+
+@app.route("/db-status")
+def db_status():
+    """Debug endpoint: shows DB file path, trade counts, and AI state."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM trades WHERE outcome='OPEN'")
+        open_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM trades WHERE outcome='WIN'")
+        win_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM trades WHERE outcome='LOSS'")
+        loss_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM trades")
+        total_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM ai_analyses")
+        ai_runs = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM ai_config")
+        ai_configs = c.fetchone()[0]
+        # Last 5 trades
+        c.execute("SELECT id, symbol, direction, outcome, pnl, ts FROM trades ORDER BY id DESC LIMIT 5")
+        recent = [{"id": r[0], "symbol": r[1], "dir": r[2], "outcome": r[3],
+                   "pnl": r[4], "ts": r[5]} for r in c.fetchall()]
+        conn.close()
+
+        cfg = get_config()
+        return jsonify({
+            "db_file": DB_FILE,
+            "data_dir_env": os.getenv("DATA_DIR", "(not set, using /tmp)"),
+            "trades": {
+                "total": total_count,
+                "open": open_count,
+                "wins": win_count,
+                "losses": loss_count,
+                "closed_total": win_count + loss_count,
+                "ai_needs": "3 closed trades minimum",
+                "ai_ready": (win_count + loss_count) >= 3,
+            },
+            "ai_engine": {
+                "config_version": cfg.get("ai_version", 0),
+                "total_ai_runs": ai_runs,
+                "total_config_saves": ai_configs,
+                "last_updated_by": cfg.get("updated_by", "default"),
+                "last_updated_at": cfg.get("updated_at", "never"),
+                "insight": cfg.get("ai_insight", ""),
+                "focus": cfg.get("ai_focus", ""),
+            },
+            "recent_trades": recent,
+        })
+    except Exception as e:
         return jsonify({"error": str(e)})
 
 
