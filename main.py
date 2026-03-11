@@ -40,6 +40,9 @@ SWING_UNIVERSE = [
     "SPY", "QQQ", "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
 ]
 
+# Alias used by run_swing_scan
+SWING_SYMBOLS = SWING_UNIVERSE
+
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 
@@ -52,8 +55,10 @@ DATA_URL  = "https://data.alpaca.markets/v2/stocks/{}/bars"
 QUOTE_URL = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
 CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
 
-ALERT_FILE     = os.getenv("DATA_DIR", "/tmp") + "/last_alert.json"
-DB_FILE        = os.getenv("DATA_DIR", "/tmp") + "/trades.db"
+# Auto-detect persistent storage: Railway volume > DATA_DIR env > /tmp fallback
+_data_dir = os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "/tmp"
+ALERT_FILE     = _data_dir + "/last_alert.json"
+DB_FILE        = _data_dir + "/trades.db"
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
 state_lock   = threading.Lock()
@@ -64,6 +69,10 @@ bot_enabled  = True
 
 swing_signals    = []
 next_swing_scan  = 0
+all_swing_signals  = []
+swing_next_scan_at = 0
+swing_lock         = threading.Lock()
+SWING_SCAN_INTERVAL = 900   # 15 min between swing scans
 
 
 # =============================================
@@ -5541,8 +5550,8 @@ def _build_scanner_context():
         open_lines.append(
             "  #{id} {sym} {d} | Entry:${e} x{c} | Stop:${stp} Target:${tgt}".format(
                 id=t["id"], sym=t["symbol"], d=t["direction"],
-                e=t["entry_price"], c=t["contracts"],
-                stp=t["stop_price"], tgt=t["target_price"]))
+                e=t["premium"], c=t["contracts"],
+                stp=t["stop"], tgt=t["target"]))
 
     # Market
     bias = "---"
@@ -5991,6 +6000,9 @@ def token_check():
 # =============================================
 
 init_db()
+log("DB_FILE: {} | data_dir: {} | RAILWAY_VOLUME_MOUNT_PATH: {}".format(
+    DB_FILE, _data_dir,
+    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "(not set)")))
 db_load_latest_config()   # restore AI config from last session
 threading.Thread(target=background_scheduler, daemon=True).start()
 threading.Thread(target=telegram_poller,      daemon=True).start()
