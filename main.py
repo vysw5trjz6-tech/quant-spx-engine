@@ -4994,7 +4994,7 @@ def take_trade():
         db_log_trade(
             sym, dir_, float(prem), int(con), float(stp), float(tgt),
             grade=grade,
-            grade_pts=int(gpts) if gpts else None,
+            grade_pts=int(float(gpts)) if gpts else None,
             gap_pct=float(gap) if gap else None,
             gap_dir=gdir,
             rs=float(rs) if rs else None
@@ -5507,12 +5507,14 @@ def _build_scanner_context():
             "1HR:{hr} | Vol:{vol} | Rank:{rank}".format(
                 sym=s["symbol"], d=s.get("direction",""),
                 g=s.get("grade","-"), gp=s.get("grade_pts",0),
-                p=s.get("price",0), vwap=round(s.get("vwap",0),2),
-                t1=s.get("t1",0), t2=s.get("t2",0),
-                stp=s.get("stop_loss",0),
-                gap=s.get("gap_pct",0), rs=s.get("rs",0),
+                p=s.get("price",0), vwap=round(float(s.get("vwap") or 0),2),
+                t1=s.get("und_call_t1") or s.get("und_put_t1") or 0,
+                t2=s.get("und_call_t2") or s.get("und_put_t2") or 0,
+                stp=s.get("und_call_stop") or s.get("und_put_stop") or 0,
+                gap=float(s.get("gap_pct") or 0),
+                rs=float(s.get("rs") or 0),
                 hr=s.get("trend_1hr","?"),
-                vol=s.get("vol_signal","?"),
+                vol=s.get("time_vol_lbl","?"),
                 rank=s.get("rank_score",0)
             ))
 
@@ -5525,16 +5527,14 @@ def _build_scanner_context():
         opt = s.get("option") or {}
         sw_lines.append(
             "  {sym} {d} | {stype} | Prob:{prob}% | Price:{p} | "
-            "T1:{t1} T2:{t2} T3:{t3} | Stop:{stp} | R:R {rr} | RS:{rs:+.1f}% | "
-            "Option:{oprem} {dte}DTE".format(
-                sym=s["symbol"], d=s["direction"],
-                stype=s["signal_type"], prob=s["prob"],
-                p=s["price"],
+            "T1:{t1} T2:{t2} T3:{t3} | Stop:{stp} | "
+            "RS:{rs:+.1f}%".format(
+                sym=s.get("symbol","?"), d=s.get("direction","?"),
+                stype=s.get("signal_type","?"), prob=s.get("prob",0),
+                p=s.get("price",0),
                 t1=s.get("t1") or "-", t2=s.get("t2") or "-", t3=s.get("t3") or "-",
-                stp=s.get("stop","-"), rr=s.get("rr1",0),
-                rs=s.get("spy_rs",0),
-                oprem=opt.get("premium","-") if opt else "-",
-                dte=opt.get("dte","?") if opt else "?",
+                stp=s.get("stop","-"),
+                rs=float(s.get("spy_rs") or 0),
             ))
 
     # Today's trades
