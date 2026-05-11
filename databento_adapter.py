@@ -1,30 +1,63 @@
 # databento_adapter.py
-# Unified Databento data adapter for futures + VIX + options.
+# Unified Databento data adapter using the official Python SDK.
 #
-# Databento (https://databento.com) is a market-data provider with direct
-# CME, OPRA, and CBOE feeds. Far better than Polygon/Alpaca for:
-#   - ES/NQ/RTY overnight futures
-#   - Real-time VIX
-#   - Full options chain with OI, IV, greeks
+# Provides:
+#   - VIX spot price (real CBOE index, not VIXY proxy)
+#   - Overnight CME futures bars (ES/NQ/RTY/YM)
+#   - Options chain snapshots with OI (for GEX calculation)
 #
 # Auth: set DATABENTO_API_KEY env var (32-char hex starting with "db-").
 #
-# Pricing notes: Databento charges per-byte for historical, flat-rate for
-# live streams. For our usage (a few hundred queries/day across overnight
-# bars + EOD options snapshots + intraday VIX), the historical API is fine.
+# SDK docs: https://databento.com/docs/api-reference-historical/basics
+#
+# Cost considerations:
+#   - Historical API charges by data volume (bytes)
+#   - We cache aggressively (60s for VIX, 1hr for bars and chains)
+#   - Live streams are flat-rate but we don't use them here yet
+#   - Typical daily spend at our usage: under $1
 
 import os
 import json
-import time
 import sqlite3
-import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 import pytz
 
 DATABENTO_KEY = os.getenv("DATABENTO_API_KEY", "").strip()
-DATABENTO_BASE = "https://hist.databento.com/v0"
 
-# Local cache so we don't re-query the same data
+# Lazy SDK import — module still loads if SDK not installed
+try:
+    import databento as _db
+    _SDK_AVAILABLE = True
+except ImportError:
+    _SDK_AVAILABLE = False
+
+
+# Cached client — reuse connection across calls
+_client = None
+
+
+def _get_client():
+    """Lazily instantiate the historical client."""
+    global _client
+    if not _SDK_AVAILABLE or not DATABENTO_KEY:
+        return None
+    if _client is None:
+        try:
+            _client = _db.Historical(DATABENTO_KEY)
+        except Exception:
+            _client = None
+    return _client
+
+
+def is_available():
+    """Returns True if SDK is installed AND a key is configured."""
+    return _SDK_AVAILABLE and bool(DATABENTO_KEY)
+
+
+# =============================================
+# LOCAL CACHE (so we don't re-bill for same query)
+# =============================================
+
 _DB_CACHE = "databento_cache.db"
 
 
@@ -45,7 +78,6 @@ _init_cache()
 
 
 def _cache_get(key, max_age_seconds=300):
-    """Return cached JSON value if fresh, else None."""
     conn = sqlite3.connect(_DB_CACHE)
     c    = conn.cursor()
     c.execute("SELECT value, stored_at FROM cache WHERE key = ?", (key,))
@@ -68,31 +100,26 @@ def _cache_set(key, value):
     conn.execute("""
         INSERT OR REPLACE INTO cache (key, value, stored_at)
         VALUES (?, ?, ?)
-    """, (key, json.dumps(value), datetime.utcnow().isoformat()))
+    """, (key, json.dumps(value, default=str), datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
-
-
-def is_available():
-    """Returns True if a Databento key is configured."""
-    return bool(DATABENTO_KEY)
 
 
 # =============================================
 # VIX SPOT
 # =============================================
 #
-# Databento dataset: CBOE.VIX (live + historical). Symbol: "VIX".
-# Schema: trades, ohlcv-1m, ohlcv-1h, ohlcv-1d.
-#
-# Returns latest CLOSE from a 1-min OHLCV bar.
+# Dataset: OPRA.PILLAR (consolidated US options) — VIX is published as an index
+# Schema: ohlcv-1m
+# Symbol: "VIX" with stype_in="raw_symbol"
 
 def get_vix_spot():
     """
     Returns latest VIX close as float, or None.
-    Cached 60s to avoid hammering API.
+    Cached 60s.
     """
-    if not is_available():
+    client = _get_client()
+    if not client:
         return None
 
     cached = _cache_get("vix_spot", max_age_seconds=60)
@@ -101,56 +128,28 @@ def get_vix_spot():
 
     et    = pytz.timezone("America/New_York")
     end   = datetime.now(et)
-    start = end - timedelta(minutes=15)
+    start = end - timedelta(minutes=30)
 
     try:
-        # Databento /timeseries.get_range endpoint
-        r = requests.get(
-            DATABENTO_BASE + "/timeseries.get_range",
-            params={
-                "dataset":   "OPRA.PILLAR",   # falls back to CBOE indices
-                "symbols":   "VIX",
-                "stype_in":  "raw_symbol",
-                "schema":    "ohlcv-1m",
-                "start":     start.isoformat(),
-                "end":       end.isoformat(),
-                "encoding":  "json",
-                "limit":     20,
-            },
-            auth=(DATABENTO_KEY, ""),
-            timeout=10,
-        )
-        if r.status_code != 200:
-            # Try the CBOE dataset directly
-            r = requests.get(
-                DATABENTO_BASE + "/timeseries.get_range",
-                params={
-                    "dataset":  "XCBOE.CFE",
-                    "symbols":  "VIX",
-                    "stype_in": "raw_symbol",
-                    "schema":   "ohlcv-1m",
-                    "start":    start.isoformat(),
-                    "end":      end.isoformat(),
-                    "encoding": "json",
-                    "limit":    20,
-                },
-                auth=(DATABENTO_KEY, ""),
-                timeout=10,
-            )
-        if r.status_code != 200:
+        df = client.timeseries.get_range(
+            dataset  = "OPRA.PILLAR",
+            symbols  = ["VIX"],
+            stype_in = "raw_symbol",
+            schema   = "ohlcv-1m",
+            start    = start,
+            end      = end,
+        ).to_df()
+
+        if df is None or df.empty:
             return None
 
-        # Databento returns JSONL — one record per line
-        lines = [ln for ln in r.text.strip().split("\n") if ln]
-        if not lines:
+        # SDK returns DataFrame with prices already scaled (no manual /1e9)
+        vix = float(df.iloc[-1]["close"])
+
+        # Sanity: VIX is conventionally 5–80 outside extreme events
+        if vix < 1 or vix > 100:
             return None
-        last = json.loads(lines[-1])
-        # OHLCV price fields are scaled: divide by 1e9 for futures, 1e2 for indices
-        # The VIX index uses 1e2 scaling (cents).
-        close_raw = last.get("close", 0)
-        if isinstance(close_raw, str):
-            close_raw = int(close_raw)
-        vix = close_raw / 1e9 if close_raw > 1e6 else close_raw / 100.0
+
         _cache_set("vix_spot", {"vix": vix})
         return vix
     except Exception:
@@ -161,13 +160,9 @@ def get_vix_spot():
 # OVERNIGHT FUTURES
 # =============================================
 #
-# Continuous-contract symbols (front month auto-rolled):
-#   ES.c.0 → S&P E-mini futures
-#   NQ.c.0 → Nasdaq 100 E-mini
-#   RTY.c.0 → Russell 2000 E-mini
-#   YM.c.0 → Dow E-mini
-#
-# Globex hours: 6 PM ET (Sun-Thu) → 5 PM ET (Mon-Fri), with daily 1hr break.
+# Dataset: GLBX.MDP3 (CME Globex full feed)
+# Continuous-contract symbology: ES.c.0 = front month ES auto-rolled
+# Schema: ohlcv-5m
 
 CONTRACT_MAP = {
     "ES":  "ES.c.0",
@@ -184,7 +179,8 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 
     Returns list of bars: [{t, o, h, l, c, v}, ...] in chronological order.
     """
-    if not is_available():
+    client = _get_client()
+    if not client:
         return []
 
     et = pytz.timezone("America/New_York")
@@ -196,7 +192,6 @@ def get_overnight_bars(contract="ES", target_date_et=None):
     while prev.weekday() >= 5:
         prev -= timedelta(days=1)
 
-    from datetime import time as dtime
     start = et.localize(datetime.combine(prev, dtime(16, 15)))
     end   = et.localize(datetime.combine(target_date_et, dtime(9, 30)))
 
@@ -207,41 +202,30 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 
     symbol = CONTRACT_MAP.get(contract, "ES.c.0")
     try:
-        r = requests.get(
-            DATABENTO_BASE + "/timeseries.get_range",
-            params={
-                "dataset":  "GLBX.MDP3",        # CME Globex
-                "symbols":  symbol,
-                "stype_in": "continuous",
-                "schema":   "ohlcv-5m",
-                "start":    start.isoformat(),
-                "end":      end.isoformat(),
-                "encoding": "json",
-                "limit":    500,
-            },
-            auth=(DATABENTO_KEY, ""),
-            timeout=15,
-        )
-        if r.status_code != 200:
+        df = client.timeseries.get_range(
+            dataset  = "GLBX.MDP3",
+            symbols  = [symbol],
+            stype_in = "continuous",
+            schema   = "ohlcv-5m",
+            start    = start,
+            end      = end,
+        ).to_df()
+
+        if df is None or df.empty:
             return []
 
+        # Convert DataFrame to the same dict shape the rest of the codebase
+        # expects from Alpaca bars: {t, o, h, l, c, v}
         bars = []
-        for ln in r.text.strip().split("\n"):
-            if not ln:
-                continue
-            try:
-                rec = json.loads(ln)
-                # Databento OHLCV: prices scaled by 1e9 for futures
-                bars.append({
-                    "t": rec.get("ts_event") or rec.get("hd", {}).get("ts_event"),
-                    "o": rec.get("open", 0)  / 1e9 if rec.get("open", 0)  > 1e6 else rec.get("open"),
-                    "h": rec.get("high", 0)  / 1e9 if rec.get("high", 0)  > 1e6 else rec.get("high"),
-                    "l": rec.get("low", 0)   / 1e9 if rec.get("low", 0)   > 1e6 else rec.get("low"),
-                    "c": rec.get("close", 0) / 1e9 if rec.get("close", 0) > 1e6 else rec.get("close"),
-                    "v": rec.get("volume", 0),
-                })
-            except Exception:
-                continue
+        for ts, row in df.iterrows():
+            bars.append({
+                "t": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "o": float(row["open"]),
+                "h": float(row["high"]),
+                "l": float(row["low"]),
+                "c": float(row["close"]),
+                "v": int(row.get("volume", 0)),
+            })
 
         _cache_set(cache_key, {"bars": bars})
         return bars
@@ -253,22 +237,25 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 # OPTIONS CHAIN (for GEX)
 # =============================================
 #
-# Databento dataset: OPRA.PILLAR — full US options consolidated feed.
-# We want the EOD snapshot with open interest. Schema: ohlcv-1d gives
-# OHLC but not OI. The "statistics" schema gives OI.
+# Dataset: OPRA.PILLAR (consolidated US options feed)
+# Schema: "statistics" gives daily OI per contract
+# Symbology: parent-symbol resolution — passing "SPY.OPT" with
+# stype_in="parent" returns every SPY option contract.
 #
-# Simpler approach: use the imbalance/statistics schema at end-of-day.
-# Returns contracts with: strike, expiry, type, open_interest, last_iv.
+# Returns: list of {strike, expiry, type, open_interest, implied_volatility}
 
 def get_options_chain_snapshot(underlying, target_date_et=None,
                                  expiries_ahead=3):
     """
-    Returns EOD options chain snapshot for the underlying, covering the
-    next N monthly expiries.
+    Returns EOD options chain for the underlying, covering the next N
+    nearest expiries.
 
-    Each contract: {strike, expiry, type, open_interest, implied_volatility}
+    Includes open interest (essential for GEX). IV is left as None; the
+    caller computes gamma via Black-Scholes using OI + strike + spot, which
+    is the standard SpotGamma-style approach.
     """
-    if not is_available():
+    client = _get_client()
+    if not client:
         return []
 
     et = pytz.timezone("America/New_York")
@@ -280,86 +267,92 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     if cached:
         return cached.get("chain", [])
 
-    # Databento "definition" schema gives strike/expiry/type
-    # "statistics" schema gives daily OI
-    # We need to combine. For simplicity, use the parent-symbol resolution:
-    #   underlying = "SPY" → returns all SPY options symbols
-    from datetime import time as dtime
+    # EOD snapshot window
     snap_time = et.localize(datetime.combine(target_date_et, dtime(16, 0)))
     start = snap_time - timedelta(hours=1)
     end   = snap_time + timedelta(minutes=30)
 
     try:
-        # Fetch the chain definition for the parent
-        r = requests.get(
-            DATABENTO_BASE + "/timeseries.get_range",
-            params={
-                "dataset":   "OPRA.PILLAR",
-                "symbols":   underlying + ".OPT",
-                "stype_in":  "parent",
-                "schema":    "statistics",
-                "start":     start.isoformat(),
-                "end":       end.isoformat(),
-                "encoding":  "json",
-                "limit":     5000,
-            },
-            auth=(DATABENTO_KEY, ""),
-            timeout=30,
-        )
-        if r.status_code != 200:
+        df = client.timeseries.get_range(
+            dataset  = "OPRA.PILLAR",
+            symbols  = [underlying + ".OPT"],
+            stype_in = "parent",
+            schema   = "statistics",
+            start    = start,
+            end      = end,
+        ).to_df()
+
+        if df is None or df.empty:
             return []
 
-        # We get statistics records; aggregate OI per contract
-        oi_by_sym = {}
-        for ln in r.text.strip().split("\n"):
-            if not ln: continue
-            try:
-                rec = json.loads(ln)
-                # stat_type 9 = open interest in Databento
-                if rec.get("stat_type") == 9:
-                    sym = rec.get("symbol") or rec.get("raw_symbol")
-                    oi_by_sym[sym] = rec.get("quantity", 0)
-            except Exception:
-                continue
+        # Filter to open-interest records.
+        # Databento statistics schema: stat_type=9 is daily open interest.
+        if "stat_type" in df.columns:
+            oi_records = df[df["stat_type"] == 9]
+        else:
+            oi_records = df
 
-        # Parse OCC-style symbols: e.g. SPY   240517C00500000
-        # Format: ROOT(6) + YYMMDD + C/P + STRIKE*1000(8)
         chain = []
-        today = target_date_et
-        for sym, oi in oi_by_sym.items():
+        for _, row in oi_records.iterrows():
             try:
-                # Skip non-OCC formats
-                if len(sym) < 15:
+                strike = float(row.get("strike_price",
+                                        row.get("strike", 0)))
+                if strike == 0:
+                    # Manual parse from raw_symbol fallback
+                    sym = str(row.get("raw_symbol", row.get("symbol", "")))
+                    if len(sym) < 15:
+                        continue
+                    cp_idx = max(sym.rfind("C"), sym.rfind("P"))
+                    if cp_idx < 6:
+                        continue
+                    strike = int(sym[cp_idx+1:cp_idx+9]) / 1000.0
+
+                exp_val = row.get("expiration") or row.get("expiry")
+                if exp_val is not None and hasattr(exp_val, "date"):
+                    expiry = exp_val.date().isoformat()
+                elif exp_val:
+                    expiry = str(exp_val)[:10]
+                else:
+                    sym = str(row.get("raw_symbol", row.get("symbol", "")))
+                    cp_idx = max(sym.rfind("C"), sym.rfind("P"))
+                    yy = int(sym[cp_idx-6:cp_idx-4])
+                    mm = int(sym[cp_idx-4:cp_idx-2])
+                    dd = int(sym[cp_idx-2:cp_idx])
+                    expiry = "{:04d}-{:02d}-{:02d}".format(2000+yy, mm, dd)
+
+                opt_type_raw = row.get("instrument_class") or \
+                               row.get("option_type")
+                if opt_type_raw:
+                    s = str(opt_type_raw).upper()
+                    opt_type = "call" if s.startswith("C") else \
+                               "put"  if s.startswith("P") else None
+                else:
+                    sym = str(row.get("raw_symbol", row.get("symbol", "")))
+                    cp_idx = max(sym.rfind("C"), sym.rfind("P"))
+                    opt_type = "call" if sym[cp_idx] == "C" else "put"
+
+                if not opt_type:
                     continue
-                # Find the call/put marker
-                cp_idx = max(sym.rfind("C"), sym.rfind("P"))
-                if cp_idx < 6: continue
-                # Strike is the last 8 digits / 1000
-                strike = int(sym[cp_idx+1:cp_idx+9]) / 1000.0
-                # Expiry is the 6 digits before C/P
-                yy = int(sym[cp_idx-6:cp_idx-4])
-                mm = int(sym[cp_idx-4:cp_idx-2])
-                dd = int(sym[cp_idx-2:cp_idx])
-                expiry = datetime(2000 + yy, mm, dd).date()
-                opt_type = "call" if sym[cp_idx] == "C" else "put"
+
+                oi = int(row.get("quantity", 0))
+                if oi <= 0:
+                    continue
 
                 chain.append({
-                    "symbol":        sym.strip(),
-                    "strike":        strike,
-                    "expiry":        expiry.isoformat(),
-                    "type":          opt_type,
-                    "open_interest": oi,
-                    # IV not in statistics schema; would need NBBO snapshot
-                    "implied_volatility": None,
+                    "strike":             strike,
+                    "expiry":             expiry,
+                    "type":               opt_type,
+                    "open_interest":      oi,
+                    "implied_volatility": None,  # caller uses BS gamma
                 })
             except Exception:
                 continue
 
-        # Filter to next N expiries
-        chain.sort(key=lambda x: x["expiry"])
-        unique_expiries = sorted(set(c["expiry"] for c in chain))
-        keep_expiries   = set(unique_expiries[:expiries_ahead])
-        chain = [c for c in chain if c["expiry"] in keep_expiries]
+        if chain:
+            chain.sort(key=lambda x: x["expiry"])
+            unique_exp = sorted(set(c["expiry"] for c in chain))
+            keep = set(unique_exp[:expiries_ahead])
+            chain = [c for c in chain if c["expiry"] in keep]
 
         _cache_set(cache_key, {"chain": chain})
         return chain
@@ -372,11 +365,19 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
 # =============================================
 
 def diagnostic():
-    """Returns status of all 3 capabilities for the /databento endpoint."""
-    out = {"available": is_available(), "key_set": bool(DATABENTO_KEY)}
+    """Returns status of all 3 capabilities."""
+    out = {
+        "sdk_installed": _SDK_AVAILABLE,
+        "key_set":       bool(DATABENTO_KEY),
+        "available":     is_available(),
+    }
     if not is_available():
-        out["note"] = "Set DATABENTO_API_KEY to enable."
+        if not _SDK_AVAILABLE:
+            out["note"] = "Install databento SDK: pip install databento"
+        elif not DATABENTO_KEY:
+            out["note"] = "Set DATABENTO_API_KEY env var to enable."
         return out
+
     try:
         vix = get_vix_spot()
         out["vix"] = vix
@@ -396,6 +397,7 @@ def diagnostic():
             out["spy_chain_sample"] = chain[0]
     except Exception as e:
         out["chain_error"] = str(e)
+
     return out
 
 
