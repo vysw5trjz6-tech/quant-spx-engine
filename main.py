@@ -64,6 +64,14 @@ except ImportError as _e:
     HAS_IV_RANK = False
     print("[init] iv_rank unavailable: {}".format(_e))
 
+# Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
+#                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
+# Default is premarket since most users only need an 8:30 AM ET alert.
+OPERATING_MODE = os.getenv("OPERATING_MODE", "premarket").strip().lower()
+if OPERATING_MODE not in ("premarket", "continuous"):
+    OPERATING_MODE = "premarket"
+print("[init] Operating mode: {}".format(OPERATING_MODE))
+
 # Shared module-level state populated daily by the scheduler
 _market_state = {
     "regime":           None,   # output of regime_filter.classify_regime()
@@ -4667,6 +4675,160 @@ def _refresh_iv_snapshots():
         log("IV snapshot error: {}".format(e))
 
 
+# =============================================
+# PREMARKET BRIEF (single morning alert, low-cost)
+# =============================================
+#
+# This is the heart of "premarket mode" — one Databento batch query at
+# 8:30 AM ET that pulls everything you need to know before the open:
+#
+#   - Overnight ES/NQ range + inventory classification
+#   - VIX previous close → regime classification
+#   - GEX snapshot from yesterday's close
+#   - High-IVR watchlist (earnings setups)
+#   - Strategy-enable matrix for today
+#
+# Cost: roughly 1 MB of historical data per run = under $0.10/day.
+# Sends one Telegram alert with all of this packaged.
+
+def run_premarket_brief():
+    """
+    Run once at 8:30 AM ET. Populates _market_state and fires a single
+    consolidated Telegram alert with everything you need before the open.
+    """
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    today = now.strftime("%Y-%m-%d")
+
+    log("=== Premarket brief generating ({}) ===".format(today))
+
+    # Run market state refresh (handles regime, premarket, gex_bias)
+    _refresh_market_state()
+
+    with _market_state_lock:
+        regime    = _market_state.get("regime")
+        premarket = _market_state.get("premarket_brief")
+        gex_bias  = _market_state.get("gex_bias")
+
+    # Top high-IVR names for earnings IV crush watchlist
+    high_ivr = []
+    if HAS_IV_RANK:
+        try:
+            for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
+                d = iv_rank.compute_iv_rank(sym)
+                if d and d["iv_rank"] >= 70:
+                    high_ivr.append((sym, d["iv_rank"]))
+            high_ivr.sort(key=lambda x: -x[1])
+            high_ivr = high_ivr[:5]
+        except Exception:
+            pass
+
+    # Build the alert
+    msg_lines = ["☀️ PREMARKET BRIEF — " + today, ""]
+
+    # Regime line
+    if regime:
+        msg_lines.append("REGIME: {}".format(regime.get("regime", "UNKNOWN")))
+        if regime.get("vix"):
+            msg_lines.append("  VIX: {:.2f}".format(regime["vix"]))
+        if regime.get("realized"):
+            msg_lines.append("  RV20: {:.1f}%".format(regime["realized"]))
+        if regime.get("note"):
+            msg_lines.append("  {}".format(regime["note"]))
+        msg_lines.append("")
+
+    # Overnight context
+    if premarket:
+        es = premarket.get("es_overnight") or {}
+        if es:
+            msg_lines.append("ES OVERNIGHT:")
+            msg_lines.append("  Range: {} – {}".format(es.get("low"), es.get("high")))
+            msg_lines.append("  Close: {} ({:.0%} of range)".format(
+                es.get("last_print"), es.get("close_loc", 0)))
+        inv = premarket.get("es_inventory") or {}
+        if inv:
+            msg_lines.append("  Inventory: {} → bias {}".format(
+                inv.get("category"), inv.get("bias")))
+        gap = premarket.get("gap") or {}
+        if gap and gap.get("class"):
+            msg_lines.append("  Gap: {} ({}%) — {}".format(
+                gap.get("class"), gap.get("gap_pct"),
+                gap.get("note", "").split(" → ")[-1][:60]))
+        msg_lines.append("")
+
+    # GEX bias
+    if gex_bias and gex_bias.get("gex_b") is not None:
+        msg_lines.append("DEALER GAMMA (SPY):")
+        msg_lines.append("  GEX: ${}B ({})".format(
+            gex_bias["gex_b"], gex_bias.get("regime", "?")))
+        msg_lines.append("  Tape bias: {}".format(gex_bias.get("tape_bias", "?")))
+        if gex_bias.get("call_wall"):
+            msg_lines.append("  Call wall: {}".format(gex_bias["call_wall"]))
+        if gex_bias.get("put_wall"):
+            msg_lines.append("  Put wall: {}".format(gex_bias["put_wall"]))
+        if gex_bias.get("flip"):
+            msg_lines.append("  Zero-gamma: {}".format(gex_bias["flip"]))
+        msg_lines.append("")
+
+    # Strategy matrix for today
+    if regime and regime.get("rules"):
+        rules = regime["rules"]
+        enabled  = [k for k in ("orb","vwap_trend","vwap_mr","ib_extension","swing_breakout")
+                    if rules.get(k)]
+        disabled = [k for k in ("orb","vwap_trend","vwap_mr","ib_extension","swing_breakout")
+                    if not rules.get(k)]
+        msg_lines.append("STRATEGIES TODAY:")
+        if enabled:
+            msg_lines.append("  ✓ " + ", ".join(enabled))
+        if disabled:
+            msg_lines.append("  ✗ " + ", ".join(disabled))
+        msg_lines.append("  Size mult: x{:.2f}".format(rules.get("size_multiplier", 1.0)))
+        msg_lines.append("")
+
+    # Top IVR for earnings IV crush
+    if high_ivr:
+        msg_lines.append("HIGH IV RANK (>70):")
+        for sym, ivr in high_ivr:
+            msg_lines.append("  {} — {:.0f}".format(sym, ivr))
+        msg_lines.append("")
+
+    # Plain-English summary line
+    if regime and gex_bias:
+        msg_lines.append("PLAN: " + _summarize_plan(regime, gex_bias, premarket))
+
+    msg = "\n".join(msg_lines)
+    send_telegram(msg)
+    log("Premarket brief sent ({} chars)".format(len(msg)))
+
+
+def _summarize_plan(regime, gex_bias, premarket):
+    """One-sentence trade plan based on the morning's context."""
+    parts = []
+    r_name = regime.get("regime", "")
+    if r_name == "CRISIS":
+        parts.append("Intraday only, half size, wide stops")
+    elif r_name == "ELEVATED":
+        parts.append("Trend strategies preferred")
+    elif r_name == "COMPRESSED":
+        parts.append("Range-bound day — fade extremes only")
+    else:
+        parts.append("Standard regime")
+
+    tape = gex_bias.get("tape_bias", "")
+    if "TREND" in tape:
+        parts.append("ORB favored")
+    elif "MEAN_REVERT" in tape:
+        parts.append("VWAP fades favored")
+
+    gap = (premarket or {}).get("gap", {})
+    if gap.get("class") == "INSIDE_GAP":
+        parts.append("morning fade likely")
+    elif "GAP_AND_GO" in (gap.get("class") or ""):
+        parts.append("continuation likely")
+
+    return ". ".join(parts) + "."
+
+
 def _check_overnight_gamma_reversal():
     """Run at 3:50 PM ET. If short-gamma + intraday weakness, fire a signal."""
     if not HAS_NEW_STRATS:
@@ -4728,25 +4890,29 @@ def background_scheduler():
     boot_hour = boot_now.hour + boot_now.minute / 60.0
     today_str = boot_now.strftime("%Y-%m-%d")
 
-    log("Boot-time bootstrap @ {:.2f} ET".format(boot_hour))
+    log("Boot-time bootstrap @ {:.2f} ET (mode: {})".format(boot_hour, OPERATING_MODE))
     threading.Thread(target=_refresh_market_state, daemon=True).start()
     if boot_hour >= 6.0:
         threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
     if boot_hour >= 8.0:
         threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
+    if boot_hour >= 8.5:
+        # Boot after the premarket-brief window — fire one now
+        threading.Thread(target=run_premarket_brief, daemon=True).start()
     if boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
     if boot_hour >= 16.5:
         threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
 
     # Mark today's refreshes as done so we don't double-run
-    _daily_refresh_done["date"]     = today_str
-    _daily_refresh_done["earnings"] = boot_hour >= 6.0
-    _daily_refresh_done["vol"]      = boot_hour >= 8.0
-    _daily_refresh_done["gex"]      = boot_hour >= 16.5
-    _daily_refresh_done["iv"]       = boot_hour >= 16.25
-    _premarket_done["date"]         = today_str if boot_hour >= 9.4 else None
-    _overnight_done["date"]         = today_str if boot_hour >= 15.93 else None
+    _daily_refresh_done["date"]      = today_str
+    _daily_refresh_done["earnings"]  = boot_hour >= 6.0
+    _daily_refresh_done["vol"]       = boot_hour >= 8.0
+    _daily_refresh_done["premarket"] = boot_hour >= 8.5
+    _daily_refresh_done["gex"]       = boot_hour >= 16.5
+    _daily_refresh_done["iv"]        = boot_hour >= 16.25
+    _premarket_done["date"]          = today_str if boot_hour >= 9.4 else None
+    _overnight_done["date"]          = today_str if boot_hour >= 15.93 else None
 
     # Kick off first swing scan immediately in background (daily bars, non-blocking)
     threading.Thread(target=run_swing_scan, daemon=True).start()
@@ -4768,10 +4934,11 @@ def background_scheduler():
             # Pre-market (6 AM ET): refresh earnings + volume profiles
             if et_hour >= 6.0 and _daily_refresh_done.get("date") != today:
                 _daily_refresh_done["date"] = today
-                _daily_refresh_done["earnings"] = False
-                _daily_refresh_done["vol"]      = False
-                _daily_refresh_done["gex"]      = False
-                _daily_refresh_done["iv"]       = False
+                _daily_refresh_done["earnings"]  = False
+                _daily_refresh_done["vol"]       = False
+                _daily_refresh_done["gex"]       = False
+                _daily_refresh_done["iv"]        = False
+                _daily_refresh_done["premarket"] = False
             if et_hour >= 6.0 and not _daily_refresh_done.get("earnings"):
                 threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
                 _daily_refresh_done["earnings"] = True
@@ -4779,24 +4946,35 @@ def background_scheduler():
                 threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
                 _daily_refresh_done["vol"] = True
 
-            # 9:25 AM ET: refresh regime/premarket/GEX
-            if (et_hour >= 9.4 and et_hour < 9.6
-                    and _premarket_done.get("date") != today):
-                _premarket_done["date"] = today
-                threading.Thread(target=_refresh_market_state, daemon=True).start()
+            # --- PREMARKET BRIEF (8:30 AM ET, once daily) ---
+            # In premarket mode, this is THE main alert of the day.
+            # In continuous mode, it still runs as an early heads-up.
+            if (et_hour >= 8.5 and et_hour < 8.7
+                    and not _daily_refresh_done.get("premarket")):
+                _daily_refresh_done["premarket"] = True
+                threading.Thread(target=run_premarket_brief, daemon=True).start()
 
-            # 3:45–3:55 PM ET: overnight gamma reversal check
-            if (et_hour >= 15.75 and et_hour < 15.93
-                    and _overnight_done.get("date") != today):
-                _overnight_done["date"] = today
-                threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
+            # --- The following are INTRADAY refreshes ---
+            # Skip them in 'premarket' mode to save Databento spend.
+            if OPERATING_MODE == "continuous":
+                # 9:25 AM ET: refresh regime/premarket/GEX
+                if (et_hour >= 9.4 and et_hour < 9.6
+                        and _premarket_done.get("date") != today):
+                    _premarket_done["date"] = today
+                    threading.Thread(target=_refresh_market_state, daemon=True).start()
 
-            # 4:30 PM ET: post-close GEX snapshot
+                # 3:45–3:55 PM ET: overnight gamma reversal check
+                if (et_hour >= 15.75 and et_hour < 15.93
+                        and _overnight_done.get("date") != today):
+                    _overnight_done["date"] = today
+                    threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
+
+            # 4:30 PM ET: post-close GEX snapshot (both modes — feeds tomorrow's brief)
             if et_hour >= 16.5 and not _daily_refresh_done.get("gex"):
                 threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
                 _daily_refresh_done["gex"] = True
 
-            # 4:15 PM ET: daily IV snapshot (builds rolling 1yr history for IV Rank)
+            # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
             if et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
                 threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
                 _daily_refresh_done["iv"] = True
@@ -6660,6 +6838,20 @@ def databento_endpoint():
         return jsonify({"error": "databento_adapter module not present"})
     except Exception as e:
         return jsonify({"error": str(e)})
+
+
+@app.route("/brief")
+def brief_endpoint():
+    """
+    Manually trigger the premarket brief. Useful for testing and for
+    on-demand re-runs if the 8:30 AM scheduled run was missed.
+    """
+    threading.Thread(target=run_premarket_brief, daemon=True).start()
+    return jsonify({
+        "status":         "queued",
+        "operating_mode": OPERATING_MODE,
+        "note":           "Premarket brief queued. Check Telegram in ~30s.",
+    })
 
 
 @app.route("/alpaca-test")
