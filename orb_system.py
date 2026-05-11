@@ -7,8 +7,18 @@ import requests
 import os
 import statistics
 import csv
+import sys
 from datetime import datetime, date, timedelta
 from collections import defaultdict
+
+# Realistic execution model (slippage + fees)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from safety_gates import realistic_trade_pnl
+    HAS_REALISTIC_EXEC = True
+except ImportError:
+    HAS_REALISTIC_EXEC = False
+    print("WARNING: safety_gates not found — backtest will report optimistic gross P&L")
 
 # =============================================
 # CONFIGURATION
@@ -304,7 +314,7 @@ def backtest_symbol(symbol, all_bars_5min, all_bars_daily):
 
 def _trade_record(symbol, date_str, direction, entry, stop, target,
                   r_mult, size, atr):
-    return {
+    rec = {
         "symbol":    symbol,
         "date":      date_str,
         "direction": direction,
@@ -316,6 +326,37 @@ def _trade_record(symbol, date_str, direction, entry, stop, target,
         "atr":       round(atr, 4) if atr else None,
         "outcome":   "WIN" if r_mult > 0 else "LOSS"
     }
+
+    # --- Realistic execution: slippage + fees ---
+    # This makes the backtest stop overstating edge by 15-30%.
+    if HAS_REALISTIC_EXEC and size and size > 0:
+        try:
+            exit_price = target if r_mult > 0 else stop
+            pos_dir    = "LONG" if direction in ("LONG", "CALL") else "SHORT"
+            exit_type  = "target_limit" if r_mult > 0 else "stop_market"
+            exec_data  = realistic_trade_pnl(
+                entry_price = entry,
+                exit_price  = exit_price,
+                num_shares  = size,
+                direction   = pos_dir,
+                exit_type   = exit_type,
+                asset       = "stock",
+            )
+            rec["entry_fill"]   = exec_data["entry_fill"]
+            rec["exit_fill"]    = exec_data["exit_fill"]
+            rec["gross_pnl"]    = exec_data["gross_pnl"]
+            rec["slippage"]     = exec_data["slippage"]
+            rec["fees"]         = exec_data["fees"]
+            rec["net_pnl"]      = exec_data["net_pnl"]
+            # Recompute r_mult on realized dollars (more truthful)
+            stop_dist = abs(entry - stop)
+            if stop_dist > 0:
+                rec["r_mult_net"] = round(
+                    exec_data["net_pnl"] / (stop_dist * size), 2)
+        except Exception as e:
+            rec["exec_error"] = str(e)
+
+    return rec
 
 
 # =============================================
@@ -372,6 +413,12 @@ def compute_stats(trades, label="ALL"):
         else:
             cur_consec  = 0
 
+    # Realized $ P&L if execution model ran
+    net_pnls   = [t.get("net_pnl") for t in trades if t.get("net_pnl") is not None]
+    gross_pnls = [t.get("gross_pnl") for t in trades if t.get("gross_pnl") is not None]
+    total_slippage = sum(t.get("slippage", 0) for t in trades)
+    total_fees     = sum(t.get("fees", 0) for t in trades)
+
     return {
         "label":         label,
         "trades":        len(rs),
@@ -384,7 +431,15 @@ def compute_stats(trades, label="ALL"):
         "avg_win":       round(avg_win, 3),
         "avg_loss":      round(avg_loss, 3),
         "max_consec_loss": max_consec,
-        "equity_curve":  equity
+        "equity_curve":  equity,
+        # Realistic execution figures (None if safety_gates not available)
+        "total_gross_pnl": round(sum(gross_pnls), 2) if gross_pnls else None,
+        "total_net_pnl":   round(sum(net_pnls), 2)   if net_pnls   else None,
+        "total_slippage":  round(total_slippage, 2)  if net_pnls   else None,
+        "total_fees":      round(total_fees, 2)      if net_pnls   else None,
+        "cost_drag_pct":   round((1 - sum(net_pnls)/sum(gross_pnls)) * 100, 1)
+                            if (net_pnls and gross_pnls and sum(gross_pnls) > 0)
+                            else None,
     }
 
 
