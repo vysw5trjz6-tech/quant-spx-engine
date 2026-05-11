@@ -279,30 +279,33 @@ def init_db():
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts         TEXT,
-            symbol     TEXT,
-            direction  TEXT,
-            premium    REAL,
-            contracts  INTEGER,
-            stop       REAL,
-            target     REAL,
-            outcome    TEXT,
-            exit_price REAL,
-            pnl        REAL,
-            r_mult     REAL,
-            grade      TEXT,
-            grade_pts  INTEGER,
-            gap_pct    REAL,
-            gap_dir    TEXT,
-            rs         REAL,
-            entry_hour REAL
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           TEXT,
+            symbol       TEXT,
+            direction    TEXT,
+            premium      REAL,
+            contracts    INTEGER,
+            stop         REAL,
+            target       REAL,
+            outcome      TEXT,
+            exit_price   REAL,
+            pnl          REAL,
+            r_mult       REAL,
+            grade        TEXT,
+            grade_pts    INTEGER,
+            gap_pct      REAL,
+            gap_dir      TEXT,
+            rs           REAL,
+            entry_hour   REAL,
+            entry_under  REAL,
+            signal_type  TEXT
         )
     """)
     # Migrate existing trades table
     for col, coltype in [("grade","TEXT"), ("grade_pts","INTEGER"),
                           ("gap_pct","REAL"), ("gap_dir","TEXT"),
-                          ("rs","REAL"), ("entry_hour","REAL")]:
+                          ("rs","REAL"), ("entry_hour","REAL"),
+                          ("entry_under","REAL"), ("signal_type","TEXT")]:
         try:
             conn.execute("ALTER TABLE trades ADD COLUMN {} {}".format(col, coltype))
         except:
@@ -557,7 +560,8 @@ def db_log_signal(sig):
 
 def db_log_trade(symbol, direction, premium, contracts, stop, target,
                   grade=None, grade_pts=None, gap_pct=None,
-                  gap_dir=None, rs=None, entry_hour=None):
+                  gap_dir=None, rs=None, entry_hour=None,
+                  entry_under=None, signal_type=None):
     try:
         conn = sqlite3.connect(DB_FILE)
         c    = conn.cursor()
@@ -568,12 +572,14 @@ def db_log_trade(symbol, direction, premium, contracts, stop, target,
         c.execute("""
             INSERT INTO trades
             (ts,symbol,direction,premium,contracts,stop,target,outcome,
-             grade,grade_pts,gap_pct,gap_dir,rs,entry_hour)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             grade,grade_pts,gap_pct,gap_dir,rs,entry_hour,
+             entry_under,signal_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
             symbol, direction, premium, contracts, stop, target, "OPEN",
-            grade, grade_pts, gap_pct, gap_dir, rs, entry_hour
+            grade, grade_pts, gap_pct, gap_dir, rs, entry_hour,
+            entry_under, signal_type
         ))
         trade_id = c.lastrowid
         conn.commit()
@@ -634,13 +640,15 @@ def db_get_open_trades():
         conn = sqlite3.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
-            SELECT id,symbol,direction,premium,contracts,stop,target,ts
+            SELECT id,symbol,direction,premium,contracts,stop,target,ts,
+                   entry_under,signal_type,grade,grade_pts
             FROM trades WHERE outcome='OPEN'
             ORDER BY ts DESC
         """)
         rows = c.fetchall()
         conn.close()
-        cols = ["id","symbol","direction","premium","contracts","stop","target","ts"]
+        cols = ["id","symbol","direction","premium","contracts","stop","target","ts",
+                "entry_under","signal_type","grade","grade_pts"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log("DB open trades error: {}".format(e))
@@ -2255,16 +2263,33 @@ def scan_all_symbols():
                 continue
 
             # No alternative signal either — fall through to WATCHING
+            # ONLY if price is within 0.5% of the ORB breakout level.
+            # Otherwise this is just noise and doesn't belong on the dashboard.
             result["direction"] = "CALL" if price > vwap else "PUT"
             result["vs_vwap"]   = "{:+.3f}%".format(vs_vwap)
             result["vs_orb"]    = "{:.2f}% from ORB {}".format(
                 abs(vs_orb_high if price > vwap else vs_orb_low),
                 "high" if price > vwap else "low")
-            vol_ratio        = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
-            result["score"]  = round((1 - min(abs(vs_orb_high), abs(vs_orb_low)) / 100) * vol_mult * 10, 2)
-            result["status"] = "WATCHING"
-            results.append(result)
-            continue
+
+            # Distance from the relevant ORB level
+            if result["direction"] == "CALL":
+                pct_to_breakout = (orb_high - price) / price * 100
+            else:
+                pct_to_breakout = (price - orb_low) / price * 100
+
+            # Only watch genuinely-approaching setups
+            if 0 <= pct_to_breakout <= 0.5:
+                vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+                result["score"]  = round((1 - min(abs(vs_orb_high), abs(vs_orb_low)) / 100) * vol_mult * 10, 2)
+                result["status"] = "WATCHING"
+                results.append(result)
+                continue
+            else:
+                # Too far to watch — bury as 'idle'
+                result["status"] = "idle"
+                result["score"]  = 0
+                results.append(result)
+                continue
 
         vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
         score     = (breakout_strength * 100 + vol_ratio) * vol_mult
@@ -2425,18 +2450,51 @@ def run_signal_scan():
     for sig in signals:
         if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
             db_log_signal(sig)
+
+            # Build context line — regime + GEX bias for situational awareness
+            with _market_state_lock:
+                _r = _market_state.get("regime")
+                _g = _market_state.get("gex_bias")
+            context_line = ""
+            if _r:
+                context_line += "Regime: {}".format(_r.get("regime", "?"))
+                if _r.get("vix"):
+                    context_line += " (VIX {})".format(_r["vix"])
+            if _g and _g.get("gex_b") is not None:
+                if context_line:
+                    context_line += " | "
+                context_line += "GEX: ${}B {}".format(
+                    _g["gex_b"], _g.get("tape_bias", ""))
+
+            # Earnings warning if present
+            earn_warning = ""
+            if sig.get("earnings_warning"):
+                earn_warning = "\n\n⚠️ {}".format(sig["earnings_warning"])
+
             msg = (
-                "{sig_type} SIGNAL\n\n"
-                "Symbol: {}\nDirection: {}\nScore: {}\n\n"
-                "Underlying: ${}\nStrike: {}\nPremium: ${}\n\n"
-                "Contracts: {}\nStop: ${}\nTarget: ${}\n\n"
-                "Vol Multiplier: {}x"
+                "{sig_type} SIGNAL — {grade} ({gpts}pts)\n\n"
+                "{sym} {dirn}  •  ${price}\n"
+                "Strike: {strike}  •  Premium: ${prem}\n"
+                "{con}x  •  Stop ${stop}  •  Target ${target}\n\n"
+                "Gap: {gap}%  •  RS vs SPY: {rs}%\n"
+                "Vol: {vol_lbl}{ctx}{ew}"
             ).format(
-                sig["symbol"], sig["direction"], sig["score"],
-                sig["price"], sig["strike"], sig["premium"],
-                sig["contracts"], sig["stop"], sig["target"],
-                sig.get("vol_mult", 1.0),
-                sig_type=sig.get("signal_type", "ORB")
+                sig_type   = sig.get("signal_type", "ORB"),
+                grade      = sig.get("grade", "?"),
+                gpts       = sig.get("grade_pts", "?"),
+                sym        = sig["symbol"],
+                dirn       = sig["direction"],
+                price      = sig["price"],
+                strike     = sig["strike"],
+                prem       = sig["premium"],
+                con        = sig["contracts"],
+                stop       = sig["stop"],
+                target     = sig["target"],
+                gap        = sig.get("gap_pct", "?"),
+                rs         = sig.get("rs", "?"),
+                vol_lbl    = sig.get("vol_ratio") or "?",
+                ctx        = "\n\n" + context_line if context_line else "",
+                ew         = earn_warning,
             )
             send_telegram(msg)
             break  # Only alert best signal
@@ -2655,6 +2713,17 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
 
         if resp.status_code != 200:
             log("AI: API error: {}".format(resp.text[:200]))
+            # Backoff on auth/billing errors — these don't fix themselves
+            # within minutes, so stop retrying until tomorrow.
+            err_text = resp.text.lower()
+            if resp.status_code in (401, 402, 403) or \
+               "credit balance" in err_text or \
+               "invalid api key" in err_text or \
+               "rate limit" in err_text and resp.status_code == 429:
+                et = pytz.timezone("America/New_York")
+                _ai_last_run_date = datetime.now(et).strftime("%Y-%m-%d")
+                _ai_last_trade_cnt = len(trades)
+                log("AI: backoff engaged — will not retry until tomorrow")
             return
 
         raw = resp.json()["content"][0]["text"].strip()
@@ -4651,8 +4720,33 @@ def background_scheduler():
     log("Background scheduler started")
     time.sleep(10)
 
-    # Initial market state load on boot
-    _refresh_market_state()
+    # --- Boot-time bootstrap ---
+    # If we boot mid-day, all the morning refreshes were missed. Run them
+    # now so the dashboard isn't blank.
+    et       = pytz.timezone("America/New_York")
+    boot_now = datetime.now(et)
+    boot_hour = boot_now.hour + boot_now.minute / 60.0
+    today_str = boot_now.strftime("%Y-%m-%d")
+
+    log("Boot-time bootstrap @ {:.2f} ET".format(boot_hour))
+    threading.Thread(target=_refresh_market_state, daemon=True).start()
+    if boot_hour >= 6.0:
+        threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
+    if boot_hour >= 8.0:
+        threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
+    if boot_hour >= 16.25:
+        threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
+    if boot_hour >= 16.5:
+        threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
+
+    # Mark today's refreshes as done so we don't double-run
+    _daily_refresh_done["date"]     = today_str
+    _daily_refresh_done["earnings"] = boot_hour >= 6.0
+    _daily_refresh_done["vol"]      = boot_hour >= 8.0
+    _daily_refresh_done["gex"]      = boot_hour >= 16.5
+    _daily_refresh_done["iv"]       = boot_hour >= 16.25
+    _premarket_done["date"]         = today_str if boot_hour >= 9.4 else None
+    _overnight_done["date"]         = today_str if boot_hour >= 15.93 else None
 
     # Kick off first swing scan immediately in background (daily bars, non-blocking)
     threading.Thread(target=run_swing_scan, daemon=True).start()
@@ -5153,12 +5247,32 @@ def render_dashboard(toast=""):
     open_rows = ""
     for t in open_trades:
         cp = get_current_price(t["symbol"])
-        if cp and t["premium"]:
-            unreal = round((cp - t["premium"]) * 100 * t["contracts"], 2)
-            uc = "#3fb950" if unreal >= 0 else "#f85149"
-            us = "<span style='color:{};font-weight:600'>${}</span>".format(uc, unreal)
+        # BUG FIX (was: (cp - t["premium"]) * 100 * contracts which mixed
+        # underlying price with option premium, producing absurd values).
+        #
+        # We don't poll option prices continuously, so we estimate the option
+        # P&L from the underlying's move using a rough delta. ATM options have
+        # delta ~0.50 at entry; we assume that for unrealized estimates.
+        # If we have a stored entry underlying we use the actual move; else
+        # we hide P&L until close.
+        unreal = None
+        if cp and t.get("premium") and t.get("entry_under"):
+            entry_under = t["entry_under"]
+            move        = cp - entry_under
+            if t["direction"] == "PUT":
+                move = -move
+            # Assumed delta ~0.50 for ATM at entry; gamma scaling ignored.
+            est_opt_change = move * 0.50
+            unreal = round(est_opt_change * 100 * t["contracts"], 2)
+        elif cp and t.get("premium"):
+            # No entry_under stored (older trade) — display dash
+            pass
+
+        if unreal is None:
+            us = "<span style='color:#8b949e' title='Awaiting option mid quote'>~</span>"
         else:
-            us = "<span style='color:#8b949e'>-</span>"
+            uc = "#3fb950" if unreal >= 0 else "#f85149"
+            us = "<span style='color:{};font-weight:600' title='Delta-estimate from underlying'>~${}</span>".format(uc, unreal)
         dc = "#3fb950" if t["direction"]=="CALL" else "#f85149"
         open_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
@@ -5465,17 +5579,28 @@ def take_trade():
     gap   = request.args.get("gap", None)
     gdir  = request.args.get("gdir", None)
     rs    = request.args.get("rs", None)
+    stype = request.args.get("stype", None)
     try:
+        # Capture underlying spot at trade entry — used for delta-based
+        # unrealized P&L estimate on the dashboard.
+        entry_under = None
+        try:
+            entry_under = get_current_price(sym)
+        except Exception:
+            pass
+
         db_log_trade(
             sym, dir_, float(prem), int(con), float(stp), float(tgt),
             grade=grade,
             grade_pts=int(float(gpts)) if gpts else None,
             gap_pct=float(gap) if gap else None,
             gap_dir=gdir,
-            rs=float(rs) if rs else None
+            rs=float(rs) if rs else None,
+            entry_under=entry_under,
+            signal_type=stype,
         )
-        log("Trade taken: {} {} {} grade={} prem={}".format(
-            sym, dir_, grade, gpts, prem))
+        log("Trade taken: {} {} {} grade={} prem={} under={}".format(
+            sym, dir_, grade, gpts, prem, entry_under))
         send_telegram(
             "TRADE TAKEN\n{} {} | Grade: {} ({}pts)\n"
             "Entry: ${} | {}x | Stop: ${} | Target: ${}\n"
@@ -6487,6 +6612,14 @@ def edge_endpoint():
         except Exception:
             pass
 
+    # Check Databento availability
+    databento_available = False
+    try:
+        import databento_adapter
+        databento_available = databento_adapter.is_available()
+    except ImportError:
+        pass
+
     return jsonify({
         "regime":             regime,
         "gex_bias":           gex_bias,
@@ -6502,10 +6635,31 @@ def edge_endpoint():
             "iv_rank":          HAS_IV_RANK,
         },
         "api_keys": {
-            "polygon": bool(os.getenv("POLYGON_API_KEY", "").strip()),
-            "fmp":     bool(os.getenv("FMP_API_KEY", "").strip()),
+            "polygon":   bool(os.getenv("POLYGON_API_KEY", "").strip()),
+            "fmp":       bool(os.getenv("FMP_API_KEY", "").strip()),
+            "databento": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
+            "anthropic": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+        },
+        "providers_active": {
+            "vix_source":       "databento" if databento_available else "vixy_proxy",
+            "futures_source":   "databento" if databento_available else
+                                ("polygon_index" if os.getenv("POLYGON_API_KEY","").strip() else "alpaca_etf"),
+            "gex_source":       "databento" if databento_available else
+                                ("polygon" if os.getenv("POLYGON_API_KEY","").strip() else "disabled"),
         },
     })
+
+
+@app.route("/databento")
+def databento_endpoint():
+    """Diagnostic for Databento connectivity."""
+    try:
+        import databento_adapter
+        return jsonify(databento_adapter.diagnostic())
+    except ImportError:
+        return jsonify({"error": "databento_adapter module not present"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 @app.route("/alpaca-test")

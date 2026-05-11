@@ -95,13 +95,29 @@ def get_current_vix():
     """
     Fetch the latest VIX quote.
 
-    Alpaca doesn't carry VIX directly. Two options:
-      1. Use VIXY (1-mo VIX futures ETF) as a proxy — close enough for regime
-      2. Use Polygon /v2/aggs/ticker/I:VIX/prev for the real VIX
+    Source priority:
+      1. Databento real VIX (most accurate)
+      2. VIXY ETF as proxy (rough — overstates by ~85% historically)
+      3. None (caller uses realized vol fallback)
 
-    Default here uses VIXY since you already have Alpaca creds.
-    Swap to Polygon if you upgrade.
+    Includes a sanity guard: if VIX > 60, returns None rather than reporting
+    impossible values. The all-time intraday high is ~89.5 (Oct 2008), and
+    closes >50 are extreme rare events (COVID 2020, GFC 2008). A consistent
+    VIX>50 reading more likely indicates a bad data source.
     """
+    # --- Path 1: Databento real VIX ---
+    try:
+        import databento_adapter
+        if databento_adapter.is_available():
+            vix = databento_adapter.get_vix_spot()
+            if vix and 5 <= vix <= 80:
+                return vix
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # --- Path 2: VIXY ETF as proxy ---
     try:
         et    = pytz.timezone("America/New_York")
         end   = datetime.now(et)
@@ -113,7 +129,6 @@ def get_current_vix():
             "limit":     5,
             "feed":      "iex",
         }
-        # Use VIXY as proxy. It tracks 1-mo VIX futures.
         r = requests.get(DATA_URL.format("VIXY"), headers=HEADERS,
                          params=params, timeout=10)
         if r.status_code != 200:
@@ -121,11 +136,19 @@ def get_current_vix():
         bars = r.json().get("bars", [])
         if not bars:
             return None
-        # VIXY price ≈ VIX/2.5 historically (rough scaling).
-        # Better: use VIXY's percentile rank vs its own 1-yr range.
-        # For regime classification, the absolute level matters less than
-        # the relative rank. We return VIXY price * empirical scalar.
-        return bars[-1]["c"] * 1.85
+        # VIXY ≈ VIX/1.85 (historical scalar). This is a rough proxy and is
+        # likely the reason logs were reporting VIX=50 — VIXY at ~27 × 1.85.
+        # Calibrate via Databento when available.
+        vixy_close = bars[-1]["c"]
+        est_vix    = vixy_close * 1.85
+        # Sanity guard
+        if est_vix > 60:
+            # The proxy is unreliable in this range; refuse rather than return
+            # a bad value that will keep the regime stuck on CRISIS.
+            return None
+        if est_vix < 5:
+            return None
+        return est_vix
     except Exception:
         return None
 

@@ -70,60 +70,93 @@ def _next_friday_or_monthly():
     return third_fri.strftime("%Y-%m-%d")
 
 
+def _candidate_expiries(n=5):
+    """
+    Return up to N candidate expiries to try for ATM IV lookup, ordered
+    by likelihood of having liquid contracts:
+      1. Next Friday (weekly)
+      2. Friday after that
+      3. Next monthly (3rd Friday)
+      4. Following monthly
+    """
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).date()
+    out   = []
+
+    # Next 4 Fridays
+    days_to_fri = (4 - today.weekday()) % 7
+    if days_to_fri == 0:
+        days_to_fri = 7   # skip today
+    for offset in range(0, 28, 7):
+        d = today + timedelta(days=days_to_fri + offset)
+        out.append(d.strftime("%Y-%m-%d"))
+
+    # Add monthly expiry too
+    monthly = _next_friday_or_monthly()
+    if monthly not in out:
+        out.append(monthly)
+
+    return out[:n]
+
+
 def fetch_atm_iv(symbol, underlying_price):
     """
     Returns today's ATM IV (average of nearest call + put), or None.
 
-    Uses Alpaca options snapshot. Targets the next monthly expiry to avoid
-    contamination from 0DTE noise.
+    Tries multiple expiries (next 4 Fridays + next monthly) until one
+    returns contracts with valid IVs. Earlier expiries often don't list
+    for thinner names; later ones might have stale IV.
     """
     if not ALPACA_KEY or not underlying_price:
         return None
 
-    expiry  = _next_friday_or_monthly()
-    url     = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
-    lo      = round(underlying_price * 0.97, 2)
-    hi      = round(underlying_price * 1.03, 2)
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
+    lo  = round(underlying_price * 0.97, 2)
+    hi  = round(underlying_price * 1.03, 2)
 
-    ivs = []
-    for opt_type in ("call", "put"):
-        try:
-            r = requests.get(url, headers=HEADERS, params={
-                "feed":              "indicative",
-                "expiration_date":   expiry,
-                "type":              opt_type,
-                "strike_price_gte":  lo,
-                "strike_price_lte":  hi,
-                "limit":             20,
-            }, timeout=10)
-            if r.status_code != 200:
+    for expiry in _candidate_expiries(5):
+        ivs = []
+        for opt_type in ("call", "put"):
+            try:
+                r = requests.get(url, headers=HEADERS, params={
+                    "feed":              "indicative",
+                    "expiration_date":   expiry,
+                    "type":              opt_type,
+                    "strike_price_gte":  lo,
+                    "strike_price_lte":  hi,
+                    "limit":             20,
+                }, timeout=10)
+                if r.status_code != 200:
+                    continue
+                snapshots = r.json().get("snapshots", {}) or {}
+                if not snapshots:
+                    continue
+
+                # Find the strike closest to spot with a valid IV
+                best_iv = None
+                best_dist = None
+                for contract_sym, snap in snapshots.items():
+                    try:
+                        strike = int(contract_sym[-8:]) / 1000.0
+                    except Exception:
+                        continue
+                    greeks = snap.get("greeks") or {}
+                    iv = greeks.get("impliedVolatility")
+                    if iv is None or iv <= 0 or iv > 5.0:
+                        continue
+                    dist = abs(strike - underlying_price)
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best_iv   = iv
+                if best_iv:
+                    ivs.append(best_iv)
+            except Exception:
                 continue
-            snapshots = r.json().get("snapshots", {}) or {}
 
-            # Find the strike closest to spot
-            best_iv = None
-            best_dist = None
-            for contract_sym, snap in snapshots.items():
-                try:
-                    strike = int(contract_sym[-8:]) / 1000.0
-                except Exception:
-                    continue
-                greeks = snap.get("greeks") or {}
-                iv = greeks.get("impliedVolatility")
-                if iv is None or iv <= 0 or iv > 5.0:
-                    continue
-                dist = abs(strike - underlying_price)
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
-                    best_iv   = iv
-            if best_iv:
-                ivs.append(best_iv)
-        except Exception:
-            continue
+        if len(ivs) >= 1:
+            return round(statistics.mean(ivs), 4)
 
-    if not ivs:
-        return None
-    return round(statistics.mean(ivs), 4)
+    return None
 
 
 # =============================================

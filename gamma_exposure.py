@@ -174,8 +174,24 @@ def compute_gex_from_chain(chain_data, spot_price):
 def fetch_polygon_chain(underlying):
     """
     Fetch full SPY/QQQ chain for first 3 monthly expiries.
-    Polygon /v3/snapshot/options/{underlying} returns chain with OI + greeks.
+
+    Provider priority:
+      1. Databento (best — direct OPRA feed with OI)
+      2. Polygon snapshot
     """
+    # --- Path 1: Databento ---
+    try:
+        import databento_adapter
+        if databento_adapter.is_available():
+            chain = databento_adapter.get_options_chain_snapshot(underlying)
+            if chain:
+                return chain
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # --- Path 2: Polygon (legacy) ---
     if not POLYGON_KEY:
         return None
     url = "https://api.polygon.io/v3/snapshot/options/{}".format(underlying)
@@ -186,7 +202,7 @@ def fetch_polygon_chain(underlying):
     out = []
     cursor = None
     pages = 0
-    while pages < 6:  # cap at ~1500 contracts
+    while pages < 6:
         if cursor:
             params["cursor"] = cursor
         try:
@@ -294,9 +310,19 @@ def load_latest_gex(symbol):
 def refresh_gex(symbol="SPY", spot_price=None):
     """
     Run after market close (or before open) to build the day's GEX snapshot.
+    Requires either Databento or Polygon key for the chain data.
     """
-    if not POLYGON_KEY:
+    # Check at least one provider is available
+    have_provider = bool(POLYGON_KEY)
+    try:
+        import databento_adapter
+        if databento_adapter.is_available():
+            have_provider = True
+    except ImportError:
+        pass
+    if not have_provider:
         return None
+
     chain = fetch_polygon_chain(symbol)
     if not chain or spot_price is None:
         return None

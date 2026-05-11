@@ -98,19 +98,36 @@ def overnight_window(target_date_et):
 
 def _get_overnight_bars(target_date_et, contract="ES"):
     """
-    Get overnight bars. Tries Polygon futures first, falls back to ETF proxy.
+    Get overnight bars. Provider priority:
+      1. Databento (real CME futures — best)
+      2. Polygon (index proxy)
+      3. Alpaca ETF proxy (SPY/QQQ extended hours — worst but free)
     Returns list of bar dicts: {t, o, h, l, c, v}
     """
+    # --- Path 1: Databento real futures ---
+    try:
+        import databento_adapter
+        if databento_adapter.is_available():
+            bars = databento_adapter.get_overnight_bars(contract, target_date_et)
+            if bars:
+                # Normalize to expected shape (t, o, h, l, c, v)
+                return [b for b in bars if all(b.get(k) is not None
+                                                 for k in ("o","h","l","c"))]
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
     start_iso, end_iso = overnight_window(target_date_et)
 
+    # --- Path 2: Polygon index ---
     if POLYGON_KEY:
         ticker_map = {
-            "ES":  "I:SPX",   # use SPX index as ES proxy on free Polygon tier
+            "ES":  "I:SPX",
             "NQ":  "I:NDX",
             "RTY": "I:RUT",
         }
         ticker = ticker_map.get(contract, "I:SPX")
-        # Polygon needs unix ms or YYYY-MM-DD
         frm = target_date_et - timedelta(days=1)
         bars = _fetch_polygon_aggs(
             ticker, 5, "minute",
@@ -118,7 +135,6 @@ def _get_overnight_bars(target_date_et, contract="ES"):
             target_date_et.strftime("%Y-%m-%d")
         )
         if bars:
-            # Polygon returns: t, o, h, l, c, v (t in ms)
             normalized = []
             et = pytz.timezone("America/New_York")
             start_dt = datetime.fromisoformat(start_iso)
@@ -133,7 +149,7 @@ def _get_overnight_bars(target_date_et, contract="ES"):
                     })
             return normalized
 
-    # Fallback: ETF proxy via Alpaca
+    # --- Path 3: Alpaca ETF proxy fallback ---
     proxy_map = {"ES": "SPY", "NQ": "QQQ", "RTY": "IWM"}
     proxy = proxy_map.get(contract, "SPY")
     return _fetch_alpaca_extended_hours(proxy, start_iso, end_iso)
