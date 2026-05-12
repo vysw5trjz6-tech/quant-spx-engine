@@ -6860,8 +6860,7 @@ def brief_endpoint():
 def databento_raw_test():
     """
     Runs raw Databento queries and surfaces the ACTUAL error messages from
-    the SDK, not our adapter's filtered version. Use this when /diag shows
-    Databento failures and you need to know exactly why.
+    the SDK, plus the list of accessible datasets and cost estimates.
     """
     out = {"queries": {}}
     try:
@@ -6871,69 +6870,95 @@ def databento_raw_test():
 
         client = db.Historical(os.getenv("DATABENTO_API_KEY"))
         et = pytz.timezone("America/New_York")
-        now = datetime.now(et)
+        today = datetime.now(et).date()
 
-        # Test 1: list available datasets on this account
+        # List accessible datasets
         try:
             datasets = client.metadata.list_datasets()
-            out["available_datasets"] = list(datasets) if datasets else []
+            out["accessible_datasets"] = list(datasets) if datasets else []
         except Exception as e:
-            out["available_datasets_error"] = str(e)
+            out["accessible_datasets_error"] = "{}: {}".format(type(e).__name__, e)
 
-        # Test 2: VX futures (the spot proxy)
+        # Try a tiny cost estimate first
+        try:
+            cost = client.metadata.get_cost(
+                dataset="GLBX.MDP3",
+                symbols=["ES.n.0"],
+                stype_in="continuous",
+                schema="ohlcv-1d",
+                start=(today - timedelta(days=2)).isoformat(),
+                end=today.isoformat(),
+            )
+            out["cost_check_es_1d"] = float(cost)
+        except Exception as e:
+            out["cost_check_es_1d_error"] = "{}: {}".format(type(e).__name__, e)
+
+        # Test: VX futures daily
         try:
             df = client.timeseries.get_range(
                 dataset="XCBF.PITCH",
                 symbols=["VX.c.0"],
                 stype_in="continuous",
-                schema="ohlcv-1h",
-                start=now - timedelta(hours=24),
-                end=now,
+                schema="ohlcv-1d",
+                start=(today - timedelta(days=5)).isoformat(),
+                end=today.isoformat(),
             ).to_df()
-            out["queries"]["vx_futures"] = {
+            out["queries"]["vx_daily"] = {
                 "ok": True, "rows": len(df) if df is not None else 0,
                 "last_close": float(df.iloc[-1]["close"]) if df is not None and not df.empty else None,
             }
         except Exception as e:
-            out["queries"]["vx_futures"] = {"ok": False, "error": str(e)}
+            out["queries"]["vx_daily"] = {
+                "ok": False,
+                "error_type": type(e).__name__,
+                "error": str(e)[:300],
+            }
 
-        # Test 3: ES front month
+        # Test: ES futures daily
         try:
             df = client.timeseries.get_range(
                 dataset="GLBX.MDP3",
-                symbols=["ES.c.0"],
+                symbols=["ES.n.0"],
                 stype_in="continuous",
-                schema="ohlcv-1h",
-                start=now - timedelta(hours=24),
-                end=now,
+                schema="ohlcv-1d",
+                start=(today - timedelta(days=5)).isoformat(),
+                end=today.isoformat(),
             ).to_df()
-            out["queries"]["es_futures"] = {
+            out["queries"]["es_daily"] = {
                 "ok": True, "rows": len(df) if df is not None else 0,
                 "last_close": float(df.iloc[-1]["close"]) if df is not None and not df.empty else None,
             }
         except Exception as e:
-            out["queries"]["es_futures"] = {"ok": False, "error": str(e)}
+            out["queries"]["es_daily"] = {
+                "ok": False,
+                "error_type": type(e).__name__,
+                "error": str(e)[:300],
+            }
 
-        # Test 4: SPY options chain
+        # Test: SPY definitions (smallest OPRA query)
         try:
             df = client.timeseries.get_range(
                 dataset="OPRA.PILLAR",
                 symbols=["SPY.OPT"],
                 stype_in="parent",
-                schema="statistics",
-                start=now - timedelta(days=2),
-                end=now,
+                schema="definition",
+                start=(today - timedelta(days=2)).isoformat(),
+                end=today.isoformat(),
             ).to_df()
-            out["queries"]["spy_chain"] = {
+            out["queries"]["spy_definitions"] = {
                 "ok": True, "rows": len(df) if df is not None else 0,
             }
         except Exception as e:
-            out["queries"]["spy_chain"] = {"ok": False, "error": str(e)}
+            out["queries"]["spy_definitions"] = {
+                "ok": False,
+                "error_type": type(e).__name__,
+                "error": str(e)[:300],
+            }
 
     except ImportError as e:
         out["error"] = "databento SDK not installed: {}".format(e)
     except Exception as e:
-        out["error"] = str(e)
+        out["error"] = "{}: {}".format(type(e).__name__, e)
 
     return jsonify(out)
 

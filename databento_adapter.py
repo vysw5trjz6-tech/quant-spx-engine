@@ -1,20 +1,12 @@
 # databento_adapter.py
-# Unified Databento data adapter using the official Python SDK.
+# Databento data adapter using patterns from Databento's official docs/examples.
 #
 # Provides:
-#   - VIX spot price (real CBOE index, not VIXY proxy)
-#   - Overnight CME futures bars (ES/NQ/RTY/YM)
-#   - Options chain snapshots with OI (for GEX calculation)
+#   - VIX proxy via front-month VX futures (XCBF.PITCH) — VIX index not sold
+#   - Overnight CME futures bars (GLBX.MDP3)
+#   - Daily options statistics with OI (OPRA.PILLAR)
 #
-# Auth: set DATABENTO_API_KEY env var (32-char hex starting with "db-").
-#
-# SDK docs: https://databento.com/docs/api-reference-historical/basics
-#
-# Cost considerations:
-#   - Historical API charges by data volume (bytes)
-#   - We cache aggressively (60s for VIX, 1hr for bars and chains)
-#   - Live streams are flat-rate but we don't use them here yet
-#   - Typical daily spend at our usage: under $1
+# Auth: set DATABENTO_API_KEY env var.
 
 import os
 import json
@@ -24,7 +16,6 @@ import pytz
 
 DATABENTO_KEY = os.getenv("DATABENTO_API_KEY", "").strip()
 
-# Lazy SDK import — module still loads if SDK not installed
 try:
     import databento as _db
     _SDK_AVAILABLE = True
@@ -32,7 +23,6 @@ except ImportError:
     _SDK_AVAILABLE = False
 
 
-# Cached client — reuse connection across calls
 _client = None
 
 
@@ -44,7 +34,8 @@ def _get_client():
     if _client is None:
         try:
             _client = _db.Historical(DATABENTO_KEY)
-        except Exception:
+        except Exception as e:
+            print("[databento] client init failed: {}".format(e))
             _client = None
     return _client
 
@@ -55,7 +46,7 @@ def is_available():
 
 
 # =============================================
-# LOCAL CACHE (so we don't re-bill for same query)
+# LOCAL CACHE
 # =============================================
 
 _DB_CACHE = "databento_cache.db"
@@ -106,94 +97,72 @@ def _cache_set(key, value):
 
 
 # =============================================
-# VIX SPOT
+# VIX SPOT PROXY (via VX front-month futures)
 # =============================================
 #
-# Dataset: OPRA.PILLAR (consolidated US options) — VIX is published as an index
-# Schema: ohlcv-1m
-# Symbol: "VIX" with stype_in="raw_symbol"
+# Databento does not sell the VIX spot index value. VX futures on XCBF.PITCH
+# track spot VIX with a small contango premium that's acceptable for regime
+# classification.
 
 def get_vix_spot():
     """
-    Returns latest VIX-like value as float, or None.
-    Cached 60s.
-
-    IMPORTANT: Databento does NOT sell the VIX spot index — they only sell
-    VIX futures (VX) on dataset XCBF.PITCH. The VIX index itself ($750/mo
-    via CGIF PCAPs) is out of reach for retail.
-
-    We use front-month VX futures as a proxy. Front-month VX tracks spot
-    VIX with a typical 0.5–2 point contango premium, which is acceptable
-    for regime classification. (Compare: VIXY ETF tracks with a ~85% scalar
-    error, which is what was producing the fake VIX 50.)
+    Returns latest VIX proxy (front-month VX futures close), or None.
     """
     client = _get_client()
     if not client:
         return None
 
-    cached = _cache_get("vix_spot", max_age_seconds=60)
+    cached = _cache_get("vix_spot", max_age_seconds=300)
     if cached is not None:
         return cached.get("vix")
 
-    et    = pytz.timezone("America/New_York")
-    end   = datetime.now(et)
-    # VX trades roughly 6:00 PM – 3:15 PM CT next day with a daily break.
-    # Look back 24 hours so we catch the most recent close regardless of
-    # when this is called.
-    start = end - timedelta(hours=24)
+    et = pytz.timezone("America/New_York")
+    today = datetime.now(et).date()
+    start = today - timedelta(days=7)
 
     try:
         df = client.timeseries.get_range(
-            dataset  = "XCBF.PITCH",      # Cboe Futures Exchange
-            symbols  = ["VX.c.0"],         # front-month VIX futures
+            dataset  = "XCBF.PITCH",
+            symbols  = ["VX.c.0"],
             stype_in = "continuous",
-            schema   = "ohlcv-1h",         # hourly is plenty for spot proxy
-            start    = start,
-            end      = end,
+            schema   = "ohlcv-1d",
+            start    = start.isoformat(),
+            end      = today.isoformat(),
         ).to_df()
 
         if df is None or df.empty:
-            print("[databento] VX futures query returned empty — XCBF.PITCH "
-                  "may not be activated on your account")
+            print("[databento] VX futures returned empty - is XCBF.PITCH activated?")
             return None
 
-        # Front-month VX close, in points (e.g. 16.45)
         vx = float(df.iloc[-1]["close"])
-
-        # Sanity: VX ranges 10–80 in normal regimes
         if vx < 8 or vx > 100:
             print("[databento] VX out of range: {}".format(vx))
             return None
 
         _cache_set("vix_spot", {"vix": vx})
         return vx
+
     except Exception as e:
-        print("[databento] VX futures fetch failed: {}".format(e))
+        print("[databento] VX fetch failed ({}): {}".format(type(e).__name__, e))
         return None
 
 
 # =============================================
 # OVERNIGHT FUTURES
 # =============================================
-#
-# Dataset: GLBX.MDP3 (CME Globex full feed)
-# Continuous-contract symbology: ES.c.0 = front month ES auto-rolled
-# Schema: ohlcv-5m
 
 CONTRACT_MAP = {
-    "ES":  "ES.c.0",
-    "NQ":  "NQ.c.0",
-    "RTY": "RTY.c.0",
-    "YM":  "YM.c.0",
+    "ES":  "ES.n.0",
+    "NQ":  "NQ.n.0",
+    "RTY": "RTY.n.0",
+    "YM":  "YM.n.0",
 }
 
 
 def get_overnight_bars(contract="ES", target_date_et=None):
     """
-    Fetch 5-min bars for the overnight session leading into target_date_et.
-    Overnight = previous day's 4:15 PM ET → today's 9:30 AM ET.
-
-    Returns list of bars: [{t, o, h, l, c, v}, ...] in chronological order.
+    Fetch hourly bars for the overnight session leading into target_date_et.
+    Returns list of bars: [{t, o, h, l, c, v}, ...]
     """
     client = _get_client()
     if not client:
@@ -203,93 +172,62 @@ def get_overnight_bars(contract="ES", target_date_et=None):
     if target_date_et is None:
         target_date_et = datetime.now(et).date()
 
-    # Previous trading day
     prev = target_date_et - timedelta(days=1)
     while prev.weekday() >= 5:
         prev -= timedelta(days=1)
 
-    start = et.localize(datetime.combine(prev, dtime(16, 15)))
-    end   = et.localize(datetime.combine(target_date_et, dtime(9, 30)))
+    start_iso = (prev.isoformat() + "T20:00:00")
+    end_iso   = (target_date_et.isoformat() + "T14:30:00")
 
     cache_key = "on_{}_{}".format(contract, target_date_et.isoformat())
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("bars", [])
 
-    symbol = CONTRACT_MAP.get(contract, "ES.c.0")
+    symbol = CONTRACT_MAP.get(contract, "ES.n.0")
+    try:
+        df = client.timeseries.get_range(
+            dataset  = "GLBX.MDP3",
+            symbols  = [symbol],
+            stype_in = "continuous",
+            schema   = "ohlcv-1h",
+            start    = start_iso,
+            end      = end_iso,
+        ).to_df()
 
-    def _try_fetch(s, e, schema_str):
-        try:
-            df = client.timeseries.get_range(
-                dataset  = "GLBX.MDP3",
-                symbols  = [symbol],
-                stype_in = "continuous",
-                schema   = schema_str,
-                start    = s,
-                end      = e,
-            ).to_df()
-            return df
-        except Exception as exc:
-            print("[databento] {} fetch attempt failed: {}".format(contract, exc))
-            return None
+        if df is None or df.empty:
+            print("[databento] {} overnight empty. Window: {} -> {}".format(
+                contract, start_iso, end_iso))
+            return []
 
-    # Attempt 1: original window (prev close +45min → today 9:30)
-    df = _try_fetch(start, end, "ohlcv-5m")
+        bars = []
+        for ts, row in df.iterrows():
+            bars.append({
+                "t": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "o": float(row["open"]),
+                "h": float(row["high"]),
+                "l": float(row["low"]),
+                "c": float(row["close"]),
+                "v": int(row.get("volume", 0)),
+            })
 
-    # Attempt 2: wider window (previous trading day 18:00 → today 9:30)
-    if df is None or df.empty:
-        wider_start = et.localize(datetime.combine(prev, dtime(18, 0)))
-        print("[databento] {} 5m empty in tight window, retrying wider".format(contract))
-        df = _try_fetch(wider_start, end, "ohlcv-5m")
+        _cache_set(cache_key, {"bars": bars})
+        return bars
 
-    # Attempt 3: 1h schema in case 5m has gaps in the data range
-    if df is None or df.empty:
-        wider_start = et.localize(datetime.combine(prev, dtime(18, 0)))
-        print("[databento] {} 5m empty, falling back to 1h bars".format(contract))
-        df = _try_fetch(wider_start, end, "ohlcv-1h")
-
-    if df is None or df.empty:
-        print("[databento] {} overnight: no bars in any window. "
-              "Check GLBX.MDP3 is activated on your account.".format(contract))
+    except Exception as e:
+        print("[databento] {} overnight failed ({}): {}".format(
+            contract, type(e).__name__, e))
         return []
 
-    # Convert DataFrame to the same dict shape the rest of the codebase
-    # expects from Alpaca bars: {t, o, h, l, c, v}
-    bars = []
-    for ts, row in df.iterrows():
-        bars.append({
-            "t": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
-            "o": float(row["open"]),
-            "h": float(row["high"]),
-            "l": float(row["low"]),
-            "c": float(row["close"]),
-            "v": int(row.get("volume", 0)),
-        })
-
-    _cache_set(cache_key, {"bars": bars})
-    return bars
-
 
 # =============================================
-# OPTIONS CHAIN (for GEX)
+# OPTIONS CHAIN with OI (for GEX)
 # =============================================
-#
-# Dataset: OPRA.PILLAR (consolidated US options feed)
-# Schema: "statistics" gives daily OI per contract
-# Symbology: parent-symbol resolution — passing "SPY.OPT" with
-# stype_in="parent" returns every SPY option contract.
-#
-# Returns: list of {strike, expiry, type, open_interest, implied_volatility}
 
 def get_options_chain_snapshot(underlying, target_date_et=None,
                                  expiries_ahead=3):
     """
-    Returns EOD options chain for the underlying, covering the next N
-    nearest expiries.
-
-    Includes open interest (essential for GEX). IV is left as None; the
-    caller computes gamma via Black-Scholes using OI + strike + spot, which
-    is the standard SpotGamma-style approach.
+    Returns EOD options chain with open interest.
     """
     client = _get_client()
     if not client:
@@ -304,87 +242,101 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     if cached:
         return cached.get("chain", [])
 
-    # EOD snapshot window
-    snap_time = et.localize(datetime.combine(target_date_et, dtime(16, 0)))
-    start = snap_time - timedelta(hours=1)
-    end   = snap_time + timedelta(minutes=30)
+    start_iso = (target_date_et - timedelta(days=2)).isoformat()
+    end_iso   = target_date_et.isoformat()
+    parent    = underlying + ".OPT"
 
     try:
-        df = client.timeseries.get_range(
+        def_df = client.timeseries.get_range(
             dataset  = "OPRA.PILLAR",
-            symbols  = [underlying + ".OPT"],
+            symbols  = [parent],
             stype_in = "parent",
-            schema   = "statistics",
-            start    = start,
-            end      = end,
+            schema   = "definition",
+            start    = start_iso,
+            end      = end_iso,
         ).to_df()
 
-        if df is None or df.empty:
-            print("[databento] {} chain returned empty DataFrame".format(underlying))
+        if def_df is None or def_df.empty:
+            print("[databento] {} definitions empty".format(underlying))
             return []
 
-        # Filter to open-interest records.
-        # Databento statistics schema: stat_type=9 is daily open interest.
-        if "stat_type" in df.columns:
-            oi_records = df[df["stat_type"] == 9]
-        else:
-            oi_records = df
-
-        chain = []
-        for _, row in oi_records.iterrows():
+        inst_meta = {}
+        for _, row in def_df.iterrows():
             try:
-                strike = float(row.get("strike_price",
-                                        row.get("strike", 0)))
-                if strike == 0:
-                    # Manual parse from raw_symbol fallback
-                    sym = str(row.get("raw_symbol", row.get("symbol", "")))
-                    if len(sym) < 15:
-                        continue
-                    cp_idx = max(sym.rfind("C"), sym.rfind("P"))
-                    if cp_idx < 6:
-                        continue
-                    strike = int(sym[cp_idx+1:cp_idx+9]) / 1000.0
+                iid = int(row.get("instrument_id"))
+                strike = row.get("strike_price")
+                if strike is None:
+                    continue
+                strike = float(strike)
+                if strike > 100000:
+                    strike = strike / 1e9
 
-                exp_val = row.get("expiration") or row.get("expiry")
-                if exp_val is not None and hasattr(exp_val, "date"):
-                    expiry = exp_val.date().isoformat()
-                elif exp_val:
-                    expiry = str(exp_val)[:10]
+                expiry = row.get("expiration")
+                if expiry is not None and hasattr(expiry, "date"):
+                    expiry_str = expiry.date().isoformat()
+                elif expiry:
+                    expiry_str = str(expiry)[:10]
                 else:
-                    sym = str(row.get("raw_symbol", row.get("symbol", "")))
-                    cp_idx = max(sym.rfind("C"), sym.rfind("P"))
-                    yy = int(sym[cp_idx-6:cp_idx-4])
-                    mm = int(sym[cp_idx-4:cp_idx-2])
-                    dd = int(sym[cp_idx-2:cp_idx])
-                    expiry = "{:04d}-{:02d}-{:02d}".format(2000+yy, mm, dd)
+                    continue
 
-                opt_type_raw = row.get("instrument_class") or \
-                               row.get("option_type")
-                if opt_type_raw:
-                    s = str(opt_type_raw).upper()
-                    opt_type = "call" if s.startswith("C") else \
-                               "put"  if s.startswith("P") else None
-                else:
-                    sym = str(row.get("raw_symbol", row.get("symbol", "")))
-                    cp_idx = max(sym.rfind("C"), sym.rfind("P"))
-                    opt_type = "call" if sym[cp_idx] == "C" else "put"
-
+                inst_class = str(row.get("instrument_class", "")).upper()
+                opt_type = "call" if "C" in inst_class else \
+                           "put"  if "P" in inst_class else None
                 if not opt_type:
                     continue
 
-                oi = int(row.get("quantity", 0))
-                if oi <= 0:
-                    continue
-
-                chain.append({
-                    "strike":             strike,
-                    "expiry":             expiry,
-                    "type":               opt_type,
-                    "open_interest":      oi,
-                    "implied_volatility": None,  # caller uses BS gamma
-                })
+                inst_meta[iid] = {
+                    "strike": strike,
+                    "expiry": expiry_str,
+                    "type":   opt_type,
+                }
             except Exception:
                 continue
+
+        if not inst_meta:
+            print("[databento] {} no parseable definitions".format(underlying))
+            return []
+
+        stats_df = client.timeseries.get_range(
+            dataset  = "OPRA.PILLAR",
+            symbols  = [parent],
+            stype_in = "parent",
+            schema   = "statistics",
+            start    = start_iso,
+            end      = end_iso,
+        ).to_df()
+
+        if stats_df is None or stats_df.empty:
+            print("[databento] {} statistics empty".format(underlying))
+            return []
+
+        if "stat_type" in stats_df.columns:
+            oi_df = stats_df[stats_df["stat_type"] == 9]
+        else:
+            oi_df = stats_df
+
+        oi_by_inst = {}
+        for _, row in oi_df.iterrows():
+            try:
+                iid = int(row.get("instrument_id"))
+                qty = int(row.get("quantity", 0))
+                if qty > 0:
+                    oi_by_inst[iid] = qty
+            except Exception:
+                continue
+
+        chain = []
+        for iid, oi in oi_by_inst.items():
+            meta = inst_meta.get(iid)
+            if not meta:
+                continue
+            chain.append({
+                "strike":              meta["strike"],
+                "expiry":              meta["expiry"],
+                "type":                meta["type"],
+                "open_interest":       oi,
+                "implied_volatility":  None,
+            })
 
         if chain:
             chain.sort(key=lambda x: x["expiry"])
@@ -394,8 +346,10 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
 
         _cache_set(cache_key, {"chain": chain})
         return chain
+
     except Exception as e:
-        print("[databento] {} chain fetch failed: {}".format(underlying, e))
+        print("[databento] {} chain failed ({}): {}".format(
+            underlying, type(e).__name__, e))
         return []
 
 
@@ -403,8 +357,35 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
 # DIAGNOSTICS
 # =============================================
 
+def list_available_datasets():
+    """Returns list of dataset IDs the account can access."""
+    client = _get_client()
+    if not client:
+        return []
+    try:
+        return list(client.metadata.list_datasets())
+    except Exception as e:
+        print("[databento] list_datasets failed: {}".format(e))
+        return []
+
+
+def get_cost_estimate(dataset, symbols, schema, start, end, stype_in="continuous"):
+    """Returns estimated USD cost for a query before running it."""
+    client = _get_client()
+    if not client:
+        return None
+    try:
+        cost = client.metadata.get_cost(
+            dataset=dataset, symbols=symbols, schema=schema,
+            start=start, end=end, stype_in=stype_in,
+        )
+        return float(cost)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def diagnostic():
-    """Returns status of all 3 capabilities."""
+    """Comprehensive status check."""
     out = {
         "sdk_installed": _SDK_AVAILABLE,
         "key_set":       bool(DATABENTO_KEY),
@@ -414,8 +395,10 @@ def diagnostic():
         if not _SDK_AVAILABLE:
             out["note"] = "Install databento SDK: pip install databento"
         elif not DATABENTO_KEY:
-            out["note"] = "Set DATABENTO_API_KEY env var to enable."
+            out["note"] = "Set DATABENTO_API_KEY env var."
         return out
+
+    out["accessible_datasets"] = list_available_datasets()
 
     try:
         vix = get_vix_spot()
@@ -426,7 +409,7 @@ def diagnostic():
         bars = get_overnight_bars("ES")
         out["es_overnight_bars"] = len(bars) if bars else 0
         if bars:
-            out["es_overnight_sample"] = bars[-1]
+            out["es_overnight_last"] = bars[-1]
     except Exception as e:
         out["es_error"] = str(e)
     try:
