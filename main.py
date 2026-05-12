@@ -133,7 +133,7 @@ SWING_UNIVERSE = [
     "SPY", "QQQ", "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
 ]
 
-# Alias used by run_swing_scan
+# Alias used by run_swing_scan  [FIX 1: confirmed -- ensures symbol list is found]
 SWING_SYMBOLS = SWING_UNIVERSE
 
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
@@ -3358,20 +3358,24 @@ def detect_oneil_pivot(daily, weekly=None):
 
     atr_base  = _atr(base_bars,  min(14, len(base_bars)))
     atr_prior = _atr(prior_bars, min(14, len(prior_bars)))
-    if atr_prior > 0 and atr_base / atr_prior > 0.85:
+    # FIX 3: raised threshold 0.85 -> 0.92 (was rejecting valid bases with only 8-14%
+    # ATR contraction; volatile markets often can't clear the original 15% bar)
+    if atr_prior > 0 and atr_base / atr_prior > 0.92:
         return None   # ATR not contracted enough -- not a tight base
 
-    # 3. Breakout above base high (pivot) -- check today or last 1-2 days
+    # 3. Breakout above base high (pivot) -- check today or last 7 days
+    # FIX 4: extended lookback range(0,4) -> range(0,8) so we catch breakouts
+    # up to 7 days old that are still holding above the pivot (valid continuation entries)
     today = daily[-1]
     pivot_broken = False
     days_since_breakout = 0
 
-    for lookback_days in range(0, 4):
+    for lookback_days in range(0, 8):
         bar = daily[-(1 + lookback_days)]
         vol_ratio = bar["v"] / avg_vol_50 if avg_vol_50 > 0 else 0
         if bar["h"] > base_high and bar["c"] > base_high * 0.995:
             if vol_ratio >= 1.40:   # 40%+ above average (O'Neil requirement)
-                pivot_broken       = True
+                pivot_broken        = True
                 days_since_breakout = lookback_days
                 breakout_vol_ratio  = vol_ratio
                 break
@@ -3386,10 +3390,11 @@ def detect_oneil_pivot(daily, weekly=None):
     if close_rank < 0.50:   # closed in lower half of range = weak
         return None
 
-    # 5. Weinstein Stage 2 filter
+    # 5. FIX 2: Weinstein Stage 1 or 2 filter (was Stage 2 only -- Stage 1 base
+    # breakouts are valid setups and were being rejected across the board)
     stage, sma_rising = weinstein_stage(daily, weekly)
-    if stage not in (2,):
-        return None   # only take Stage 2 breakouts
+    if stage not in (1, 2):
+        return None
 
     # Probability calculation (O'Neil-calibrated)
     prob = 62
@@ -3398,6 +3403,7 @@ def detect_oneil_pivot(daily, weekly=None):
     if days_since_breakout == 0:    prob += 5    # fresh breakout today
     if close_rank >= 0.80:          prob += 4    # closed at top of range
     if atr_base / (atr_prior + 0.001) < 0.60:   prob += 3   # very tight base
+    if stage == 1:                  prob -= 4    # slight haircut vs confirmed Stage 2
     prob = min(prob, 82)
 
     # Swing low = base low (stop placement)
@@ -3428,8 +3434,8 @@ def detect_oneil_pivot(daily, weekly=None):
         "pivot":         round(base_high, 2),
         "close_rank":    round(close_rank * 100, 1),
         "stage":         stage,
-        "notes":         "Base: {:.0f}wks | Pivot: ${:.2f} | Vol: {:.1f}x | Close rank: {:.0f}%".format(
-                            base_weeks, base_high, breakout_vol_ratio, close_rank * 100),
+        "notes":         "Base: {:.0f}wks | Pivot: ${:.2f} | Vol: {:.1f}x | Close rank: {:.0f}% | Stage {}".format(
+                            base_weeks, base_high, breakout_vol_ratio, close_rank * 100, stage),
     }
 
 
@@ -3518,17 +3524,23 @@ def detect_wyckoff_spring(daily, weekly=None):
         return None
 
     # Check recovery volume is higher (Sign of Strength)
+    # FIX 6: lowered recovery vol threshold from 0.9x to 0.75x avg_vol
+    # Large-caps and ETFs rarely show dramatic recovery volume; 0.75x is still
+    # meaningful confirmation that sellers are not in control
     recent_bars    = daily[spring_idx + 1:]
     if recent_bars:
         recovery_vol   = statistics.mean([b["v"] for b in recent_bars])
-        vol_expanding  = recovery_vol > avg_vol * 0.9
+        vol_expanding  = recovery_vol > avg_vol * 0.75
     else:
         vol_expanding  = False
 
     # Weinstein Stage: spring should occur in Stage 1/2 (accumulation zone)
+    # FIX 2: changed from stage==4 exclusion to requiring stage in (1,2)
+    # Wyckoff springs by definition happen during accumulation (Stage 1) or
+    # early markup (Stage 2) -- Stage 3/4 springs are bear-market traps
     stage, _ = weinstein_stage(daily, weekly)
-    if stage == 4:
-        return None   # don't buy a spring in a confirmed downtrend
+    if stage not in (1, 2):
+        return None
 
     # Count support touches for probability calibration
     support_touches = sum(1 for l in lows if abs(l - support) / support < 0.015)
@@ -3607,9 +3619,11 @@ def detect_52w_breakout(daily, weekly=None):
     if price < high_all * 0.95:
         return None
 
-    # 2. Tight consolidation: >= 15 bars (3 weeks) within 10% of high
-    tight_bars = [b for b in daily[-50:] if b["c"] >= high_all * 0.90]
-    if len(tight_bars) < 15:
+    # 2. FIX 5: Tight consolidation relaxed from 15 bars/90% to 10 bars/88%
+    # Original requirement was too strict: many valid setups form bases with
+    # slightly wider ranges or fewer bars, especially in volatile markets
+    tight_bars = [b for b in daily[-50:] if b["c"] >= high_all * 0.88]
+    if len(tight_bars) < 10:
         return None
 
     # 3. Volume contraction during consolidation
@@ -3727,9 +3741,11 @@ def detect_earnings_continuation(daily, weekly=None):
     if pullback > 0.40:
         return None
 
-    # Stage 2 filter (only take CALL continuations in Stage 2)
+    # FIX 2: Accept Stage 1 and Stage 2 for CALL continuations (was Stage 2 only)
+    # Earnings gaps in Stage 1 can be valid re-ratings from a basing phase;
+    # only Stage 3 (topping) and Stage 4 (decline) should be excluded
     stage, _ = weinstein_stage(daily, None)
-    if direction == "CALL" and stage not in (2,):
+    if direction == "CALL" and stage not in (1, 2):
         return None
 
     # Probability (O'Neil / Zacks calibrated)
@@ -3737,6 +3753,7 @@ def detect_earnings_continuation(daily, weekly=None):
     prob += max(0, 12 - days_since)
     prob += 8 if pullback < 0.15 else 0
     prob += 5 if earn_gap > 6.0  else 0
+    if stage == 1: prob -= 3   # slight haircut for Stage 1 vs Stage 2
     prob  = min(prob, 82)
 
     pre_earn   = daily[max(0, earn_idx - 10):earn_idx]
@@ -4694,7 +4711,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
     <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
     <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
     <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
-    &nbsp;&nbsp;|&nbsp;&nbsp; All signals Stage-2 filtered &nbsp;|&nbsp;&nbsp;
+    &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
     Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Delta ~0.55, 2-week options
   </div>
   {cards}
