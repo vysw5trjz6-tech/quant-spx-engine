@@ -106,45 +106,17 @@ def _cache_set(key, value):
 
 def get_vix_spot():
     """
-    Returns latest VIX proxy (front-month VX futures close), or None.
+    DEPRECATED: Databento does not sell the VIX spot index.
+
+    VX futures on XCBF.PITCH require a paid live license per their API:
+        "A live data license is required to access XCBF.PITCH data
+         after 2026-05-11T22:00:00Z"
+
+    VIX index is now fetched via Yahoo Finance in regime_filter.py.
+    This stub returns None so any legacy caller falls through to
+    regime_filter's Yahoo path.
     """
-    client = _get_client()
-    if not client:
-        return None
-
-    cached = _cache_get("vix_spot", max_age_seconds=300)
-    if cached is not None:
-        return cached.get("vix")
-
-    et = pytz.timezone("America/New_York")
-    today = datetime.now(et).date()
-    start = today - timedelta(days=7)
-
-    try:
-        df = client.timeseries.get_range(
-            dataset  = "XCBF.PITCH",
-            symbols  = ["VX.c.0"],
-            stype_in = "continuous",
-            schema   = "ohlcv-1d",
-            start    = start.isoformat(),
-            end      = today.isoformat(),
-        ).to_df()
-
-        if df is None or df.empty:
-            print("[databento] VX futures returned empty - is XCBF.PITCH activated?")
-            return None
-
-        vx = float(df.iloc[-1]["close"])
-        if vx < 8 or vx > 100:
-            print("[databento] VX out of range: {}".format(vx))
-            return None
-
-        _cache_set("vix_spot", {"vix": vx})
-        return vx
-
-    except Exception as e:
-        print("[databento] VX fetch failed ({}): {}".format(type(e).__name__, e))
-        return None
+    return None
 
 
 # =============================================
@@ -399,12 +371,10 @@ def diagnostic():
         return out
 
     out["accessible_datasets"] = list_available_datasets()
+    out["vix_note"] = ("VIX index is fetched via Yahoo Finance in regime_filter.py. "
+                       "Databento doesn't sell the spot VIX value; XCBF.PITCH "
+                       "futures require paid live license.")
 
-    try:
-        vix = get_vix_spot()
-        out["vix"] = vix
-    except Exception as e:
-        out["vix_error"] = str(e)
     try:
         bars = get_overnight_bars("ES")
         out["es_overnight_bars"] = len(bars) if bars else 0

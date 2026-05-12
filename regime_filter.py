@@ -96,30 +96,34 @@ def get_current_vix():
     Fetch the latest VIX quote.
 
     Source priority:
-      1. Databento real VIX (most accurate)
-      2. VIXY ETF as proxy (only used if VIXY × 1.85 produces a sane value)
+      1. Yahoo Finance (real VIX index, free, 15-min delayed)
+      2. VIXY ETF as last-resort proxy with tight sanity guard
       3. None (caller uses realized vol fallback)
 
-    Sanity guard: VIXY proxy is unreliable above ~30. The historical VIXY
-    × 1.85 scalar breaks down in high-vol regimes — it overstates VIX.
-    If the proxy returns > 35, refuse rather than report a value that
-    will keep regime stuck on CRISIS.
-    """
-    # --- Path 1: Databento real VIX ---
-    try:
-        import databento_adapter
-        if databento_adapter.is_available():
-            vix = databento_adapter.get_vix_spot()
-            if vix and 5 <= vix <= 80:
-                return vix
-            # Databento configured but returned nothing — log it
-            print("[regime] Databento VIX query returned: {} (rejected or empty)".format(vix))
-    except ImportError:
-        pass
-    except Exception as e:
-        print("[regime] Databento VIX error: {}".format(e))
+    NOTE: Databento does NOT sell the VIX spot index — they only sell VIX
+    futures (VX) on XCBF.PITCH which requires a paid live license. So
+    Databento is intentionally NOT in the VIX path here.
 
-    # --- Path 2: VIXY ETF as proxy ---
+    Yahoo's ^VIX is the actual CBOE VIX index value, 15-min delayed during
+    RTH and EOD-current outside RTH. Fine for our pre-market regime alert.
+    """
+    # --- Path 1: Yahoo Finance ---
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("^VIX")
+        # 5 days gives us yesterday's close even on weekends/holidays
+        hist = ticker.history(period="5d", interval="1d")
+        if hist is not None and not hist.empty:
+            vix = float(hist["Close"].iloc[-1])
+            if 5 <= vix <= 80:
+                return vix
+            print("[regime] Yahoo VIX out of range: {}".format(vix))
+    except ImportError:
+        print("[regime] yfinance not installed — falling back to VIXY proxy")
+    except Exception as e:
+        print("[regime] Yahoo VIX fetch failed: {}".format(e))
+
+    # --- Path 2: VIXY ETF as proxy (last resort, tightly bounded) ---
     try:
         et    = pytz.timezone("America/New_York")
         end   = datetime.now(et)
@@ -141,16 +145,9 @@ def get_current_vix():
         vixy_close = bars[-1]["c"]
         est_vix    = vixy_close * 1.85
 
-        # Tightened sanity guard: VIXY proxy unreliable above ~35.
-        # When VIX is genuinely > 30, you'd see it confirmed in news and on
-        # realized vol. Without that confirmation, treat high proxy reads
-        # as a calibration failure rather than a regime signal.
-        if est_vix > 35:
-            print("[regime] VIXY proxy gave VIX={:.1f} — rejecting "
-                  "(outside reliable proxy range). VIXY close was ${:.2f}".format(
-                  est_vix, vixy_close))
-            return None
-        if est_vix < 5:
+        # Tight guard: VIXY × 1.85 only valid roughly 12-25 range
+        if est_vix > 35 or est_vix < 5:
+            print("[regime] VIXY proxy rejected: VIX={:.1f}".format(est_vix))
             return None
         return est_vix
     except Exception:
