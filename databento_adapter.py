@@ -115,8 +115,17 @@ def _cache_set(key, value):
 
 def get_vix_spot():
     """
-    Returns latest VIX close as float, or None.
+    Returns latest VIX-like value as float, or None.
     Cached 60s.
+
+    IMPORTANT: Databento does NOT sell the VIX spot index — they only sell
+    VIX futures (VX) on dataset XCBF.PITCH. The VIX index itself ($750/mo
+    via CGIF PCAPs) is out of reach for retail.
+
+    We use front-month VX futures as a proxy. Front-month VX tracks spot
+    VIX with a typical 0.5–2 point contango premium, which is acceptable
+    for regime classification. (Compare: VIXY ETF tracks with a ~85% scalar
+    error, which is what was producing the fake VIX 50.)
     """
     client = _get_client()
     if not client:
@@ -128,34 +137,38 @@ def get_vix_spot():
 
     et    = pytz.timezone("America/New_York")
     end   = datetime.now(et)
-    start = end - timedelta(minutes=30)
+    # VX trades roughly 6:00 PM – 3:15 PM CT next day with a daily break.
+    # Look back 24 hours so we catch the most recent close regardless of
+    # when this is called.
+    start = end - timedelta(hours=24)
 
     try:
         df = client.timeseries.get_range(
-            dataset  = "OPRA.PILLAR",
-            symbols  = ["VIX"],
-            stype_in = "raw_symbol",
-            schema   = "ohlcv-1m",
+            dataset  = "XCBF.PITCH",      # Cboe Futures Exchange
+            symbols  = ["VX.c.0"],         # front-month VIX futures
+            stype_in = "continuous",
+            schema   = "ohlcv-1h",         # hourly is plenty for spot proxy
             start    = start,
             end      = end,
         ).to_df()
 
         if df is None or df.empty:
-            print("[databento] VIX query returned empty DataFrame")
+            print("[databento] VX futures query returned empty — XCBF.PITCH "
+                  "may not be activated on your account")
             return None
 
-        # SDK returns DataFrame with prices already scaled (no manual /1e9)
-        vix = float(df.iloc[-1]["close"])
+        # Front-month VX close, in points (e.g. 16.45)
+        vx = float(df.iloc[-1]["close"])
 
-        # Sanity: VIX is conventionally 5–80 outside extreme events
-        if vix < 1 or vix > 100:
-            print("[databento] VIX out of range: {}".format(vix))
+        # Sanity: VX ranges 10–80 in normal regimes
+        if vx < 8 or vx > 100:
+            print("[databento] VX out of range: {}".format(vx))
             return None
 
-        _cache_set("vix_spot", {"vix": vix})
-        return vix
+        _cache_set("vix_spot", {"vix": vx})
+        return vx
     except Exception as e:
-        print("[databento] VIX fetch failed: {}".format(e))
+        print("[databento] VX futures fetch failed: {}".format(e))
         return None
 
 
@@ -204,38 +217,57 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         return cached.get("bars", [])
 
     symbol = CONTRACT_MAP.get(contract, "ES.c.0")
-    try:
-        df = client.timeseries.get_range(
-            dataset  = "GLBX.MDP3",
-            symbols  = [symbol],
-            stype_in = "continuous",
-            schema   = "ohlcv-5m",
-            start    = start,
-            end      = end,
-        ).to_df()
 
-        if df is None or df.empty:
-            print("[databento] {} overnight returned empty DataFrame".format(contract))
-            return []
+    def _try_fetch(s, e, schema_str):
+        try:
+            df = client.timeseries.get_range(
+                dataset  = "GLBX.MDP3",
+                symbols  = [symbol],
+                stype_in = "continuous",
+                schema   = schema_str,
+                start    = s,
+                end      = e,
+            ).to_df()
+            return df
+        except Exception as exc:
+            print("[databento] {} fetch attempt failed: {}".format(contract, exc))
+            return None
 
-        # Convert DataFrame to the same dict shape the rest of the codebase
-        # expects from Alpaca bars: {t, o, h, l, c, v}
-        bars = []
-        for ts, row in df.iterrows():
-            bars.append({
-                "t": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
-                "o": float(row["open"]),
-                "h": float(row["high"]),
-                "l": float(row["low"]),
-                "c": float(row["close"]),
-                "v": int(row.get("volume", 0)),
-            })
+    # Attempt 1: original window (prev close +45min → today 9:30)
+    df = _try_fetch(start, end, "ohlcv-5m")
 
-        _cache_set(cache_key, {"bars": bars})
-        return bars
-    except Exception as e:
-        print("[databento] {} overnight fetch failed: {}".format(contract, e))
+    # Attempt 2: wider window (previous trading day 18:00 → today 9:30)
+    if df is None or df.empty:
+        wider_start = et.localize(datetime.combine(prev, dtime(18, 0)))
+        print("[databento] {} 5m empty in tight window, retrying wider".format(contract))
+        df = _try_fetch(wider_start, end, "ohlcv-5m")
+
+    # Attempt 3: 1h schema in case 5m has gaps in the data range
+    if df is None or df.empty:
+        wider_start = et.localize(datetime.combine(prev, dtime(18, 0)))
+        print("[databento] {} 5m empty, falling back to 1h bars".format(contract))
+        df = _try_fetch(wider_start, end, "ohlcv-1h")
+
+    if df is None or df.empty:
+        print("[databento] {} overnight: no bars in any window. "
+              "Check GLBX.MDP3 is activated on your account.".format(contract))
         return []
+
+    # Convert DataFrame to the same dict shape the rest of the codebase
+    # expects from Alpaca bars: {t, o, h, l, c, v}
+    bars = []
+    for ts, row in df.iterrows():
+        bars.append({
+            "t": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+            "o": float(row["open"]),
+            "h": float(row["high"]),
+            "l": float(row["low"]),
+            "c": float(row["close"]),
+            "v": int(row.get("volume", 0)),
+        })
+
+    _cache_set(cache_key, {"bars": bars})
+    return bars
 
 
 # =============================================

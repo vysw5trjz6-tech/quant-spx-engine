@@ -6856,6 +6856,88 @@ def brief_endpoint():
     })
 
 
+@app.route("/databento-test")
+def databento_raw_test():
+    """
+    Runs raw Databento queries and surfaces the ACTUAL error messages from
+    the SDK, not our adapter's filtered version. Use this when /diag shows
+    Databento failures and you need to know exactly why.
+    """
+    out = {"queries": {}}
+    try:
+        import databento as db
+        if not os.getenv("DATABENTO_API_KEY", "").strip():
+            return jsonify({"error": "DATABENTO_API_KEY not set"})
+
+        client = db.Historical(os.getenv("DATABENTO_API_KEY"))
+        et = pytz.timezone("America/New_York")
+        now = datetime.now(et)
+
+        # Test 1: list available datasets on this account
+        try:
+            datasets = client.metadata.list_datasets()
+            out["available_datasets"] = list(datasets) if datasets else []
+        except Exception as e:
+            out["available_datasets_error"] = str(e)
+
+        # Test 2: VX futures (the spot proxy)
+        try:
+            df = client.timeseries.get_range(
+                dataset="XCBF.PITCH",
+                symbols=["VX.c.0"],
+                stype_in="continuous",
+                schema="ohlcv-1h",
+                start=now - timedelta(hours=24),
+                end=now,
+            ).to_df()
+            out["queries"]["vx_futures"] = {
+                "ok": True, "rows": len(df) if df is not None else 0,
+                "last_close": float(df.iloc[-1]["close"]) if df is not None and not df.empty else None,
+            }
+        except Exception as e:
+            out["queries"]["vx_futures"] = {"ok": False, "error": str(e)}
+
+        # Test 3: ES front month
+        try:
+            df = client.timeseries.get_range(
+                dataset="GLBX.MDP3",
+                symbols=["ES.c.0"],
+                stype_in="continuous",
+                schema="ohlcv-1h",
+                start=now - timedelta(hours=24),
+                end=now,
+            ).to_df()
+            out["queries"]["es_futures"] = {
+                "ok": True, "rows": len(df) if df is not None else 0,
+                "last_close": float(df.iloc[-1]["close"]) if df is not None and not df.empty else None,
+            }
+        except Exception as e:
+            out["queries"]["es_futures"] = {"ok": False, "error": str(e)}
+
+        # Test 4: SPY options chain
+        try:
+            df = client.timeseries.get_range(
+                dataset="OPRA.PILLAR",
+                symbols=["SPY.OPT"],
+                stype_in="parent",
+                schema="statistics",
+                start=now - timedelta(days=2),
+                end=now,
+            ).to_df()
+            out["queries"]["spy_chain"] = {
+                "ok": True, "rows": len(df) if df is not None else 0,
+            }
+        except Exception as e:
+            out["queries"]["spy_chain"] = {"ok": False, "error": str(e)}
+
+    except ImportError as e:
+        out["error"] = "databento SDK not installed: {}".format(e)
+    except Exception as e:
+        out["error"] = str(e)
+
+    return jsonify(out)
+
+
 @app.route("/diag")
 def diag_endpoint():
     """
