@@ -4896,8 +4896,10 @@ def background_scheduler():
         threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
     if boot_hour >= 8.0:
         threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
-    if boot_hour >= 8.5:
-        # Boot after the premarket-brief window — fire one now
+    # Brief on boot ONLY if we're in the pre-open window (8:30 AM – 10:30 AM ET)
+    # AND we haven't already sent today's brief. Outside that window, wait
+    # for tomorrow's 8:30 AM schedule.
+    if 8.5 <= boot_hour <= 10.5:
         threading.Thread(target=run_premarket_brief, daemon=True).start()
     if boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
@@ -4908,7 +4910,7 @@ def background_scheduler():
     _daily_refresh_done["date"]      = today_str
     _daily_refresh_done["earnings"]  = boot_hour >= 6.0
     _daily_refresh_done["vol"]       = boot_hour >= 8.0
-    _daily_refresh_done["premarket"] = boot_hour >= 8.5
+    _daily_refresh_done["premarket"] = (boot_hour >= 8.5)  # mark sent if boot was in or past window
     _daily_refresh_done["gex"]       = boot_hour >= 16.5
     _daily_refresh_done["iv"]        = boot_hour >= 16.25
     _premarket_done["date"]          = today_str if boot_hour >= 9.4 else None
@@ -6852,6 +6854,87 @@ def brief_endpoint():
         "operating_mode": OPERATING_MODE,
         "note":           "Premarket brief queued. Check Telegram in ~30s.",
     })
+
+
+@app.route("/diag")
+def diag_endpoint():
+    """
+    Comprehensive live diagnostic. Runs actual queries against each data
+    source and reports what's working vs. broken.
+    """
+    out = {
+        "operating_mode": OPERATING_MODE,
+        "modules": {
+            "volume_truth":     HAS_VOLUME_TRUTH,
+            "safety_gates":     HAS_SAFETY_GATES,
+            "regime_filter":    HAS_REGIME,
+            "overnight":        HAS_OVERNIGHT,
+            "gamma_exposure":   HAS_GEX,
+            "new_strategies":   HAS_NEW_STRATS,
+            "iv_rank":          HAS_IV_RANK,
+        },
+        "api_keys": {
+            "alpaca":    bool(os.getenv("APCA_API_KEY_ID", "").strip()),
+            "anthropic": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+            "telegram":  bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
+            "databento": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
+            "polygon":   bool(os.getenv("POLYGON_API_KEY", "").strip()),
+            "fmp":       bool(os.getenv("FMP_API_KEY", "").strip()),
+        },
+    }
+
+    # --- Databento live tests ---
+    db_test = {"sdk_installed": False, "tests": {}}
+    try:
+        import databento_adapter
+        db_test["sdk_installed"] = databento_adapter._SDK_AVAILABLE
+        db_test["available"]     = databento_adapter.is_available()
+
+        if databento_adapter.is_available():
+            # VIX
+            try:
+                vix = databento_adapter.get_vix_spot()
+                db_test["tests"]["vix"] = {
+                    "ok":     vix is not None,
+                    "value":  vix,
+                }
+            except Exception as e:
+                db_test["tests"]["vix"] = {"ok": False, "error": str(e)}
+
+            # ES overnight
+            try:
+                bars = databento_adapter.get_overnight_bars("ES")
+                db_test["tests"]["es_overnight"] = {
+                    "ok":       len(bars) > 0,
+                    "bar_count": len(bars) if bars else 0,
+                }
+            except Exception as e:
+                db_test["tests"]["es_overnight"] = {"ok": False, "error": str(e)}
+
+            # SPY chain
+            try:
+                chain = databento_adapter.get_options_chain_snapshot("SPY")
+                db_test["tests"]["spy_chain"] = {
+                    "ok":           len(chain) > 0,
+                    "contract_count": len(chain) if chain else 0,
+                }
+            except Exception as e:
+                db_test["tests"]["spy_chain"] = {"ok": False, "error": str(e)}
+
+    except ImportError:
+        db_test["import_error"] = "databento_adapter module not loadable"
+
+    out["databento"] = db_test
+
+    # --- Current cached state ---
+    with _market_state_lock:
+        out["cached_state"] = {
+            "regime":          _market_state.get("regime"),
+            "gex_bias":        _market_state.get("gex_bias"),
+            "premarket_brief": _market_state.get("premarket_brief"),
+        }
+
+    return jsonify(out)
 
 
 @app.route("/alpaca-test")

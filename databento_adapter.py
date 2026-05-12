@@ -141,6 +141,7 @@ def get_vix_spot():
         ).to_df()
 
         if df is None or df.empty:
+            print("[databento] VIX query returned empty DataFrame")
             return None
 
         # SDK returns DataFrame with prices already scaled (no manual /1e9)
@@ -148,11 +149,13 @@ def get_vix_spot():
 
         # Sanity: VIX is conventionally 5–80 outside extreme events
         if vix < 1 or vix > 100:
+            print("[databento] VIX out of range: {}".format(vix))
             return None
 
         _cache_set("vix_spot", {"vix": vix})
         return vix
-    except Exception:
+    except Exception as e:
+        print("[databento] VIX fetch failed: {}".format(e))
         return None
 
 
@@ -212,6 +215,7 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         ).to_df()
 
         if df is None or df.empty:
+            print("[databento] {} overnight returned empty DataFrame".format(contract))
             return []
 
         # Convert DataFrame to the same dict shape the rest of the codebase
@@ -229,7 +233,8 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 
         _cache_set(cache_key, {"bars": bars})
         return bars
-    except Exception:
+    except Exception as e:
+        print("[databento] {} overnight fetch failed: {}".format(contract, e))
         return []
 
 
@@ -283,6 +288,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         ).to_df()
 
         if df is None or df.empty:
+            print("[databento] {} chain returned empty DataFrame".format(underlying))
             return []
 
         # Filter to open-interest records.
@@ -356,7 +362,8 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
 
         _cache_set(cache_key, {"chain": chain})
         return chain
-    except Exception:
+    except Exception as e:
+        print("[databento] {} chain fetch failed: {}".format(underlying, e))
         return []
 
 

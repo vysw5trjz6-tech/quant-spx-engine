@@ -97,13 +97,13 @@ def get_current_vix():
 
     Source priority:
       1. Databento real VIX (most accurate)
-      2. VIXY ETF as proxy (rough — overstates by ~85% historically)
+      2. VIXY ETF as proxy (only used if VIXY × 1.85 produces a sane value)
       3. None (caller uses realized vol fallback)
 
-    Includes a sanity guard: if VIX > 60, returns None rather than reporting
-    impossible values. The all-time intraday high is ~89.5 (Oct 2008), and
-    closes >50 are extreme rare events (COVID 2020, GFC 2008). A consistent
-    VIX>50 reading more likely indicates a bad data source.
+    Sanity guard: VIXY proxy is unreliable above ~30. The historical VIXY
+    × 1.85 scalar breaks down in high-vol regimes — it overstates VIX.
+    If the proxy returns > 35, refuse rather than report a value that
+    will keep regime stuck on CRISIS.
     """
     # --- Path 1: Databento real VIX ---
     try:
@@ -112,10 +112,12 @@ def get_current_vix():
             vix = databento_adapter.get_vix_spot()
             if vix and 5 <= vix <= 80:
                 return vix
+            # Databento configured but returned nothing — log it
+            print("[regime] Databento VIX query returned: {} (rejected or empty)".format(vix))
     except ImportError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        print("[regime] Databento VIX error: {}".format(e))
 
     # --- Path 2: VIXY ETF as proxy ---
     try:
@@ -136,15 +138,17 @@ def get_current_vix():
         bars = r.json().get("bars", [])
         if not bars:
             return None
-        # VIXY ≈ VIX/1.85 (historical scalar). This is a rough proxy and is
-        # likely the reason logs were reporting VIX=50 — VIXY at ~27 × 1.85.
-        # Calibrate via Databento when available.
         vixy_close = bars[-1]["c"]
         est_vix    = vixy_close * 1.85
-        # Sanity guard
-        if est_vix > 60:
-            # The proxy is unreliable in this range; refuse rather than return
-            # a bad value that will keep the regime stuck on CRISIS.
+
+        # Tightened sanity guard: VIXY proxy unreliable above ~35.
+        # When VIX is genuinely > 30, you'd see it confirmed in news and on
+        # realized vol. Without that confirmation, treat high proxy reads
+        # as a calibration failure rather than a regime signal.
+        if est_vix > 35:
+            print("[regime] VIXY proxy gave VIX={:.1f} — rejecting "
+                  "(outside reliable proxy range). VIXY close was ${:.2f}".format(
+                  est_vix, vixy_close))
             return None
         if est_vix < 5:
             return None
