@@ -64,6 +64,27 @@ except ImportError as _e:
     HAS_IV_RANK = False
     print("[init] iv_rank unavailable: {}".format(_e))
 
+try:
+    import oi_delta
+    HAS_OI_DELTA = True
+except ImportError as _e:
+    HAS_OI_DELTA = False
+    print("[init] oi_delta unavailable: {}".format(_e))
+
+try:
+    import market_profile
+    HAS_MPROFILE = True
+except ImportError as _e:
+    HAS_MPROFILE = False
+    print("[init] market_profile unavailable: {}".format(_e))
+
+try:
+    import options_flow
+    HAS_OPT_FLOW = True
+except ImportError as _e:
+    HAS_OPT_FLOW = False
+    print("[init] options_flow unavailable: {}".format(_e))
+
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
 # Default is premarket since most users only need an 8:30 AM ET alert.
@@ -1313,84 +1334,211 @@ def relative_strength(symbol_change, spy_change):
 
 def confluence_grade(breakout_strength, vol_ratio, vol_mult,
                      gap_pct, gap_direction, rs, direction,
-                     et_hour):
+                     et_hour, symbol=None, spot_price=None):
     """
     Scores 0-100 across 5 factors using AI-tunable weights from SCANNER_CONFIG.
+
+    If `symbol` and `spot_price` are provided, also computes BONUS points
+    from three new edge sources (OI delta, Market Profile, options flow).
+    Bonus points are added on top of base score, capped to keep grade<=100.
+
+    Returns: (grade_letter, total_pts, color, breakdown_dict)
+      breakdown_dict explains each component for /grade-debug endpoint.
     """
     cfg = get_config()
     pts = 0
+    breakdown = {"base_components": {}, "edge_bonuses": {}}
 
     # 1. Breakout strength
     bs_pct = breakout_strength * 100
     w      = cfg["weight_breakout"]
+    bs_pts = 0
     if bs_pct >= cfg["bs_strong"]:
-        pts += w
+        bs_pts = w
     elif bs_pct >= cfg["bs_medium"]:
-        pts += int(w * 0.72)
+        bs_pts = int(w * 0.72)
     elif bs_pct >= cfg["bs_weak"]:
-        pts += int(w * 0.48)
+        bs_pts = int(w * 0.48)
     else:
-        pts += int(w * 0.24)
+        bs_pts = int(w * 0.24)
+    pts += bs_pts
+    breakdown["base_components"]["breakout"] = bs_pts
 
     # 2. Volume ratio
     w = cfg["weight_volume"]
+    vp = 0
     if vol_ratio >= cfg["vol_high"]:
-        pts += w
+        vp = w
     elif vol_ratio >= cfg["vol_med"]:
-        pts += int(w * 0.75)
+        vp = int(w * 0.75)
     elif vol_ratio >= cfg["vol_low"]:
-        pts += int(w * 0.50)
+        vp = int(w * 0.50)
     else:
-        pts += int(w * 0.20)
+        vp = int(w * 0.20)
+    pts += vp
+    breakdown["base_components"]["volume"] = vp
 
     # 3. Gap alignment
     w = cfg["weight_gap"]
+    gp = 0
     if direction == "CALL":
         if gap_direction == "UP" and gap_pct >= 0.5:
-            pts += w
+            gp = w
         elif gap_direction == "UP":
-            pts += int(w * 0.70)
+            gp = int(w * 0.70)
         elif gap_direction == "FLAT":
-            pts += int(w * 0.40)
+            gp = int(w * 0.40)
         else:
-            pts += int(w * 0.10)
+            gp = int(w * 0.10)
     else:
         if gap_direction == "DOWN" and abs(gap_pct) >= 0.5:
-            pts += w
+            gp = w
         elif gap_direction == "DOWN":
-            pts += int(w * 0.70)
+            gp = int(w * 0.70)
         elif gap_direction == "FLAT":
-            pts += int(w * 0.40)
+            gp = int(w * 0.40)
         else:
-            pts += int(w * 0.10)
+            gp = int(w * 0.10)
+    pts += gp
+    breakdown["base_components"]["gap"] = gp
 
     # 4. Relative strength
     w = cfg["weight_rs"]
+    rp = 0
     if direction == "CALL":
-        if rs >= 0.3:    pts += w
-        elif rs >= 0.1:  pts += int(w * 0.70)
-        elif rs >= -0.1: pts += int(w * 0.40)
-        else:            pts += int(w * 0.10)
+        if rs >= 0.3:    rp = w
+        elif rs >= 0.1:  rp = int(w * 0.70)
+        elif rs >= -0.1: rp = int(w * 0.40)
+        else:            rp = int(w * 0.10)
     else:
-        if rs <= -0.3:   pts += w
-        elif rs <= -0.1: pts += int(w * 0.70)
-        elif rs <= 0.1:  pts += int(w * 0.40)
-        else:            pts += int(w * 0.10)
+        if rs <= -0.3:   rp = w
+        elif rs <= -0.1: rp = int(w * 0.70)
+        elif rs <= 0.1:  rp = int(w * 0.40)
+        else:            rp = int(w * 0.10)
+    pts += rp
+    breakdown["base_components"]["rs"] = rp
 
     # 5. Time of day
     w = cfg["weight_time"]
+    tp = 0
     if et_hour < cfg["time_prime_end"]:
-        pts += w
+        tp = w
     elif et_hour < cfg["time_decent_end"]:
-        pts += int(w * 0.67)
+        tp = int(w * 0.67)
     elif et_hour < cfg["time_risky_end"]:
-        pts += int(w * 0.33)
+        tp = int(w * 0.33)
     else:
-        pts += int(w * 0.07)
+        tp = int(w * 0.07)
+    pts += tp
+    breakdown["base_components"]["time"] = tp
 
     # Apply vol regime modifier
     pts = int(pts * vol_mult)
-    pts = min(pts, 100)
+    breakdown["base_total"] = pts
+
+    # =============================================
+    # NEW EDGE BONUSES (Tier 3) — optional, only if symbol provided
+    # =============================================
+    edge_pts = 0
+    if symbol:
+        # OI Delta bonus: -15 to +15
+        if HAS_OI_DELTA:
+            try:
+                delta = oi_delta.compute_delta(symbol)
+                if delta:
+                    sig = oi_delta.classify_oi_signal(delta, spot_price)
+                    # Apply directional alignment: bonus if signal matches our direction
+                    raw_bonus = sig.get("grade_pts", 0)
+                    if direction == "CALL" and sig["label"] == "BULLISH_BUILD":
+                        edge_pts += raw_bonus
+                        breakdown["edge_bonuses"]["oi_delta"] = {
+                            "pts": raw_bonus, "label": sig["label"]}
+                    elif direction == "PUT" and sig["label"] == "BEARISH_BUILD":
+                        edge_pts += raw_bonus
+                        breakdown["edge_bonuses"]["oi_delta"] = {
+                            "pts": raw_bonus, "label": sig["label"]}
+                    elif direction == "CALL" and sig["label"] == "BEARISH_BUILD":
+                        # Counter-positioning — small penalty
+                        edge_pts -= 5
+                        breakdown["edge_bonuses"]["oi_delta"] = {
+                            "pts": -5, "label": "counter-positioned"}
+                    elif direction == "PUT" and sig["label"] == "BULLISH_BUILD":
+                        edge_pts -= 5
+                        breakdown["edge_bonuses"]["oi_delta"] = {
+                            "pts": -5, "label": "counter-positioned"}
+            except Exception:
+                pass
+
+        # Market Profile bonus: -10 to +12
+        # Applies only to SPY/QQQ since profile is built from ES
+        if HAS_MPROFILE and symbol in ("SPY", "QQQ") and spot_price:
+            try:
+                et = pytz.timezone("America/New_York")
+                yesterday = datetime.now(et).date() - timedelta(days=1)
+                while yesterday.weekday() >= 5:
+                    yesterday -= timedelta(days=1)
+                prior = market_profile.load_profile("ES", yesterday, "RTH")
+                if prior:
+                    # Map SPY price to ES rough scale (SPY × 10 ≈ ES)
+                    es_proxy_price = spot_price * 10 if symbol == "SPY" else spot_price * 25
+                    classification = market_profile.classify_opening(
+                        es_proxy_price, prior)
+                    if classification:
+                        cbias = classification["bias"]
+                        cpts  = classification["grade_pts"]
+                        # Apply directional alignment
+                        if direction == "CALL" and cbias in ("BULL", "NEUTRAL_BULL"):
+                            edge_pts += cpts
+                            breakdown["edge_bonuses"]["market_profile"] = {
+                                "pts": cpts, "class": classification["class"]}
+                        elif direction == "PUT" and cbias in ("BEAR", "NEUTRAL_BEAR"):
+                            edge_pts += cpts
+                            breakdown["edge_bonuses"]["market_profile"] = {
+                                "pts": cpts, "class": classification["class"]}
+                        elif direction == "CALL" and cbias == "BEAR":
+                            edge_pts -= cpts
+                            breakdown["edge_bonuses"]["market_profile"] = {
+                                "pts": -cpts, "class": "fighting profile"}
+                        elif direction == "PUT" and cbias == "BULL":
+                            edge_pts -= cpts
+                            breakdown["edge_bonuses"]["market_profile"] = {
+                                "pts": -cpts, "class": "fighting profile"}
+            except Exception:
+                pass
+
+        # Options Flow bonus: -15 to +15
+        # Only for SPY/QQQ trades AND only during/after opening window
+        if HAS_OPT_FLOW and symbol in ("SPY", "QQQ") and et_hour >= 10.0:
+            try:
+                et = pytz.timezone("America/New_York")
+                today = datetime.now(et).date().isoformat()
+                flow = options_flow.load_flow(symbol, today)
+                if flow:
+                    fsig = options_flow.classify_flow(flow)
+                    raw = fsig.get("grade_pts", 0)
+                    if direction == "CALL" and fsig["label"] == "CALL_AGGRESSIVE":
+                        edge_pts += raw
+                        breakdown["edge_bonuses"]["opt_flow"] = {
+                            "pts": raw, "label": fsig["label"]}
+                    elif direction == "PUT" and fsig["label"] == "PUT_AGGRESSIVE":
+                        edge_pts += raw
+                        breakdown["edge_bonuses"]["opt_flow"] = {
+                            "pts": raw, "label": fsig["label"]}
+                    elif direction == "CALL" and fsig["label"] == "PUT_AGGRESSIVE":
+                        edge_pts -= raw
+                        breakdown["edge_bonuses"]["opt_flow"] = {
+                            "pts": -raw, "label": "counter-flow"}
+                    elif direction == "PUT" and fsig["label"] == "CALL_AGGRESSIVE":
+                        edge_pts -= raw
+                        breakdown["edge_bonuses"]["opt_flow"] = {
+                            "pts": -raw, "label": "counter-flow"}
+            except Exception:
+                pass
+
+    breakdown["edge_total"] = edge_pts
+    pts += edge_pts
+    pts = max(0, min(pts, 100))
+    breakdown["final_pts"] = pts
 
     a_min = cfg["grade_a_min"]
     b_min = cfg["grade_b_min"]
@@ -1405,7 +1553,7 @@ def confluence_grade(breakout_strength, vol_ratio, vol_mult,
     else:
         grade = "D"; color = "#f85149"
 
-    return grade, pts, color
+    return grade, pts, color, breakdown
 
 
 # =============================================
@@ -2216,9 +2364,10 @@ def scan_all_symbols():
                     (direction == "PUT"  and market_bias == "BULL")
                 )
 
-                grade, grade_pts, grade_color = confluence_grade(
+                grade, grade_pts, grade_color, _grade_bd = confluence_grade(
                     breakout_strength, vol_ratio, vol_mult,
-                    gap_pct, gap_dir, rs, direction, et_hour)
+                    gap_pct, gap_dir, rs, direction, et_hour,
+                    symbol=symbol, spot_price=price)
 
                 # Alt strategies get a slight grade bump for passing their own filters
                 grade_pts = min(grade_pts + 5, 100)
@@ -2314,9 +2463,10 @@ def scan_all_symbols():
             log("{}: SKIP counter-trend (config disabled)".format(symbol))
             continue
 
-        grade, grade_pts, grade_color = confluence_grade(
+        grade, grade_pts, grade_color, _grade_bd = confluence_grade(
             breakout_strength, vol_ratio, vol_mult,
-            gap_pct, gap_dir, rs, direction, et_hour)
+            gap_pct, gap_dir, rs, direction, et_hour,
+            symbol=symbol, spot_price=price)
 
         t1_key = "und_call_t1" if direction == "CALL" else "und_put_t1"
         t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
@@ -4637,19 +4787,106 @@ def _refresh_earnings_calendar():
 
 
 def _refresh_gex_snapshots():
-    """End-of-day GEX snapshot build (uses today's closing OI)."""
+    """
+    End-of-day chain snapshot: builds GEX, saves OI history for delta tracking.
+    Uses Databento (or Polygon fallback).
+    """
     if not HAS_GEX:
         return
-    if not os.getenv("POLYGON_API_KEY", "").strip():
-        return  # silent skip if no key
+    # Need either Databento or Polygon to be available
+    have_provider = bool(os.getenv("POLYGON_API_KEY", "").strip())
+    try:
+        import databento_adapter
+        if databento_adapter.is_available():
+            have_provider = True
+    except ImportError:
+        pass
+    if not have_provider:
+        return
+
     try:
         for sym in ("SPY", "QQQ"):
             spot = get_current_price(sym)
-            if spot:
-                gamma_exposure.refresh_gex(sym, spot)
-                log("GEX snapshot built for {}".format(sym))
+            if not spot:
+                continue
+            gamma_exposure.refresh_gex(sym, spot)
+            log("GEX snapshot built for {}".format(sym))
     except Exception as e:
         log("GEX snapshot error: {}".format(e))
+
+
+def _refresh_oi_snapshots():
+    """
+    Daily OI snapshot for OI-delta tracking. Pulls chain data for all
+    tracked symbols and persists strike-level OI to history DB.
+
+    Heavier query than GEX (we go per-symbol for the full universe rather
+    than just SPY/QQQ), but still cheap on Databento — definitions+statistics
+    schema typically <$0.01 per symbol.
+    """
+    if not HAS_OI_DELTA:
+        return
+    try:
+        import databento_adapter
+        if not databento_adapter.is_available():
+            return
+    except ImportError:
+        return
+
+    all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
+    ok_count = 0
+    error_count = 0
+    for sym in all_syms:
+        try:
+            chain = databento_adapter.get_options_chain_snapshot(sym)
+            if chain:
+                rows = oi_delta.save_snapshot(sym, chain)
+                if rows > 0:
+                    ok_count += 1
+                else:
+                    error_count += 1
+            else:
+                error_count += 1
+        except Exception as e:
+            error_count += 1
+            if error_count <= 3:  # only log first few errors
+                log("OI snapshot {} error: {}".format(sym, e))
+
+    log("OI snapshots: {}/{} symbols stored".format(ok_count, len(all_syms)))
+
+
+def _build_market_profile():
+    """Build yesterday's RTH Market Profile for ES (and SPY as proxy)."""
+    if not HAS_MPROFILE:
+        return
+    try:
+        prof = market_profile.build_rth_profile("ES")
+        if prof:
+            log("Market Profile (ES): POC={} VAH={} VAL={}".format(
+                prof["poc"], prof["vah"], prof["val"]))
+    except Exception as e:
+        log("Market Profile build error: {}".format(e))
+
+
+def _pull_opening_flow():
+    """
+    Pull options flow in 8:00–10:00 ET window for SPY + QQQ.
+    Triggered at 10:05 AM ET so the full window is past.
+    """
+    if not HAS_OPT_FLOW:
+        return
+    try:
+        for sym in ("SPY", "QQQ"):
+            try:
+                flow = options_flow.pull_opening_flow(sym)
+                if flow:
+                    classification = options_flow.classify_flow(flow)
+                    log("Opening flow {}: {} (imbalance {:+.2f})".format(
+                        sym, classification["label"], classification["imbalance"]))
+            except Exception as e:
+                log("Flow pull {} error: {}".format(sym, e))
+    except Exception as e:
+        log("Opening flow error: {}".format(e))
 
 
 def _refresh_iv_snapshots():
@@ -4896,25 +5133,32 @@ def background_scheduler():
         threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
     if boot_hour >= 8.0:
         threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
+        # Build yesterday's Market Profile (needed for today's opening classification)
+        threading.Thread(target=_build_market_profile, daemon=True).start()
     # Brief on boot ONLY if we're in the pre-open window (8:30 AM – 10:30 AM ET)
-    # AND we haven't already sent today's brief. Outside that window, wait
-    # for tomorrow's 8:30 AM schedule.
     if 8.5 <= boot_hour <= 10.5:
         threading.Thread(target=run_premarket_brief, daemon=True).start()
+    # Opening flow: pull at boot if we're past 10:05 AM today
+    if 10.1 <= boot_hour <= 16.0:
+        threading.Thread(target=_pull_opening_flow, daemon=True).start()
     if boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
     if boot_hour >= 16.5:
         threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
+        threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
 
     # Mark today's refreshes as done so we don't double-run
-    _daily_refresh_done["date"]      = today_str
-    _daily_refresh_done["earnings"]  = boot_hour >= 6.0
-    _daily_refresh_done["vol"]       = boot_hour >= 8.0
-    _daily_refresh_done["premarket"] = (boot_hour >= 8.5)  # mark sent if boot was in or past window
-    _daily_refresh_done["gex"]       = boot_hour >= 16.5
-    _daily_refresh_done["iv"]        = boot_hour >= 16.25
-    _premarket_done["date"]          = today_str if boot_hour >= 9.4 else None
-    _overnight_done["date"]          = today_str if boot_hour >= 15.93 else None
+    _daily_refresh_done["date"]       = today_str
+    _daily_refresh_done["earnings"]   = boot_hour >= 6.0
+    _daily_refresh_done["vol"]        = boot_hour >= 8.0
+    _daily_refresh_done["mprofile"]   = boot_hour >= 8.0
+    _daily_refresh_done["flow"]       = boot_hour >= 10.1
+    _daily_refresh_done["premarket"]  = (boot_hour >= 8.5)
+    _daily_refresh_done["gex"]        = boot_hour >= 16.5
+    _daily_refresh_done["oi"]         = boot_hour >= 16.5
+    _daily_refresh_done["iv"]         = boot_hour >= 16.25
+    _premarket_done["date"]           = today_str if boot_hour >= 9.4 else None
+    _overnight_done["date"]           = today_str if boot_hour >= 15.93 else None
 
     # Kick off first swing scan immediately in background (daily bars, non-blocking)
     threading.Thread(target=run_swing_scan, daemon=True).start()
@@ -4941,12 +5185,20 @@ def background_scheduler():
                 _daily_refresh_done["gex"]       = False
                 _daily_refresh_done["iv"]        = False
                 _daily_refresh_done["premarket"] = False
+                _daily_refresh_done["mprofile"]  = False
+                _daily_refresh_done["flow"]      = False
+                _daily_refresh_done["oi"]        = False
             if et_hour >= 6.0 and not _daily_refresh_done.get("earnings"):
                 threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
                 _daily_refresh_done["earnings"] = True
             if et_hour >= 8.0 and not _daily_refresh_done.get("vol"):
                 threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
                 _daily_refresh_done["vol"] = True
+            # 8:00 AM ET: build yesterday's RTH Market Profile
+            # (yesterday's session has fully closed by then)
+            if et_hour >= 8.0 and not _daily_refresh_done.get("mprofile"):
+                threading.Thread(target=_build_market_profile, daemon=True).start()
+                _daily_refresh_done["mprofile"] = True
 
             # --- PREMARKET BRIEF (8:30 AM ET, once daily) ---
             # In premarket mode, this is THE main alert of the day.
@@ -4955,6 +5207,12 @@ def background_scheduler():
                     and not _daily_refresh_done.get("premarket")):
                 _daily_refresh_done["premarket"] = True
                 threading.Thread(target=run_premarket_brief, daemon=True).start()
+
+            # 10:05 AM ET: pull SPY+QQQ options flow for the 8:00-10:00 window
+            if (et_hour >= 10.08 and et_hour < 10.3
+                    and not _daily_refresh_done.get("flow")):
+                _daily_refresh_done["flow"] = True
+                threading.Thread(target=_pull_opening_flow, daemon=True).start()
 
             # --- The following are INTRADAY refreshes ---
             # Skip them in 'premarket' mode to save Databento spend.
@@ -4975,6 +5233,11 @@ def background_scheduler():
             if et_hour >= 16.5 and not _daily_refresh_done.get("gex"):
                 threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
                 _daily_refresh_done["gex"] = True
+
+            # 4:35 PM ET: OI snapshot for delta tracking (full universe)
+            if et_hour >= 16.58 and not _daily_refresh_done.get("oi"):
+                threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
+                _daily_refresh_done["oi"] = True
 
             # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
             if et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
@@ -6854,6 +7117,56 @@ def brief_endpoint():
         "operating_mode": OPERATING_MODE,
         "note":           "Premarket brief queued. Check Telegram in ~30s.",
     })
+
+
+@app.route("/grade-debug")
+def grade_debug_endpoint():
+    """
+    Compute a grade for a symbol+direction and return the full breakdown,
+    including how much each new edge module (OI delta, Market Profile,
+    options flow) is contributing.
+
+    Usage: /grade-debug?sym=SPY&dir=CALL
+    """
+    sym = request.args.get("sym", "SPY").upper()
+    dir_ = request.args.get("dir", "CALL").upper()
+    if dir_ not in ("CALL", "PUT"):
+        return jsonify({"error": "dir must be CALL or PUT"})
+
+    try:
+        price = get_current_price(sym)
+        if not price:
+            return jsonify({"error": "no current price for {}".format(sym)})
+
+        et = pytz.timezone("America/New_York")
+        et_hour = datetime.now(et).hour + datetime.now(et).minute / 60.0
+
+        # Use neutral defaults for the technical inputs so we isolate edge bonuses
+        grade, pts, color, breakdown = confluence_grade(
+            breakout_strength = 0.005,
+            vol_ratio         = 1.5,
+            vol_mult          = 1.0,
+            gap_pct           = 0.3,
+            gap_direction     = "UP" if dir_ == "CALL" else "DOWN",
+            rs                = 0.2 if dir_ == "CALL" else -0.2,
+            direction         = dir_,
+            et_hour           = et_hour,
+            symbol            = sym,
+            spot_price        = price,
+        )
+
+        return jsonify({
+            "symbol":    sym,
+            "direction": dir_,
+            "price":     price,
+            "grade":     grade,
+            "pts":       pts,
+            "breakdown": breakdown,
+            "note":      "Technical inputs are placeholder defaults; "
+                         "use this endpoint to inspect edge bonus contributions only.",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "type": type(e).__name__})
 
 
 @app.route("/databento-test")
