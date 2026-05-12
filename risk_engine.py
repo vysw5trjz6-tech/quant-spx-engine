@@ -1,6 +1,8 @@
 # risk_engine.py
 
-ACCOUNT_SIZE = 30000
+import os
+
+ACCOUNT_SIZE = int(os.getenv("ACCOUNT_SIZE", "30000"))
 
 def get_risk_percent(score):
     if score >= 85:

@@ -1,10 +1,11 @@
 import sqlite3
+import db_utils
 from datetime import datetime
 
 DB_NAME = "trades.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = db_utils.connect(DB_NAME)
     c = conn.cursor()
 
     c.execute("""
@@ -28,7 +29,7 @@ def init_db():
     conn.close()
 
 def log_trade(ticker, mode, bias, entry, stop, target, probability, vol_regime):
-    conn = sqlite3.connect(DB_NAME)
+    conn = db_utils.connect(DB_NAME)
     c = conn.cursor()
 
     c.execute("""

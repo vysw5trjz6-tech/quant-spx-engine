@@ -50,7 +50,7 @@ ORB_BARS = 6
 # Strategy parameters
 RISK_MULTIPLIER      = 2.0    # profit target in R
 RISK_PERCENT         = 0.01   # 1% account risk per trade
-ACCOUNT_SIZE         = 30000
+ACCOUNT_SIZE         = int(os.getenv("ACCOUNT_SIZE", "30000"))
 VOL_CONFIRM_MULT     = 1.5    # breakout bar volume must be > 1.5x recent avg
 GAP_FILTER_PCT       = 0.015  # skip days with opening gap > 1.5%
 LATE_ENTRY_CUTOFF    = "11:30"  # no new entries after this ET time

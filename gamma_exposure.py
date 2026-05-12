@@ -20,6 +20,7 @@ import os
 import math
 import json
 import sqlite3
+import db_utils
 import requests
 from datetime import datetime, timedelta
 import pytz
@@ -168,6 +169,75 @@ def compute_gex_from_chain(chain_data, spot_price):
 
 
 # =============================================
+# TENOR-BUCKETED GEX
+# =============================================
+#
+# Aggregate GEX hides the fact that 0DTE dealer hedging flips intraday and
+# behaves very differently from monthly positioning. Bucketing by DTE lets
+# downstream logic treat them separately -- e.g. weight 0DTE gamma 3x in the
+# last hour of trading where it dominates the tape.
+
+TENOR_BUCKETS = (
+    ("0DTE", 0,  0),
+    ("1-7",  1,  7),
+    ("8-30", 8,  30),
+    ("30+",  31, 10_000),
+)
+
+
+def compute_gex_by_tenor(chain_data, spot_price):
+    """Per-bucket dealer GEX. Returns dict bucket -> {gex, gex_billions, regime}."""
+    if not chain_data or spot_price is None:
+        return None
+
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).date()
+
+    totals = {label: 0.0 for label, _, _ in TENOR_BUCKETS}
+
+    for c in chain_data:
+        try:
+            strike = float(c["strike"])
+            expiry = c["expiry"]
+            if isinstance(expiry, str):
+                expiry = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+            opt_type = (c.get("type") or "").lower()
+            oi       = int(c.get("open_interest") or 0)
+            iv       = float(c.get("implied_volatility") or 0)
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        if oi == 0 or iv <= 0 or iv > 5.0:
+            continue
+
+        dte_days = (expiry - today).days
+        if dte_days < 0:
+            continue
+        dte_years = max(dte_days, 0.5) / 365.0
+
+        bucket = None
+        for label, lo, hi in TENOR_BUCKETS:
+            if lo <= dte_days <= hi:
+                bucket = label
+                break
+        if bucket is None:
+            continue
+
+        gamma = bs_gamma(spot_price, strike, dte_years, iv)
+        sign  = 1 if opt_type == "call" else -1
+        totals[bucket] += gamma * oi * 100 * (spot_price ** 2) * 0.01 * sign
+
+    return {
+        label: {
+            "gex":          round(totals[label], 0),
+            "gex_billions": round(totals[label] / 1e9, 3),
+            "regime":       "LONG_GAMMA" if totals[label] > 0 else "SHORT_GAMMA",
+        }
+        for label in totals
+    }
+
+
+# =============================================
 # DATA FETCH — Polygon
 # =============================================
 
@@ -244,7 +314,7 @@ GEX_CACHE_DB = "gex_state.db"
 
 
 def _init_gex_db():
-    conn = sqlite3.connect(GEX_CACHE_DB)
+    conn = db_utils.connect(GEX_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS gex_snapshots (
@@ -272,7 +342,7 @@ def save_gex(symbol, gex_data):
         return
     et = pytz.timezone("America/New_York")
     today = datetime.now(et).strftime("%Y-%m-%d")
-    conn = sqlite3.connect(GEX_CACHE_DB)
+    conn = db_utils.connect(GEX_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO gex_snapshots
@@ -290,7 +360,7 @@ def save_gex(symbol, gex_data):
 
 
 def load_latest_gex(symbol):
-    conn = sqlite3.connect(GEX_CACHE_DB)
+    conn = db_utils.connect(GEX_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         SELECT json_blob FROM gex_snapshots
@@ -328,6 +398,11 @@ def refresh_gex(symbol="SPY", spot_price=None):
         return None
     gex = compute_gex_from_chain(chain, spot_price)
     if gex:
+        # Attach tenor breakdown so downstream consumers (get_gex_bias,
+        # scanner, dashboard) can read it without re-pulling the chain.
+        by_tenor = compute_gex_by_tenor(chain, spot_price)
+        if by_tenor:
+            gex["gex_by_tenor"] = by_tenor
         save_gex(symbol, gex)
     return gex
 
@@ -337,6 +412,15 @@ def get_gex_bias(symbol="SPY"):
     Returns the strategy bias for today based on dealer GEX regime.
     Use this to flip your scanner between trend-mode and fade-mode.
     """
+    bias = _build_gex_bias(symbol)
+    # Attach tenor breakdown if the snapshot has it (recent refresh_gex runs).
+    snapshot = load_latest_gex(symbol)
+    if snapshot and snapshot.get("gex_by_tenor"):
+        bias["gex_by_tenor"] = snapshot["gex_by_tenor"]
+    return bias
+
+
+def _build_gex_bias(symbol="SPY"):
     gex = load_latest_gex(symbol)
     if not gex:
         return {

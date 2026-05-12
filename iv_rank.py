@@ -13,6 +13,7 @@
 
 import os
 import sqlite3
+import db_utils
 import statistics
 import requests
 from datetime import datetime, timedelta
@@ -29,7 +30,7 @@ IV_CACHE_DB = "iv_history.db"
 
 
 def _init_iv_db():
-    conn = sqlite3.connect(IV_CACHE_DB)
+    conn = db_utils.connect(IV_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS iv_history (
@@ -171,7 +172,7 @@ def store_iv(symbol, iv):
     today = datetime.now(et).strftime("%Y-%m-%d")
     now   = datetime.now(et).isoformat()
 
-    conn = sqlite3.connect(IV_CACHE_DB)
+    conn = db_utils.connect(IV_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO iv_history (symbol, obs_date, atm_iv, updated_at)
@@ -184,7 +185,7 @@ def store_iv(symbol, iv):
 
 def get_history(symbol, lookback_days=252):
     """Return list of (date_str, iv) tuples for the symbol, newest first."""
-    conn = sqlite3.connect(IV_CACHE_DB)
+    conn = db_utils.connect(IV_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         SELECT obs_date, atm_iv FROM iv_history

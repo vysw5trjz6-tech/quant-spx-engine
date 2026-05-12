@@ -11,6 +11,7 @@
 import os
 import json
 import sqlite3
+import db_utils
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
@@ -53,7 +54,7 @@ _DB_CACHE = "databento_cache.db"
 
 
 def _init_cache():
-    conn = sqlite3.connect(_DB_CACHE)
+    conn = db_utils.connect(_DB_CACHE)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cache (
             key       TEXT PRIMARY KEY,
@@ -69,7 +70,7 @@ _init_cache()
 
 
 def _cache_get(key, max_age_seconds=300):
-    conn = sqlite3.connect(_DB_CACHE)
+    conn = db_utils.connect(_DB_CACHE)
     c    = conn.cursor()
     c.execute("SELECT value, stored_at FROM cache WHERE key = ?", (key,))
     row = c.fetchone()
@@ -87,7 +88,7 @@ def _cache_get(key, max_age_seconds=300):
 
 
 def _cache_set(key, value):
-    conn = sqlite3.connect(_DB_CACHE)
+    conn = db_utils.connect(_DB_CACHE)
     conn.execute("""
         INSERT OR REPLACE INTO cache (key, value, stored_at)
         VALUES (?, ?, ?)
