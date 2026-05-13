@@ -569,18 +569,39 @@ def db_get_all_closed_trades():
 
 def db_log_signal(sig):
     try:
+        # Pick the underlying stop / targets the scanner already computed
+        # (per-direction keys: und_call_*, und_put_*). Paper trader walks
+        # these against the rest of the day's 5-min bars at EOD.
+        direction = sig.get("direction")
+        if direction == "CALL":
+            und_stop = sig.get("und_call_stop")
+            und_t1   = sig.get("und_call_t1")
+            und_t2   = sig.get("und_call_t2")
+        elif direction == "PUT":
+            und_stop = sig.get("und_put_stop")
+            und_t1   = sig.get("und_put_t1")
+            und_t2   = sig.get("und_put_t2")
+        else:
+            und_stop = und_t1 = und_t2 = None
+
         conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             INSERT INTO signals
-            (ts,symbol,direction,price,score,premium,strike,contracts,stop,target)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            (ts, symbol, direction, price, score, premium, strike, contracts,
+             stop, target,
+             entry_under, und_stop, und_target_t1, und_target_t2,
+             signal_type, grade, grade_pts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
-            sig.get("symbol"), sig.get("direction"),
+            sig.get("symbol"), direction,
             sig.get("price"),  sig.get("score"),
             sig.get("premium"), str(sig.get("strike","")),
-            sig.get("contracts"), sig.get("stop"), sig.get("target")
+            sig.get("contracts"), sig.get("stop"), sig.get("target"),
+            sig.get("price"),   # entry_under = underlying price at signal time
+            und_stop, und_t1, und_t2,
+            sig.get("signal_type"), sig.get("grade"), sig.get("grade_pts"),
         ))
         conn.commit()
         conn.close()
@@ -5337,6 +5358,7 @@ def background_scheduler():
     _daily_refresh_done["gex"]        = boot_hour >= 16.5
     _daily_refresh_done["oi"]         = boot_hour >= 16.5
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
+    _daily_refresh_done["paper"]      = boot_hour >= 16.05
     _premarket_done["date"]           = today_str if boot_hour >= 9.4 else None
     _overnight_done["date"]           = today_str if boot_hour >= 15.93 else None
 
@@ -5368,6 +5390,7 @@ def background_scheduler():
                 _daily_refresh_done["mprofile"]  = False
                 _daily_refresh_done["flow"]      = False
                 _daily_refresh_done["oi"]        = False
+                _daily_refresh_done["paper"]     = False
             if et_hour >= 6.0 and not _daily_refresh_done.get("earnings"):
                 threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
                 _daily_refresh_done["earnings"] = True
@@ -5430,6 +5453,19 @@ def background_scheduler():
             if et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
                 threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
                 _daily_refresh_done["iv"] = True
+
+            # 0. Paper trader: replay today's signals at 4:04 PM ET so the
+            #    AI improvement step below sees synthetic outcomes alongside
+            #    any manually-logged real trades. Runs once per day.
+            if (HAS_PAPER_TRADER and et_hour >= 16.05
+                    and not _daily_refresh_done.get("paper")):
+                _daily_refresh_done["paper"] = True
+                def _paper_run():
+                    try:
+                        paper_trader.run_paper_trader(DB_FILE, log_fn=log)
+                    except Exception as _e:
+                        log("paper trader error: {}".format(_e))
+                threading.Thread(target=_paper_run, daemon=True).start()
 
             # 1. End-of-day AI: run once after 4:05 PM ET
             if et_hour >= 16.08 and _ai_last_run_date != today:
@@ -7659,6 +7695,13 @@ def token_check():
 # =============================================
 
 init_db()
+try:
+    import paper_trader
+    paper_trader.init_paper_columns(DB_FILE)
+    HAS_PAPER_TRADER = True
+except Exception as _e:
+    HAS_PAPER_TRADER = False
+    print("[init] paper_trader init failed: {}".format(_e))
 log("DB_FILE: {} | data_dir: {} | RAILWAY_VOLUME_MOUNT_PATH: {}".format(
     DB_FILE, _data_dir,
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "(not set)")))
