@@ -134,7 +134,7 @@ SWING_UNIVERSE = [
     "SPY", "QQQ", "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
 ]
 
-# Alias used by run_swing_scan
+# Alias used by run_swing_scan  [FIX 1: confirmed -- ensures symbol list is found]
 SWING_SYMBOLS = SWING_UNIVERSE
 
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
@@ -2111,6 +2111,19 @@ def scan_all_symbols():
     # SYMBOLS + SPY/QQQ for the market-alignment block below.
     data_fetcher.prefetch_symbols(list(set(SYMBOLS) | {"SPY", "QQQ"}))
 
+    # IB-extension unlock: if SPY has cleanly broken its 30-min initial balance
+    # with volume confirmation, re-enable ORB/vwap_trend/ib_extension at full
+    # grading regardless of the morning regime label.
+    spy_bars = get_intraday("SPY")
+    unlock_dir = _check_ib_extension_unlock(spy_bars)
+    if unlock_dir or _ib_unlock_state.get("unlocked"):
+        for k in ("orb", "vwap_trend", "ib_extension"):
+            strat_rules[k] = True
+        # Drop the regime penalty -- the unlock IS our expansion confirmation.
+        strat_rules.pop("score_penalty_trend", None)
+        # Bump size back to LOW_VOL baseline once expansion is confirmed.
+        strat_rules["size_multiplier"] = max(strat_rules.get("size_multiplier", 1.0), 0.85)
+
     # Broad market alignment
     spy_chg_global = get_spy_change()
     qqq_intra = get_intraday("QQQ")
@@ -2322,6 +2335,17 @@ def scan_all_symbols():
                 # Alt strategies get a slight grade bump for passing their own filters
                 grade_pts = min(grade_pts + 5, 100)
 
+                # Regime penalty on trend-style ALT signals (COMPRESSED only:
+                # raises the bar so chop doesn't trigger but real expansion can).
+                if alt_signal["signal_type"] in ("VWAP_TREND", "IB_EXTENSION"):
+                    grade_pts = max(0, grade_pts - strat_rules.get("score_penalty_trend", 0))
+                    if grade_pts < cfg["grade_a_min"] and grade == "A":
+                        grade = "B"; grade_color = "#3fb950"
+                    if grade_pts < cfg["grade_b_min"] and grade == "B":
+                        grade = "C"; grade_color = "#f0883e"
+                    if grade_pts < cfg["grade_c_min"]:
+                        grade = "D"; grade_color = "#8b949e"
+
                 t1_key = "und_call_t1" if direction == "CALL" else "und_put_t1"
                 t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
                 clear_air = check_clear_air(price, direction,
@@ -2417,6 +2441,18 @@ def scan_all_symbols():
             breakout_strength, vol_ratio, vol_mult,
             gap_pct, gap_dir, rs, direction, et_hour,
             symbol=symbol, spot_price=price)
+
+        # Regime penalty on ORB during COMPRESSED -- enabled but harder to fire.
+        # IB-extension breakout override (set earlier in scan_all_symbols) waives
+        # the penalty since the unlock signal already confirms expansion.
+        if not _ib_unlock_state.get("unlocked"):
+            grade_pts = max(0, grade_pts - strat_rules.get("score_penalty_trend", 0))
+            if grade_pts < cfg["grade_a_min"] and grade == "A":
+                grade = "B"; grade_color = "#3fb950"
+            if grade_pts < cfg["grade_b_min"] and grade == "B":
+                grade = "C"; grade_color = "#f0883e"
+            if grade_pts < cfg["grade_c_min"]:
+                grade = "D"; grade_color = "#8b949e"
 
         t1_key = "und_call_t1" if direction == "CALL" else "und_put_t1"
         t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
@@ -3308,20 +3344,24 @@ def detect_oneil_pivot(daily, weekly=None):
 
     atr_base  = _atr(base_bars,  min(14, len(base_bars)))
     atr_prior = _atr(prior_bars, min(14, len(prior_bars)))
-    if atr_prior > 0 and atr_base / atr_prior > 0.85:
+    # FIX 3: raised threshold 0.85 -> 0.92 (was rejecting valid bases with only 8-14%
+    # ATR contraction; volatile markets often can't clear the original 15% bar)
+    if atr_prior > 0 and atr_base / atr_prior > 0.92:
         return None   # ATR not contracted enough -- not a tight base
 
-    # 3. Breakout above base high (pivot) -- check today or last 1-2 days
+    # 3. Breakout above base high (pivot) -- check today or last 7 days
+    # FIX 4: extended lookback range(0,4) -> range(0,8) so we catch breakouts
+    # up to 7 days old that are still holding above the pivot (valid continuation entries)
     today = daily[-1]
     pivot_broken = False
     days_since_breakout = 0
 
-    for lookback_days in range(0, 4):
+    for lookback_days in range(0, 8):
         bar = daily[-(1 + lookback_days)]
         vol_ratio = bar["v"] / avg_vol_50 if avg_vol_50 > 0 else 0
         if bar["h"] > base_high and bar["c"] > base_high * 0.995:
             if vol_ratio >= 1.40:   # 40%+ above average (O'Neil requirement)
-                pivot_broken       = True
+                pivot_broken        = True
                 days_since_breakout = lookback_days
                 breakout_vol_ratio  = vol_ratio
                 break
@@ -3336,10 +3376,11 @@ def detect_oneil_pivot(daily, weekly=None):
     if close_rank < 0.50:   # closed in lower half of range = weak
         return None
 
-    # 5. Weinstein Stage 2 filter
+    # 5. FIX 2: Weinstein Stage 1 or 2 filter (was Stage 2 only -- Stage 1 base
+    # breakouts are valid setups and were being rejected across the board)
     stage, sma_rising = weinstein_stage(daily, weekly)
-    if stage not in (2,):
-        return None   # only take Stage 2 breakouts
+    if stage not in (1, 2):
+        return None
 
     # Probability calculation (O'Neil-calibrated)
     prob = 62
@@ -3348,6 +3389,7 @@ def detect_oneil_pivot(daily, weekly=None):
     if days_since_breakout == 0:    prob += 5    # fresh breakout today
     if close_rank >= 0.80:          prob += 4    # closed at top of range
     if atr_base / (atr_prior + 0.001) < 0.60:   prob += 3   # very tight base
+    if stage == 1:                  prob -= 4    # slight haircut vs confirmed Stage 2
     prob = min(prob, 82)
 
     # Swing low = base low (stop placement)
@@ -3378,8 +3420,8 @@ def detect_oneil_pivot(daily, weekly=None):
         "pivot":         round(base_high, 2),
         "close_rank":    round(close_rank * 100, 1),
         "stage":         stage,
-        "notes":         "Base: {:.0f}wks | Pivot: ${:.2f} | Vol: {:.1f}x | Close rank: {:.0f}%".format(
-                            base_weeks, base_high, breakout_vol_ratio, close_rank * 100),
+        "notes":         "Base: {:.0f}wks | Pivot: ${:.2f} | Vol: {:.1f}x | Close rank: {:.0f}% | Stage {}".format(
+                            base_weeks, base_high, breakout_vol_ratio, close_rank * 100, stage),
     }
 
 
@@ -3468,17 +3510,23 @@ def detect_wyckoff_spring(daily, weekly=None):
         return None
 
     # Check recovery volume is higher (Sign of Strength)
+    # FIX 6: lowered recovery vol threshold from 0.9x to 0.75x avg_vol
+    # Large-caps and ETFs rarely show dramatic recovery volume; 0.75x is still
+    # meaningful confirmation that sellers are not in control
     recent_bars    = daily[spring_idx + 1:]
     if recent_bars:
         recovery_vol   = statistics.mean([b["v"] for b in recent_bars])
-        vol_expanding  = recovery_vol > avg_vol * 0.9
+        vol_expanding  = recovery_vol > avg_vol * 0.75
     else:
         vol_expanding  = False
 
     # Weinstein Stage: spring should occur in Stage 1/2 (accumulation zone)
+    # FIX 2: changed from stage==4 exclusion to requiring stage in (1,2)
+    # Wyckoff springs by definition happen during accumulation (Stage 1) or
+    # early markup (Stage 2) -- Stage 3/4 springs are bear-market traps
     stage, _ = weinstein_stage(daily, weekly)
-    if stage == 4:
-        return None   # don't buy a spring in a confirmed downtrend
+    if stage not in (1, 2):
+        return None
 
     # Count support touches for probability calibration
     support_touches = sum(1 for l in lows if abs(l - support) / support < 0.015)
@@ -3557,9 +3605,11 @@ def detect_52w_breakout(daily, weekly=None):
     if price < high_all * 0.95:
         return None
 
-    # 2. Tight consolidation: >= 15 bars (3 weeks) within 10% of high
-    tight_bars = [b for b in daily[-50:] if b["c"] >= high_all * 0.90]
-    if len(tight_bars) < 15:
+    # 2. FIX 5: Tight consolidation relaxed from 15 bars/90% to 10 bars/88%
+    # Original requirement was too strict: many valid setups form bases with
+    # slightly wider ranges or fewer bars, especially in volatile markets
+    tight_bars = [b for b in daily[-50:] if b["c"] >= high_all * 0.88]
+    if len(tight_bars) < 10:
         return None
 
     # 3. Volume contraction during consolidation
@@ -3677,9 +3727,11 @@ def detect_earnings_continuation(daily, weekly=None):
     if pullback > 0.40:
         return None
 
-    # Stage 2 filter (only take CALL continuations in Stage 2)
+    # FIX 2: Accept Stage 1 and Stage 2 for CALL continuations (was Stage 2 only)
+    # Earnings gaps in Stage 1 can be valid re-ratings from a basing phase;
+    # only Stage 3 (topping) and Stage 4 (decline) should be excluded
     stage, _ = weinstein_stage(daily, None)
-    if direction == "CALL" and stage not in (2,):
+    if direction == "CALL" and stage not in (1, 2):
         return None
 
     # Probability (O'Neil / Zacks calibrated)
@@ -3687,6 +3739,7 @@ def detect_earnings_continuation(daily, weekly=None):
     prob += max(0, 12 - days_since)
     prob += 8 if pullback < 0.15 else 0
     prob += 5 if earn_gap > 6.0  else 0
+    if stage == 1: prob -= 3   # slight haircut for Stage 1 vs Stage 2
     prob  = min(prob, 82)
 
     pre_earn   = daily[max(0, earn_idx - 10):earn_idx]
@@ -4644,7 +4697,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
     <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
     <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
     <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
-    &nbsp;&nbsp;|&nbsp;&nbsp; All signals Stage-2 filtered &nbsp;|&nbsp;&nbsp;
+    &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
     Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Delta ~0.55, 2-week options
   </div>
   {cards}
@@ -4669,10 +4722,28 @@ def _refresh_market_state():
     try:
         if HAS_REGIME:
             regime = regime_filter.classify_regime()
+            # Compression-squeeze override: if today's RV20 is in the bottom
+            # 20% of trailing year, gap is tight, and VIX term structure is
+            # not in backwardation, flip COMPRESSED -> EXPANSION_WATCH so the
+            # scanner doesn't fade a coiled-spring expansion day.
+            try:
+                gap_pct_abs = None
+                spy_daily   = get_daily("SPY")
+                spy_intra   = get_intraday("SPY")
+                if spy_daily and spy_intra:
+                    gp, _gd = get_premarket_gap(spy_daily, spy_intra)
+                    if gp is not None:
+                        gap_pct_abs = abs(gp)
+                regime = regime_filter.apply_expansion_override(
+                    regime, gap_pct_abs=gap_pct_abs, symbol="SPY"
+                )
+            except Exception as e:
+                log("expansion override error: {}".format(e))
             with _market_state_lock:
                 _market_state["regime"]    = regime
                 _market_state["regime_ts"] = time.time()
-            log("Regime refreshed: {}".format(regime.get("regime")))
+            log("Regime refreshed: {} (expansion_watch={})".format(
+                regime.get("regime"), regime.get("expansion_watch")))
     except Exception as e:
         log("regime refresh error: {}".format(e))
 
@@ -4990,54 +5061,172 @@ def run_premarket_brief():
     log("Premarket brief sent ({} chars)".format(len(msg)))
 
 
+import plan_summary as _plan_summary
+
+
 def _summarize_plan(regime, gex_bias, premarket, rules=None):
+    """Delegates to plan_summary.summarize_plan (extracted for unit testing).
+
+    `rules` is accepted for backward-compat with the call site in
+    run_premarket_brief but ignored -- plan_summary reads what it needs
+    (expansion_watch, intraday_flip, term_structure, tape_bias, regime label)
+    directly from the regime dict and gex_bias dict.
     """
-    One-sentence trade plan based on the morning's context.
-    rules: dict from regime["rules"] -- used to check which strategies are
-           actually enabled today so the plan never contradicts the strategy matrix.
+    return _plan_summary.summarize_plan(regime, gex_bias, premarket)
+
+
+def _check_ib_extension_unlock(spy_intraday_bars):
     """
-    if rules is None:
-        rules = {}
+    Detect when SPY has extended beyond its 30-min initial balance with
+    confirmation volume, and unlock trend strategies for the rest of the
+    session. Called every scan cycle from scan_all_symbols.
 
-    parts = []
-    r_name = regime.get("regime", "")
-    if r_name == "CRISIS":
-        parts.append("Intraday only, half size, wide stops")
-    elif r_name == "ELEVATED":
-        parts.append("Trend strategies preferred")
-    elif r_name == "COMPRESSED":
-        parts.append("Range-bound day — fade extremes only")
-    else:
-        parts.append("Standard regime")
+    IB definition: first 6 x 5-min bars (9:30 - 10:00 ET).
+    Unlock trigger:
+      - Current price > IB_high + IB_range   (full extension up), OR
+      - Current price < IB_low  - IB_range   (full extension down)
+      - AND the extending bar's volume > 1.3x recent average
 
-    tape     = gex_bias.get("tape_bias", "")
-    orb_on   = rules.get("orb", True)   # default True when rules not available
-    vwap_on  = rules.get("vwap_mr", True)
+    Once unlocked, persists for the rest of the day (state cleared on date roll).
+    """
+    et      = pytz.timezone("America/New_York")
+    today   = datetime.now(et).strftime("%Y-%m-%d")
 
-    if "TREND" in tape:
-        # Only say "ORB favored" if ORB is actually enabled for today
-        if orb_on:
-            parts.append("ORB favored")
-        else:
-            # Tape says trend but ORB is off (e.g. COMPRESSED regime) --
-            # suggest the next-best enabled strategy instead
-            if rules.get("vwap_trend", False):
-                parts.append("VWAP trend favored (ORB off)")
-            else:
-                parts.append("wait for clear breakout — ORB unreliable today")
-    elif "MEAN_REVERT" in tape:
-        if vwap_on:
-            parts.append("VWAP fades favored")
-        else:
-            parts.append("mean-revert tape but VWAP_MR off — reduce size")
+    with _ib_unlock_lock:
+        if _ib_unlock_state["date"] != today:
+            # New day -- reset state
+            _ib_unlock_state.update({
+                "date":      today,
+                "unlocked":  False,
+                "direction": None,
+                "ib_high":   None,
+                "ib_low":    None,
+                "ib_range":  None,
+            })
+        if _ib_unlock_state["unlocked"]:
+            return _ib_unlock_state["direction"]
 
-    gap = (premarket or {}).get("gap", {})
-    if gap.get("class") == "INSIDE_GAP":
-        parts.append("morning fade likely")
-    elif "GAP_AND_GO" in (gap.get("class") or ""):
-        parts.append("continuation likely")
+    if not spy_intraday_bars or len(spy_intraday_bars) < ORB_BARS + 1:
+        return None
 
-    return ". ".join(parts) + "."
+    ib_bars  = spy_intraday_bars[:ORB_BARS]
+    ib_high  = max(b["h"] for b in ib_bars)
+    ib_low   = min(b["l"] for b in ib_bars)
+    ib_range = ib_high - ib_low
+    if ib_range <= 0:
+        return None
+
+    recent_bars = spy_intraday_bars[ORB_BARS:]
+    if not recent_bars:
+        return None
+
+    # Average volume over IB for the volume confirmation gate
+    ib_avg_vol = statistics.mean([b["v"] for b in ib_bars]) or 1.0
+
+    # Scan post-IB bars for an extension event
+    for b in recent_bars:
+        if b["h"] > ib_high + ib_range and b["v"] > ib_avg_vol * 1.3:
+            with _ib_unlock_lock:
+                _ib_unlock_state.update({
+                    "date": today, "unlocked": True, "direction": "UP",
+                    "ib_high": ib_high, "ib_low": ib_low, "ib_range": ib_range,
+                })
+            log("IB extension UP confirmed: bar high={:.2f} > {:.2f} (vol {:.0f} vs avg {:.0f})".format(
+                b["h"], ib_high + ib_range, b["v"], ib_avg_vol))
+            return "UP"
+        if b["l"] < ib_low - ib_range and b["v"] > ib_avg_vol * 1.3:
+            with _ib_unlock_lock:
+                _ib_unlock_state.update({
+                    "date": today, "unlocked": True, "direction": "DOWN",
+                    "ib_high": ib_high, "ib_low": ib_low, "ib_range": ib_range,
+                })
+            log("IB extension DOWN confirmed: bar low={:.2f} < {:.2f} (vol {:.0f} vs avg {:.0f})".format(
+                b["l"], ib_low - ib_range, b["v"], ib_avg_vol))
+            return "DOWN"
+
+    return None
+
+
+def _intraday_regime_recheck():
+    """
+    Run once around 10:30 AM ET. Compares 30-min realized vol from 5-min SPY
+    bars against the morning's regime classification. If the intraday tape is
+    materially more volatile than the COMPRESSED label implies, force-flip to
+    LOW_VOL and fire a Telegram update so the user knows the matrix changed.
+    """
+    if not HAS_REGIME:
+        return
+
+    et       = pytz.timezone("America/New_York")
+    today    = datetime.now(et).strftime("%Y-%m-%d")
+    if _regime_recheck_done.get("date") == today:
+        return
+
+    intraday = get_intraday("SPY")
+    # Need at least 12 5-min bars (60 min) of data for a meaningful read
+    if not intraday or len(intraday) < 12:
+        return
+
+    closes = [b["c"] for b in intraday[-12:]]
+    rets   = []
+    for i in range(1, len(closes)):
+        if closes[i-1] <= 0:
+            return
+        rets.append(math.log(closes[i] / closes[i-1]))
+    if len(rets) < 2:
+        return
+
+    # Annualize 5-min realized vol: 78 5-min bars/day * 252 trading days = 19656
+    sd        = statistics.stdev(rets)
+    rv_intra  = sd * math.sqrt(19656) * 100   # percent annualized
+
+    with _market_state_lock:
+        regime_now = _market_state.get("regime") or {}
+    current_label = regime_now.get("regime")
+    rv20          = regime_now.get("realized") or 0
+
+    # Flip rule: intraday RV is 1.3x trailing 20-day, AND we're currently
+    # in COMPRESSED. Any other transition we ignore for now.
+    should_flip = (
+        current_label == "COMPRESSED"
+        and rv20 > 0
+        and rv_intra > rv20 * 1.3
+    )
+
+    _regime_recheck_done["date"]    = today
+    _regime_recheck_done["flipped"] = should_flip
+    _regime_recheck_done["from"]    = current_label
+    _regime_recheck_done["rv_intra"] = round(rv_intra, 2)
+
+    if not should_flip:
+        log("Intraday regime re-check: {} (rv_intra={:.1f}%, rv20={:.1f}%) - no flip".format(
+            current_label, rv_intra, rv20))
+        return
+
+    new_label = "LOW_VOL"
+    _regime_recheck_done["to"] = new_label
+
+    new_regime = dict(regime_now)
+    new_regime["regime"]   = new_label
+    new_regime["rules"]    = dict(regime_filter.REGIME_STRATEGY_RULES[new_label])
+    new_regime["note"]     = "INTRADAY_FLIP from COMPRESSED. RV_intra={:.1f}% (RV20={:.1f}%)".format(
+        rv_intra, rv20)
+    new_regime["intraday_flip"] = True
+    new_regime["rv_intra"]      = round(rv_intra, 2)
+
+    with _market_state_lock:
+        _market_state["regime"] = new_regime
+
+    log("REGIME FLIP: COMPRESSED -> LOW_VOL (rv_intra={:.1f}%)".format(rv_intra))
+    try:
+        send_telegram(
+            "REGIME UPDATE: COMPRESSED -> LOW_VOL\n"
+            "Intraday RV expanding ({:.1f}% vs RV20 {:.1f}%).\n"
+            "Trend strategies fully active for the rest of the session."
+            .format(rv_intra, rv20)
+        )
+    except Exception as e:
+        log("regime flip telegram error: {}".format(e))
 
 
 def _check_overnight_gamma_reversal():
@@ -5086,6 +5275,23 @@ def _check_overnight_gamma_reversal():
 _daily_refresh_done = {"date": None, "vol": False, "earnings": False, "gex": False}
 _premarket_done     = {"date": None}
 _overnight_done     = {"date": None}
+
+# IB-extension unlock: once SPY breaks its 30-min initial balance with volume,
+# all trend strategies are re-enabled at full grading for the rest of the day
+# regardless of the morning regime label. Resets daily.
+_ib_unlock_state = {
+    "date":      None,
+    "unlocked":  False,
+    "direction": None,   # "UP" or "DOWN"
+    "ib_high":   None,
+    "ib_low":    None,
+    "ib_range":  None,
+}
+_ib_unlock_lock = threading.Lock()
+
+# Intraday regime re-classify: runs once at ~10:30 ET. Sets a marker so we
+# don't double-fire and so the brief endpoint can show whether a flip happened.
+_regime_recheck_done = {"date": None, "flipped": False, "from": None, "to": None}
 
 
 def background_scheduler():
@@ -5187,6 +5393,13 @@ def background_scheduler():
                     and not _daily_refresh_done.get("flow")):
                 _daily_refresh_done["flow"] = True
                 threading.Thread(target=_pull_opening_flow, daemon=True).start()
+
+            # 10:30 AM ET: re-classify regime against intraday RV.
+            # If we labeled today COMPRESSED but the tape is expanding, force
+            # a flip and notify so the matrix reflects reality.
+            if (et_hour >= 10.5 and et_hour < 10.8
+                    and _regime_recheck_done.get("date") != today):
+                threading.Thread(target=_intraday_regime_recheck, daemon=True).start()
 
             # --- The following are INTRADAY refreshes ---
             # Skip them in 'premarket' mode to save Databento spend.

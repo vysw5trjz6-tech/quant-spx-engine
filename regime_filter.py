@@ -42,15 +42,24 @@ REGIME_THRESHOLDS = [
     (999, "CRISIS"),
 ]
 
-# Strategy enable/disable matrix per regime
+# Strategy enable/disable matrix per regime.
+#
+# IMPORTANT: COMPRESSED no longer hard-disables trend strategies. Trailing-RV20
+# below 10% is a coiled-spring signature -- historically it predicts expansion
+# days more often than chop days. Disabling ORB/vwap_trend means we miss the
+# moves we're best positioned to catch. Instead we keep them enabled at 0.5x
+# size with a score penalty so only the strongest setups fire.
 REGIME_STRATEGY_RULES = {
     "COMPRESSED": {
-        "orb":              False,   # ranges too tight
-        "vwap_trend":       False,
+        "orb":              True,
+        "vwap_trend":       True,
         "vwap_mr":          True,    # range-bound days favor MR
-        "ib_extension":     False,
+        "ib_extension":     True,
         "swing_breakout":   False,
         "size_multiplier":  0.5,     # half size — premium bleeds in low IV
+        # Raise the bar for trend signals to fire while in COMPRESSED.
+        # Scanner subtracts this from grade_pts before letter assignment.
+        "score_penalty_trend": 15,
     },
     "LOW_VOL": {
         "orb":              True,
@@ -152,6 +161,139 @@ def get_current_vix():
         return est_vix
     except Exception:
         return None
+
+
+# =============================================
+# RV20 PERCENTILE (for compression-squeeze detection)
+# =============================================
+#
+# Returns the percentile rank of today's 20-day realized vol against its own
+# rolling distribution over the past ~year. Below the 20th percentile means
+# realized vol is in the bottom fifth of recent history -- a coiled-spring
+# setup. Combined with a tight overnight gap and non-backwardated VIX term
+# structure, this is the classic expansion-day signature.
+
+def _rolling_rv20(closes):
+    """Yield rolling 20-day annualized stdev (% form) over a daily close series."""
+    if len(closes) < 21:
+        return []
+    out = []
+    for end in range(21, len(closes) + 1):
+        window = closes[end - 21:end]
+        rets = []
+        for i in range(1, len(window)):
+            if window[i - 1] <= 0:
+                rets = []
+                break
+            rets.append(math.log(window[i] / window[i - 1]))
+        if len(rets) < 2:
+            continue
+        sd = statistics.stdev(rets)
+        out.append(sd * math.sqrt(252) * 100)
+    return out
+
+
+def get_rv20_percentile(symbol="SPY", history_days=252):
+    """
+    Returns (today_rv20, percentile_0_to_100) or (None, None) on failure.
+
+    Percentile uses the rolling distribution: percentile 15 means today's
+    RV20 is lower than 85% of the past year's RV20 readings.
+    """
+    try:
+        et    = pytz.timezone("America/New_York")
+        end   = datetime.now(et)
+        start = end - timedelta(days=history_days + 40)
+        params = {
+            "timeframe": "1Day",
+            "start":     start.strftime("%Y-%m-%d"),
+            "end":       end.strftime("%Y-%m-%d"),
+            "limit":     history_days + 30,
+            "feed":      "iex",
+        }
+        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                         params=params, timeout=10)
+        if r.status_code != 200:
+            return None, None
+        bars = r.json().get("bars", [])
+        if len(bars) < 60:
+            return None, None
+        closes = [b["c"] for b in bars]
+    except Exception:
+        return None, None
+
+    series = _rolling_rv20(closes)
+    if len(series) < 30:
+        return None, None
+
+    today = series[-1]
+    # Inclusive lower-rank percentile
+    below = sum(1 for v in series if v < today)
+    pct   = round(below / len(series) * 100, 1)
+    return round(today, 2), pct
+
+
+# =============================================
+# EXPANSION OVERRIDE
+# =============================================
+#
+# Coiled-spring conditions: low trailing realized vol + tight overnight gap +
+# non-backwardated term structure. Empirically these days break out far more
+# often than they chop. When detected we override the COMPRESSED rules with
+# LOW_VOL rules (trend strategies fully enabled, size back to 0.85x).
+#
+# This is what would have saved us from missing the SPY trend day on 2026-05-13:
+# RV20 was 9.8% (low decile), gap was small, VIX term structure flat.
+
+EXPANSION_RV_PERCENTILE_MAX = 20.0   # RV20 must sit in bottom 20% of trailing year
+EXPANSION_GAP_PCT_MAX       = 0.50   # overnight gap must be < 0.5% (no pre-decided move)
+EXPANSION_TERM_LABELS_OK    = {"CONTANGO", "DEEP_CONTANGO", "FLAT"}
+
+
+def check_expansion_watch(rv_percentile, gap_pct_abs, term_structure_label):
+    """Return True if all three coiled-spring conditions are satisfied."""
+    if rv_percentile is None or gap_pct_abs is None:
+        return False
+    if rv_percentile > EXPANSION_RV_PERCENTILE_MAX:
+        return False
+    if gap_pct_abs > EXPANSION_GAP_PCT_MAX:
+        return False
+    if term_structure_label not in EXPANSION_TERM_LABELS_OK:
+        return False
+    return True
+
+
+def apply_expansion_override(regime_data, gap_pct_abs=None, symbol="SPY"):
+    """
+    Mutates and returns regime_data. If today qualifies as EXPANSION_WATCH:
+      - Replace strategy rules with LOW_VOL rules (trend strats fully on)
+      - Drop the COMPRESSED score penalty
+      - Bump size_multiplier from 0.5 -> 0.85
+      - Attach expansion_watch=True + diagnostics for the brief
+    """
+    regime_data.setdefault("expansion_watch", False)
+
+    if regime_data.get("regime") != "COMPRESSED":
+        return regime_data
+
+    rv_today, rv_pct = get_rv20_percentile(symbol)
+    term             = get_vix_term_structure() or {}
+    term_label       = term.get("label")
+
+    qualifies = check_expansion_watch(rv_pct, gap_pct_abs, term_label)
+
+    regime_data["rv20_percentile"] = rv_pct
+    regime_data["term_structure"]  = term
+
+    if qualifies:
+        regime_data["expansion_watch"] = True
+        regime_data["rules"]           = dict(REGIME_STRATEGY_RULES["LOW_VOL"])
+        regime_data["note"] = (
+            "EXPANSION_WATCH active. RV20 pct={} gap={}% term={}. "
+            "Trend strategies unlocked at LOW_VOL sizing."
+        ).format(rv_pct, gap_pct_abs, term_label)
+
+    return regime_data
 
 
 def get_realized_vol(symbol="SPY", lookback_days=20):
