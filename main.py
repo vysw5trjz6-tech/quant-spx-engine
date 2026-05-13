@@ -7,6 +7,7 @@ import threading
 import time
 import json
 import sqlite3
+import db_utils
 from datetime import datetime, timedelta
 import pytz
 
@@ -109,7 +110,7 @@ _market_state_lock = threading.Lock()
 
 app = Flask(__name__)
 
-ACCOUNT_SIZE  = 30000
+ACCOUNT_SIZE  = int(os.getenv("ACCOUNT_SIZE", "30000"))
 SCAN_INTERVAL = 300
 ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
@@ -289,7 +290,7 @@ def log(msg):
 # =============================================
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = db_utils.connect(DB_FILE)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS signals (
@@ -411,7 +412,7 @@ def init_db():
 
 def db_save_ai_config(config, trigger="scheduled"):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             INSERT INTO ai_config (ts, version, config_json, trigger)
@@ -431,7 +432,7 @@ def db_save_ai_config(config, trigger="scheduled"):
 def db_save_ai_analysis(trades_used, win_rate, insight, focus, reasoning,
                          config_diff, raw_response):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             INSERT INTO ai_analyses
@@ -451,7 +452,7 @@ def db_save_ai_analysis(trades_used, win_rate, insight, focus, reasoning,
 def db_load_latest_config():
     """Load most recent AI config from DB into memory on startup."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("SELECT config_json FROM ai_config ORDER BY id DESC LIMIT 1")
         row = c.fetchone()
@@ -466,7 +467,7 @@ def db_load_latest_config():
 
 def db_get_ai_analyses(limit=10):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             SELECT ts, trades_used, win_rate, insight, focus, reasoning, config_diff
@@ -484,7 +485,7 @@ def db_get_ai_analyses(limit=10):
 def db_save_proposal(proposal_type, title, summary, evidence, spec):
     """Save a new structural proposal from the AI."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         # Avoid saving exact duplicate titles
         c.execute("SELECT id FROM ai_proposals WHERE title=? AND status='pending'", (title,))
@@ -511,7 +512,7 @@ def db_save_proposal(proposal_type, title, summary, evidence, spec):
 def db_get_proposals(status=None, limit=20):
     """Get proposals, optionally filtered by status."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         if status:
             c.execute("""
@@ -535,7 +536,7 @@ def db_get_proposals(status=None, limit=20):
 
 def db_dismiss_proposal(proposal_id):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("UPDATE ai_proposals SET status='dismissed', dismissed_at=? WHERE id=?",
                   (datetime.now(pytz.utc).isoformat(), proposal_id))
@@ -548,7 +549,7 @@ def db_dismiss_proposal(proposal_id):
 def db_get_all_closed_trades():
     """All closed trades for AI analysis."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             SELECT symbol, direction, outcome, pnl, r_mult,
@@ -568,7 +569,7 @@ def db_get_all_closed_trades():
 
 def db_log_signal(sig):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             INSERT INTO signals
@@ -592,7 +593,7 @@ def db_log_trade(symbol, direction, premium, contracts, stop, target,
                   gap_dir=None, rs=None, entry_hour=None,
                   entry_under=None, signal_type=None):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         et   = pytz.timezone("America/New_York")
         if entry_hour is None:
@@ -621,7 +622,7 @@ def db_log_trade(symbol, direction, premium, contracts, stop, target,
 
 def db_close_trade(trade_id, exit_price, outcome):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("SELECT premium, contracts FROM trades WHERE id=?", (trade_id,))
         row = c.fetchone()
@@ -646,7 +647,7 @@ def db_get_today_trades():
     try:
         et    = pytz.timezone("America/New_York")
         today = datetime.now(et).strftime("%Y-%m-%d")
-        conn  = sqlite3.connect(DB_FILE)
+        conn  = db_utils.connect(DB_FILE)
         c     = conn.cursor()
         c.execute("""
             SELECT id,symbol,direction,premium,contracts,stop,target,
@@ -666,7 +667,7 @@ def db_get_today_trades():
 
 def db_get_open_trades():
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             SELECT id,symbol,direction,premium,contracts,stop,target,ts,
@@ -838,82 +839,27 @@ def market_open():
 # DATA FETCHING
 # =============================================
 
+import data_fetcher
+
+
 def get_intraday(symbol):
-    try:
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "5Min", "limit": 78}, timeout=10)
-        if r.status_code != 200:
-            log("Intraday {} error: {}".format(symbol, r.text[:80]))
-            return None
-        bars = r.json().get("bars", [])
-        log("Intraday {}: {} bars".format(symbol, len(bars)))
-        return bars
-    except Exception as e:
-        log("Intraday exception {}: {}".format(symbol, e))
-        return None
+    return data_fetcher.get_intraday(symbol)
 
 
 def get_daily(symbol):
-    try:
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "1Day", "limit": 20}, timeout=10)
-        if r.status_code != 200:
-            return None
-        return r.json().get("bars", [])
-    except:
-        return None
+    return data_fetcher.get_daily(symbol)
 
 
 def get_1hr_bars(symbol):
-    """Last 30 x 1hr bars for key level detection."""
-    try:
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "1Hour", "limit": 30}, timeout=10)
-        if r.status_code != 200:
-            return None
-        return r.json().get("bars", [])
-    except:
-        return None
+    return data_fetcher.get_1hr_bars(symbol)
 
 
 def get_4hr_bars(symbol):
-    """Synthesize 4hr candles from 1hr bars (4 x 1hr grouped)."""
-    try:
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "1Hour", "limit": 80}, timeout=10)
-        if r.status_code != 200:
-            return None
-        bars = r.json().get("bars", [])
-        if not bars:
-            return None
-        grouped = []
-        for i in range(0, len(bars) - 3, 4):
-            chunk = bars[i:i+4]
-            grouped.append({
-                "o": chunk[0]["o"],
-                "h": max(b["h"] for b in chunk),
-                "l": min(b["l"] for b in chunk),
-                "c": chunk[-1]["c"],
-                "v": sum(b["v"] for b in chunk),
-                "t": chunk[0]["t"],
-            })
-        return grouped
-    except:
-        return None
+    return data_fetcher.get_4hr_bars(symbol)
 
 
 def get_current_price(symbol):
-    try:
-        r = requests.get(QUOTE_URL.format(symbol), headers=HEADERS, timeout=5)
-        if r.status_code == 200:
-            q  = r.json().get("quote", {})
-            ap = q.get("ap", 0)
-            bp = q.get("bp", 0)
-            if ap and bp:
-                return round((ap + bp) / 2, 2)
-    except:
-        pass
-    return None
+    return data_fetcher.get_current_price(symbol)
 
 
 # =============================================
@@ -2160,6 +2106,10 @@ def scan_all_symbols():
         log("GEX: ${}B {} | {}".format(
             gex_bias.get("gex_b"), gex_bias.get("regime"),
             gex_bias.get("note", "")))
+
+    # Warm all bar caches in parallel before the per-symbol loop.
+    # SYMBOLS + SPY/QQQ for the market-alignment block below.
+    data_fetcher.prefetch_symbols(list(set(SYMBOLS) | {"SPY", "QQQ"}))
 
     # Broad market alignment
     spy_chg_global = get_spy_change()
@@ -6098,7 +6048,7 @@ def close_trade():
 def stats_page():
     """Win rate breakdown by symbol, grade, hour, direction."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
             SELECT symbol, direction, outcome, pnl, r_mult,
@@ -6898,7 +6848,7 @@ You have full knowledge of this scanner's methodology:
 def db_status():
     """Debug endpoint: shows DB file path, trade counts, and AI state."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = db_utils.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM trades WHERE outcome='OPEN'")
         open_count = c.fetchone()[0]

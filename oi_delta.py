@@ -15,6 +15,7 @@
 
 import os
 import sqlite3
+import db_utils
 import json
 import statistics
 from datetime import datetime, timedelta
@@ -24,7 +25,7 @@ OI_DB = "oi_history.db"
 
 
 def _init_db():
-    conn = sqlite3.connect(OI_DB)
+    conn = db_utils.connect(OI_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS oi_snapshots (
@@ -68,7 +69,7 @@ def save_snapshot(symbol, chain_data, snap_date=None):
         snap_date = datetime.now(et).strftime("%Y-%m-%d")
     now_iso = datetime.now(et).isoformat()
 
-    conn = sqlite3.connect(OI_DB)
+    conn = db_utils.connect(OI_DB)
     c    = conn.cursor()
 
     # Wipe existing for this date+symbol
@@ -124,7 +125,7 @@ def compute_delta(symbol, current_date=None, lookback_days=1):
     if current_date is None:
         current_date = datetime.now(et).strftime("%Y-%m-%d")
 
-    conn = sqlite3.connect(OI_DB)
+    conn = db_utils.connect(OI_DB)
     c    = conn.cursor()
 
     # Find the most recent snapshot date AT OR BEFORE current_date

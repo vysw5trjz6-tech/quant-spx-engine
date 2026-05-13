@@ -13,6 +13,7 @@ import os
 import json
 import time
 import sqlite3
+import db_utils
 import statistics
 import requests
 from datetime import datetime, timedelta
@@ -37,7 +38,7 @@ VOL_REFRESH_HOURS = 24   # rebuild cache every 24h
 # =============================================
 
 def _init_vol_db():
-    conn = sqlite3.connect(VOL_CACHE_DB)
+    conn = db_utils.connect(VOL_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS bar_profile (
@@ -152,7 +153,7 @@ def build_profile(symbol):
     et  = pytz.timezone("America/New_York")
     now = datetime.now(et).isoformat()
 
-    conn = sqlite3.connect(VOL_CACHE_DB)
+    conn = db_utils.connect(VOL_CACHE_DB)
     c    = conn.cursor()
 
     # Wipe and rebuild
@@ -182,7 +183,7 @@ def build_profile(symbol):
 
 def needs_refresh(symbol):
     """Returns True if profile is missing or older than VOL_REFRESH_HOURS."""
-    conn = sqlite3.connect(VOL_CACHE_DB)
+    conn = db_utils.connect(VOL_CACHE_DB)
     c    = conn.cursor()
     c.execute("SELECT last_built FROM profile_meta WHERE symbol = ?", (symbol,))
     row = c.fetchone()
@@ -227,7 +228,7 @@ def get_true_volume_ratio(symbol, current_bar_idx, current_volume):
     if current_bar_idx < 0 or current_bar_idx > 77:
         return 1.0, "N/A", 50
 
-    conn = sqlite3.connect(VOL_CACHE_DB)
+    conn = db_utils.connect(VOL_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         SELECT median_vol, p25_vol, p75_vol, sample_n

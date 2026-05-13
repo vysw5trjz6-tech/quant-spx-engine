@@ -22,6 +22,7 @@
 
 import os
 import sqlite3
+import db_utils
 import json
 from datetime import datetime, timedelta, time as dtime
 import pytz
@@ -30,7 +31,7 @@ FLOW_DB = "options_flow.db"
 
 
 def _init_db():
-    conn = sqlite3.connect(FLOW_DB)
+    conn = db_utils.connect(FLOW_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS flow_summaries (
@@ -314,7 +315,7 @@ def _summarize_trades(symbol, flow_date_str, trades_df, quotes_df, inst_map):
 
 
 def _store_flow(s):
-    conn = sqlite3.connect(FLOW_DB)
+    conn = db_utils.connect(FLOW_DB)
     c    = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO flow_summaries
@@ -341,7 +342,7 @@ def _store_flow(s):
 def load_flow(symbol, flow_date):
     if hasattr(flow_date, "isoformat"):
         flow_date = flow_date.isoformat()
-    conn = sqlite3.connect(FLOW_DB)
+    conn = db_utils.connect(FLOW_DB)
     c    = conn.cursor()
     c.execute("""
         SELECT call_premium, put_premium, call_volume, put_volume,

@@ -18,6 +18,7 @@
 
 import os
 import sqlite3
+import db_utils
 import json
 import statistics
 from datetime import datetime, timedelta, time as dtime
@@ -27,7 +28,7 @@ PROFILE_DB = "market_profile.db"
 
 
 def _init_db():
-    conn = sqlite3.connect(PROFILE_DB)
+    conn = db_utils.connect(PROFILE_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
@@ -245,7 +246,7 @@ def build_rth_profile(symbol="ES", target_date_et=None):
 
 
 def _store_profile(profile):
-    conn = sqlite3.connect(PROFILE_DB)
+    conn = db_utils.connect(PROFILE_DB)
     c    = conn.cursor()
     et = pytz.timezone("America/New_York")
     c.execute("""
@@ -271,7 +272,7 @@ def load_profile(symbol, session_date, session_type="RTH"):
     """Load a stored profile, or None if not present."""
     if hasattr(session_date, "isoformat"):
         session_date = session_date.isoformat()
-    conn = sqlite3.connect(PROFILE_DB)
+    conn = db_utils.connect(PROFILE_DB)
     c    = conn.cursor()
     c.execute("""
         SELECT poc, vah, val, session_high, session_low,

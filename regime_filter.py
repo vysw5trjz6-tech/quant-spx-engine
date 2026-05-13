@@ -261,6 +261,82 @@ def _regime_note(regime, iv_rv_gap):
 
 
 # =============================================
+# VIX TERM STRUCTURE
+# =============================================
+#
+# VIX9D < VIX < VIX3M = normal contango (forward vol priced higher).
+# VIX9D > VIX > VIX3M = backwardation (front-month panic). Historically
+# one of the cleanest short-term mean-revert signals on SPX -- inversions
+# unwind within 3-5 sessions ~75% of the time. Cheap to compute: 3 EOD
+# index reads via yfinance.
+
+def get_vix_term_structure():
+    """
+    Returns dict with VIX9D / VIX / VIX3M and a regime label, or None on failure.
+
+      label one of:
+        "DEEP_BACKWARDATION"  -- VIX9D / VIX3M > 1.10  (panic, fade reflex moves)
+        "BACKWARDATION"       -- VIX9D > VIX3M         (cautious, expect bounce)
+        "FLAT"                -- |VIX9D - VIX3M| < 5%  (mixed, no edge)
+        "CONTANGO"            -- VIX3M > VIX9D         (normal, trend-friendly)
+        "DEEP_CONTANGO"       -- VIX3M / VIX9D > 1.15  (complacent, vol-of-vol up)
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+
+    try:
+        tickers = yf.Tickers("^VIX9D ^VIX ^VIX3M")
+        out = {}
+        for tk in ("^VIX9D", "^VIX", "^VIX3M"):
+            hist = tickers.tickers[tk].history(period="5d", interval="1d")
+            if hist is None or hist.empty:
+                return None
+            out[tk] = float(hist["Close"].iloc[-1])
+    except Exception as e:
+        print("[regime] term-structure fetch failed: {}".format(e))
+        return None
+
+    vix9d, vix, vix3m = out["^VIX9D"], out["^VIX"], out["^VIX3M"]
+    if vix9d <= 0 or vix3m <= 0:
+        return None
+
+    ratio = vix9d / vix3m  # >1 = backwardation, <1 = contango
+
+    if ratio > 1.10:
+        label = "DEEP_BACKWARDATION"
+        bias  = "FADE_DOWNSIDE"
+        note  = "Front-month panic. Historically reverts within 3-5 sessions."
+    elif ratio > 1.02:
+        label = "BACKWARDATION"
+        bias  = "CAUTIOUS_LONG"
+        note  = "Short-term stress. Bounce probable but not immediate."
+    elif ratio > 0.97:
+        label = "FLAT"
+        bias  = "NEUTRAL"
+        note  = "Term structure flat. No directional signal."
+    elif ratio > 0.87:
+        label = "CONTANGO"
+        bias  = "TREND_FRIENDLY"
+        note  = "Normal contango. Standard regime."
+    else:
+        label = "DEEP_CONTANGO"
+        bias  = "WATCH_VOL_SPIKE"
+        note  = "Very steep contango. Complacency risk -- watch for vol expansion."
+
+    return {
+        "vix9d":  round(vix9d, 2),
+        "vix":    round(vix, 2),
+        "vix3m":  round(vix3m, 2),
+        "ratio":  round(ratio, 3),
+        "label":  label,
+        "bias":   bias,
+        "note":   note,
+    }
+
+
+# =============================================
 # INTEGRATION HELPERS
 # =============================================
 

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# SQLite caches created by modules at import-time / runtime
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+.pytest_cache/
+.venv/
+venv/
+.env

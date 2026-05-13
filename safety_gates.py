@@ -6,6 +6,7 @@ import os
 import math
 import json
 import sqlite3
+import db_utils
 import statistics
 import requests
 from datetime import datetime, timedelta
@@ -143,7 +144,7 @@ EARNINGS_CACHE_DB = "earnings_calendar.db"
 
 
 def _init_earnings_db():
-    conn = sqlite3.connect(EARNINGS_CACHE_DB)
+    conn = db_utils.connect(EARNINGS_CACHE_DB)
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS earnings (
@@ -178,7 +179,7 @@ def update_earnings_calendar(symbol, fmp_api_key=None):
     et  = pytz.timezone("America/New_York")
     now = datetime.now(et).isoformat()
 
-    conn = sqlite3.connect(EARNINGS_CACHE_DB)
+    conn = db_utils.connect(EARNINGS_CACHE_DB)
     c    = conn.cursor()
     rows_written = 0
 
@@ -226,7 +227,7 @@ def days_to_earnings(symbol):
     Returns the number of trading days until next earnings, or None if unknown.
     Negative = earnings already passed (within last 7 days).
     """
-    conn = sqlite3.connect(EARNINGS_CACHE_DB)
+    conn = db_utils.connect(EARNINGS_CACHE_DB)
     c    = conn.cursor()
     et    = pytz.timezone("America/New_York")
     today = datetime.now(et).date()
@@ -255,7 +256,7 @@ def get_prior_earnings_dates(symbol, max_quarters=8):
     newest first. Used by the IV crush strategy to compute historical
     post-earnings moves.
     """
-    conn = sqlite3.connect(EARNINGS_CACHE_DB)
+    conn = db_utils.connect(EARNINGS_CACHE_DB)
     c    = conn.cursor()
     et    = pytz.timezone("America/New_York")
     today = datetime.now(et).date()
