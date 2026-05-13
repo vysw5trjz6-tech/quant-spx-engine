@@ -2860,6 +2860,15 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
     )
 
     try:
+        # End-of-day call gets Opus for richer reasoning over the full
+        # day's signal set; intraday updates stay on Sonnet for speed/cost.
+        if trigger == "end_of_day":
+            ai_model     = "claude-opus-4-7"
+            ai_max_tokens = 1500
+        else:
+            ai_model     = "claude-sonnet-4-20250514"
+            ai_max_tokens = 1000
+
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -2868,13 +2877,13 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
                 "content-type":      "application/json",
             },
             json={
-                "model":      "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
+                "model":      ai_model,
+                "max_tokens": ai_max_tokens,
                 "messages":   [{"role": "user", "content": prompt}]
             },
-            timeout=30
+            timeout=60
         )
-        log("AI: Anthropic HTTP {}".format(resp.status_code))
+        log("AI: Anthropic HTTP {} (model={})".format(resp.status_code, ai_model))
 
         if resp.status_code != 200:
             log("AI: API error: {}".format(resp.text[:200]))
@@ -2991,6 +3000,132 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
         log("AI: JSON parse error: {} | raw: {}".format(e, raw[:200]))
     except Exception as e:
         log("AI: Exception: {}".format(e))
+
+
+def _filter_trades_since(trades, cutoff_iso_date):
+    """Trades whose ts (ISO) is on or after cutoff_iso_date (YYYY-MM-DD)."""
+    out = []
+    for t in trades:
+        ts = t.get("ts") or ""
+        if ts[:10] >= cutoff_iso_date:
+            out.append(t)
+    return out
+
+
+def run_friday_digest():
+    """
+    Friday-only weekly upgrade summary, sent via Telegram.
+    Uses Opus 4.7 for synthesis. Runs once per Friday after close.
+    """
+    if not ANTHROPIC_KEY:
+        log("FridayDigest: ANTHROPIC_API_KEY not set - skipping")
+        return
+
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.weekday() != 4:   # 0=Mon..4=Fri
+        log("FridayDigest: not Friday - skipping")
+        return
+
+    all_trades = db_get_all_closed_trades()
+    if len(all_trades) < 5:
+        log("FridayDigest: only {} closed trades - skipping".format(len(all_trades)))
+        return
+
+    # Last 7 calendar days (covers the 5-trading-day week)
+    cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    week_trades = _filter_trades_since(all_trades, cutoff)
+    if len(week_trades) < 3:
+        log("FridayDigest: only {} trades this week - skipping".format(len(week_trades)))
+        return
+
+    stats    = _build_stats_summary(week_trades)
+    cfg      = get_config()
+    analyses = db_get_ai_analyses(limit=5)
+    proposals = db_get_proposals(status="pending", limit=5) if "db_get_proposals" in globals() else []
+
+    recent_insights = [{
+        "date":    (a.get("ts") or "")[:10],
+        "insight": a.get("insight") or "",
+        "focus":   a.get("focus") or "",
+    } for a in analyses]
+
+    proposal_briefs = [{
+        "title":   p.get("title", ""),
+        "summary": p.get("summary", ""),
+    } for p in proposals]
+
+    prompt = """You are reviewing a week of automated 0DTE/swing options signals from an algorithmic trading system. \
+Most outcomes are paper-traded (synthetic backtest of the system's own signals against intraday bars), so treat them as signal quality rather than realized PnL.
+
+WEEK STATS:
+{stats}
+
+RECENT AI INSIGHTS (newest first):
+{insights}
+
+PENDING STRUCTURAL PROPOSALS:
+{proposals}
+
+CURRENT FOCUS: {focus}
+
+Write a Telegram message under 380 words. Plain text only (no markdown, no asterisks, no backticks). \
+Use these sections, each prefixed exactly as written:
+
+WEEK RECAP:
+2 sentences. Overall signal quality this week, citing win-rate and avg-R.
+
+TOP UPGRADES (next week):
+Numbered list of 3 specific, actionable changes. Each: one short title line, then 1-2 sentences of reasoning that cite specific stats (which symbol/grade/time bucket/regime). \
+Prefer config tweaks the AI loop can already make; only suggest structural changes if data clearly warrants new code.
+
+WATCH:
+1-2 sentences on the single biggest risk or unknown to monitor next week.
+
+Be direct. No "consider" / "you might want to". No emojis. No closing pleasantries.""".format(
+        stats     = json.dumps(stats,           indent=2),
+        insights  = json.dumps(recent_insights, indent=2),
+        proposals = json.dumps(proposal_briefs, indent=2) if proposal_briefs else "(none)",
+        focus     = cfg.get("ai_focus", "(none)"),
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-opus-4-7",
+                "max_tokens": 1500,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            timeout=90,
+        )
+        log("FridayDigest: Anthropic HTTP {}".format(resp.status_code))
+        if resp.status_code != 200:
+            log("FridayDigest: API error: {}".format(resp.text[:200]))
+            return
+        body = resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        log("FridayDigest: API exception: {}".format(e))
+        return
+
+    header  = "Weekly Upgrade Digest - {}".format(now.strftime("%Y-%m-%d"))
+    summary = "Trades analyzed: {} | Win rate: {}% | Avg R: {}".format(
+        stats.get("total_trades", 0),
+        stats.get("win_rate", 0),
+        stats.get("avg_r_mult", 0),
+    )
+    msg = "{}\n{}\n\n{}".format(header, summary, body)
+
+    if send_telegram(msg):
+        log("FridayDigest: sent ({} chars)".format(len(msg)))
+    else:
+        log("FridayDigest: send_telegram failed")
+
 
 def _run_proposal_analysis(trades, stats):
     """
@@ -5359,6 +5494,9 @@ def background_scheduler():
     _daily_refresh_done["oi"]         = boot_hour >= 16.5
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
     _daily_refresh_done["paper"]      = boot_hour >= 16.05
+    # Only relevant on Fridays; pre-mark on non-Fridays so it never fires.
+    _is_friday = datetime.now(et).weekday() == 4
+    _daily_refresh_done["friday_digest"] = (not _is_friday) or (boot_hour >= 16.25)
     _premarket_done["date"]           = today_str if boot_hour >= 9.4 else None
     _overnight_done["date"]           = today_str if boot_hour >= 15.93 else None
 
@@ -5391,6 +5529,10 @@ def background_scheduler():
                 _daily_refresh_done["flow"]      = False
                 _daily_refresh_done["oi"]        = False
                 _daily_refresh_done["paper"]     = False
+                # Pre-mark non-Fridays so the digest never fires on Mon-Thu.
+                _daily_refresh_done["friday_digest"] = (
+                    datetime.now(et).weekday() != 4
+                )
             if et_hour >= 6.0 and not _daily_refresh_done.get("earnings"):
                 threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
                 _daily_refresh_done["earnings"] = True
@@ -5475,6 +5617,15 @@ def background_scheduler():
                     args=("end_of_day",),
                     daemon=True
                 ).start()
+
+            # 1b. Friday weekly upgrade digest: ~10 min after EOD AI so the
+            #     latest analysis is committed. Opus-generated, Telegram-sent.
+            if (et_hour >= 16.25
+                    and datetime.now(et).weekday() == 4
+                    and not _daily_refresh_done.get("friday_digest")):
+                _daily_refresh_done["friday_digest"] = True
+                log("AI: Friday digest trigger")
+                threading.Thread(target=run_friday_digest, daemon=True).start()
 
             # 2. Intraday: run after every 15 new closed trades
             #    (was 3 — too noisy. Bayesian gate inside run_ai_improvement
