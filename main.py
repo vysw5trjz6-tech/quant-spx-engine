@@ -4946,11 +4946,9 @@ def _refresh_volume_profiles():
 
 
 def _refresh_earnings_calendar():
-    """Once-daily refresh of upcoming earnings dates."""
+    """Once-daily refresh of upcoming earnings dates via yfinance."""
     if not HAS_SAFETY_GATES:
         return
-    if not os.getenv("FMP_API_KEY", "").strip():
-        return  # silent skip if no API key
     try:
         all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
         ok_count = 0
@@ -4970,15 +4968,12 @@ def _refresh_gex_snapshots():
     """
     if not HAS_GEX:
         return
-    # Need either Databento or Polygon to be available
-    have_provider = bool(os.getenv("POLYGON_API_KEY", "").strip())
+    # Databento is the sole chain provider for GEX.
     try:
         import databento_adapter
-        if databento_adapter.is_available():
-            have_provider = True
+        if not databento_adapter.is_available():
+            return
     except ImportError:
-        pass
-    if not have_provider:
         return
 
     try:
@@ -7338,9 +7333,9 @@ def gex_endpoint():
     if not bias:
         return jsonify({
             "status":        "no_data",
-            "note":          "GEX not yet built. Requires POLYGON_API_KEY and post-close refresh.",
+            "note":          "GEX not yet built. Requires DATABENTO_API_KEY and post-close refresh.",
             "module_loaded": HAS_GEX,
-            "polygon_key":   bool(os.getenv("POLYGON_API_KEY", "").strip()),
+            "databento_key": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
         })
     # Also pull the latest raw snapshot for SPY for the dashboard
     raw_spy = None
@@ -7452,17 +7447,18 @@ def edge_endpoint():
             "iv_rank":          HAS_IV_RANK,
         },
         "api_keys": {
-            "polygon":   bool(os.getenv("POLYGON_API_KEY", "").strip()),
-            "fmp":       bool(os.getenv("FMP_API_KEY", "").strip()),
+            "alpaca":    bool(os.getenv("APCA_API_KEY_ID", "").strip()),
             "databento": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
             "anthropic": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+            "telegram":  bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
         },
         "providers_active": {
-            "vix_source":       "databento" if databento_available else "vixy_proxy",
-            "futures_source":   "databento" if databento_available else
-                                ("polygon_index" if os.getenv("POLYGON_API_KEY","").strip() else "alpaca_etf"),
-            "gex_source":       "databento" if databento_available else
-                                ("polygon" if os.getenv("POLYGON_API_KEY","").strip() else "disabled"),
+            "bars_source":      "alpaca",
+            "options_iv_source":"alpaca",
+            "vix_source":       "yahoo_finance",
+            "earnings_source":  "yahoo_finance",
+            "futures_source":   "databento" if databento_available else "alpaca_etf",
+            "gex_source":       "databento" if databento_available else "disabled",
         },
     })
 
@@ -7669,11 +7665,9 @@ def diag_endpoint():
         },
         "api_keys": {
             "alpaca":    bool(os.getenv("APCA_API_KEY_ID", "").strip()),
+            "databento": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
             "anthropic": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
             "telegram":  bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
-            "databento": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
-            "polygon":   bool(os.getenv("POLYGON_API_KEY", "").strip()),
-            "fmp":       bool(os.getenv("FMP_API_KEY", "").strip()),
         },
     }
 

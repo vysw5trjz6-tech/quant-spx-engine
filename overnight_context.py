@@ -8,9 +8,8 @@
 #   3. Gap classification: where does today's RTH open sit relative to the
 #      overnight range? Each class has a distinct base rate.
 #
-# Provider: source-agnostic adapter. Default uses Polygon.io futures.
-# Set POLYGON_API_KEY env var. If unset, module falls back to MES/MNQ ETF
-# proxies (SPY/QQQ overnight via /v2/aggs with extended hours).
+# Provider: Databento for real CME futures (preferred); Alpaca ETF
+# extended-hours bars (SPY/QQQ/IWM) as the no-license fallback.
 
 import os
 import statistics
@@ -18,32 +17,13 @@ import requests
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
-POLYGON_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 
 
 # =============================================
-# DATA FETCHERS — pluggable provider
+# DATA FETCHERS
 # =============================================
-
-def _fetch_polygon_aggs(ticker, multiplier, timespan, frm, to):
-    """Polygon aggregates endpoint. Use for futures (e.g. /vX/aggs/I:ES)."""
-    if not POLYGON_KEY:
-        return []
-    url = ("https://api.polygon.io/v2/aggs/ticker/{}/range/{}/{}/{}/{}"
-           .format(ticker, multiplier, timespan, frm, to))
-    try:
-        r = requests.get(url, params={
-            "adjusted": "true", "sort": "asc", "limit": 5000,
-            "apiKey": POLYGON_KEY
-        }, timeout=12)
-        if r.status_code != 200:
-            return []
-        return r.json().get("results", []) or []
-    except Exception:
-        return []
-
 
 def _fetch_alpaca_extended_hours(symbol, start_iso, end_iso):
     """
@@ -100,8 +80,7 @@ def _get_overnight_bars(target_date_et, contract="ES"):
     """
     Get overnight bars. Provider priority:
       1. Databento (real CME futures — best)
-      2. Polygon (index proxy)
-      3. Alpaca ETF proxy (SPY/QQQ extended hours — worst but free)
+      2. Alpaca ETF proxy (SPY/QQQ/IWM extended hours — fallback)
     Returns list of bar dicts: {t, o, h, l, c, v}
     """
     # --- Path 1: Databento real futures ---
@@ -110,7 +89,6 @@ def _get_overnight_bars(target_date_et, contract="ES"):
         if databento_adapter.is_available():
             bars = databento_adapter.get_overnight_bars(contract, target_date_et)
             if bars:
-                # Normalize to expected shape (t, o, h, l, c, v)
                 return [b for b in bars if all(b.get(k) is not None
                                                  for k in ("o","h","l","c"))]
     except ImportError:
@@ -118,38 +96,8 @@ def _get_overnight_bars(target_date_et, contract="ES"):
     except Exception:
         pass
 
+    # --- Path 2: Alpaca ETF proxy fallback ---
     start_iso, end_iso = overnight_window(target_date_et)
-
-    # --- Path 2: Polygon index ---
-    if POLYGON_KEY:
-        ticker_map = {
-            "ES":  "I:SPX",
-            "NQ":  "I:NDX",
-            "RTY": "I:RUT",
-        }
-        ticker = ticker_map.get(contract, "I:SPX")
-        frm = target_date_et - timedelta(days=1)
-        bars = _fetch_polygon_aggs(
-            ticker, 5, "minute",
-            frm.strftime("%Y-%m-%d"),
-            target_date_et.strftime("%Y-%m-%d")
-        )
-        if bars:
-            normalized = []
-            et = pytz.timezone("America/New_York")
-            start_dt = datetime.fromisoformat(start_iso)
-            end_dt   = datetime.fromisoformat(end_iso)
-            for b in bars:
-                bt = datetime.fromtimestamp(b["t"] / 1000.0, tz=pytz.UTC)
-                if start_dt <= bt <= end_dt:
-                    normalized.append({
-                        "t": bt.astimezone(et).isoformat(),
-                        "o": b["o"], "h": b["h"], "l": b["l"],
-                        "c": b["c"], "v": b.get("v", 0),
-                    })
-            return normalized
-
-    # --- Path 3: Alpaca ETF proxy fallback ---
     proxy_map = {"ES": "SPY", "NQ": "QQQ", "RTY": "IWM"}
     proxy = proxy_map.get(contract, "SPY")
     return _fetch_alpaca_extended_hours(proxy, start_iso, end_iso)
