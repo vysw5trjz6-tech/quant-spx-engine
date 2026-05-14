@@ -294,6 +294,34 @@ def log(msg):
             debug_log.pop(0)
 
 
+def log_warn(msg):
+    # Stays on stdout (the platform classifies stdout as `info`) but the
+    # WARN prefix makes it filterable in log search.
+    log("WARN: {}".format(msg))
+
+
+def log_error(msg):
+    # Writes to stderr so the platform log shipper tags it as `error`.
+    import sys as _sys
+    ts    = datetime.now(pytz.utc).strftime("%H:%M:%S")
+    entry = "[{}] ERROR: {}".format(ts, msg)
+    print(entry, file=_sys.stderr, flush=True)
+    with state_lock:
+        debug_log.append(entry)
+        if len(debug_log) > 150:
+            debug_log.pop(0)
+
+
+# Werkzeug's default request handler writes every "GET / 200" line to stderr,
+# which the log shipper then tags as `error`. Silence the 2xx/3xx access logs
+# at the source so only actual server errors (5xx) bubble up there.
+try:
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+except Exception:
+    pass
+
+
 # =============================================
 # DATABASE
 # =============================================
@@ -2129,13 +2157,21 @@ def scan_all_symbols():
         strat_rules["size_multiplier"] *= gex_bias.get("size_mult", 1.0)
 
     if regime:
-        log("Regime: {} (VIX {}) | size x{:.2f} | {}".format(
+        _regime_line = "Regime: {} (VIX {}) | size x{:.2f} | {}".format(
             regime.get("regime"), regime.get("vix"),
-            strat_rules["size_multiplier"], regime.get("note", "")))
+            strat_rules["size_multiplier"], regime.get("note", ""))
+        if regime.get("vix") is None:
+            log_warn(_regime_line + " (VIX unavailable — using fallback)")
+        else:
+            log(_regime_line)
     if gex_bias:
-        log("GEX: ${}B {} | {}".format(
+        _gex_line = "GEX: ${}B {} | {}".format(
             gex_bias.get("gex_b"), gex_bias.get("regime"),
-            gex_bias.get("note", "")))
+            gex_bias.get("note", ""))
+        if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
+            log_warn(_gex_line)
+        else:
+            log(_gex_line)
 
     # Warm all bar caches in parallel before the per-symbol loop.
     # SYMBOLS + SPY/QQQ for the market-alignment block below.
@@ -2928,7 +2964,8 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
         log("AI: Anthropic HTTP {} (model={})".format(resp.status_code, ai_model))
 
         if resp.status_code != 200:
-            log("AI: API error: {}".format(resp.text[:200]))
+            log_error("AI: Anthropic HTTP {} {}".format(
+                resp.status_code, resp.text[:200]))
             # Backoff on auth/billing errors — these don't fix themselves
             # within minutes, so stop retrying until tomorrow.
             err_text = resp.text.lower()
@@ -2939,7 +2976,7 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
                 et = pytz.timezone("America/New_York")
                 _ai_last_run_date = datetime.now(et).strftime("%Y-%m-%d")
                 _ai_last_trade_cnt = len(trades)
-                log("AI: backoff engaged — will not retry until tomorrow")
+                log_warn("AI: backoff engaged — will not retry until tomorrow")
             return
 
         raw = resp.json()["content"][0]["text"].strip()
@@ -3148,11 +3185,12 @@ Be direct. No "consider" / "you might want to". No emojis. No closing pleasantri
         )
         log("FridayDigest: Anthropic HTTP {}".format(resp.status_code))
         if resp.status_code != 200:
-            log("FridayDigest: API error: {}".format(resp.text[:200]))
+            log_error("FridayDigest: Anthropic HTTP {} {}".format(
+                resp.status_code, resp.text[:200]))
             return
         body = resp.json()["content"][0]["text"].strip()
     except Exception as e:
-        log("FridayDigest: API exception: {}".format(e))
+        log_error("FridayDigest: API exception: {}".format(e))
         return
 
     header  = "Weekly Upgrade Digest - {}".format(now.strftime("%Y-%m-%d"))
@@ -3254,7 +3292,7 @@ If the data does not yet support any specific proposal, return: {{"proposals": [
         )
 
         if resp.status_code != 200:
-            log("AI proposals: API error {}".format(resp.status_code))
+            log_error("AI proposals: Anthropic HTTP {}".format(resp.status_code))
             return
 
         raw = resp.json()["content"][0]["text"].strip()
