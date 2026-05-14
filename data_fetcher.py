@@ -47,6 +47,11 @@ _DAILY_CACHE    = TTLCache(maxsize=256, ttl=3600)
 _HR1_CACHE      = TTLCache(maxsize=256, ttl=1800)
 _HR4_CACHE      = TTLCache(maxsize=256, ttl=3600)
 _QUOTE_CACHE    = TTLCache(maxsize=256, ttl=5)
+# Yahoo Finance has its own rate limits and adds ~500-1500ms latency.
+# Cache the last-price call for 30s -- long enough that re-checks within
+# a scan loop are free, short enough that a stale rescue doesn't outlive
+# the next real Alpaca print.
+_YAHOO_CACHE    = TTLCache(maxsize=256, ttl=30)
 _LOCK           = threading.RLock()
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="data-fetch")
@@ -176,6 +181,49 @@ def _parse_alpaca_ts(ts_str):
         return None
 
 
+def _yahoo_last_price(symbol):
+    """
+    Pull `last_price` from yfinance.Ticker(symbol).fast_info.
+
+    Yahoo Finance is officially delayed 15 min for free US equity data,
+    but in practice fast_info["last_price"] returns within ~1s for
+    liquid names. We use it strictly as a fallback when Alpaca's IEX
+    feed has gone stale (common for non-IEX-heavy names on fast moves).
+
+    Returns the float price or None. Cached 30s.
+    """
+    with _LOCK:
+        cached = _YAHOO_CACHE.get(symbol)
+    if cached is not None:
+        return cached
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+
+    try:
+        info = yf.Ticker(symbol).fast_info
+        # yfinance exposes fast_info both as a dict-like and as an object;
+        # last_price is sometimes lastPrice. Probe both.
+        last = None
+        if hasattr(info, "get"):
+            last = info.get("last_price") or info.get("lastPrice")
+        if last is None:
+            last = getattr(info, "last_price", None) or getattr(info, "lastPrice", None)
+        if last is None:
+            return None
+        price = round(float(last), 2)
+        if price <= 0:
+            return None
+    except Exception:
+        return None
+
+    with _LOCK:
+        _YAHOO_CACHE[symbol] = price
+    return price
+
+
 def get_price_with_freshness(symbol):
     """
     Pull the freshest valid price for `symbol` from Alpaca's snapshot
@@ -229,11 +277,40 @@ def get_price_with_freshness(symbol):
         candidates.append(((now_utc - q_ts).total_seconds(),
                            round((float(ap) + float(bp)) / 2, 2), "quote"))
 
-    if not candidates:
-        return None, None, None
+    # Prior daily close lives in the same snapshot; we'll use it to
+    # sanity-check a Yahoo rescue (reject yfinance values that are wildly
+    # off, which can happen during yfinance rate limits or symbol typos).
+    prev_close = None
+    prev = snap.get("prevDailyBar") or {}
+    if prev.get("c"):
+        try:
+            prev_close = float(prev["c"])
+        except Exception:
+            prev_close = None
 
     candidates.sort(key=lambda x: x[0])
-    age, price, source = candidates[0]
+    if candidates:
+        age, price, source = candidates[0]
+    else:
+        age, price, source = None, None, None
+
+    # Alpaca is fresh enough -- no rescue needed.
+    if price is not None and age is not None and age <= STALE_PRICE_MAX_AGE_SECONDS:
+        return price, age, source
+
+    # Alpaca is stale or missing. Try Yahoo as a fallback.
+    yp = _yahoo_last_price(symbol)
+    if yp is not None:
+        # Sanity check: a Yahoo price must agree with the prior daily
+        # close within +/- 20%. Most stocks rarely move that much in a
+        # single session; this catches obviously-broken Yahoo responses
+        # without rejecting legitimate gap moves.
+        sane = prev_close is None or abs(yp - prev_close) / prev_close <= 0.20
+        if sane:
+            return yp, 0.0, "yahoo"
+
+    # No rescue -- return whatever Alpaca had (caller's is_price_stale
+    # gate will mark this stale and skip the signal).
     return price, age, source
 
 
@@ -256,22 +333,31 @@ def get_current_price(symbol):
 
 def is_price_stale(symbol):
     """
-    Returns (is_stale, age_seconds, source). is_stale is True when the
-    freshest price source for `symbol` exceeds STALE_PRICE_MAX_AGE_SECONDS
-    during regular trading hours. Outside RTH we don't gate -- the scanner
-    has its own pre-ORB / post-close logic. Used by the 0DTE scanner to
-    skip signal generation on stocks whose IEX prints have gone stale.
+    Returns (is_stale, price, age_seconds, source).
+
+    is_stale = True when no fresh price source exists during RTH. Sources
+    are checked in priority order inside get_price_with_freshness:
+      1. Alpaca latestTrade / minuteBar / latestQuote (IEX feed)
+      2. Yahoo Finance fast_info.last_price (rescue)
+
+    A symbol that gets rescued by Yahoo returns source="yahoo", age=0,
+    and is_stale=False. Callers should use the returned price as the
+    current spot (the bar-close in intraday[-1] may still be stale on
+    IEX, so the scanner overrides it with this price when source=yahoo).
+
+    Outside RTH we don't gate -- pre/post-market signals are handled
+    elsewhere.
     """
     now_et = datetime.now(_ET)
     et_minutes = now_et.hour * 60 + now_et.minute
-    # RTH window 9:30 - 16:00 ET
+    # RTH window 9:30 - 16:00 ET on weekdays
     in_rth = (570 <= et_minutes < 960) and now_et.weekday() < 5
     price, age, source = get_price_with_freshness(symbol)
     if price is None or age is None:
-        return True, None, None
+        return True, None, None, None
     if in_rth and age > STALE_PRICE_MAX_AGE_SECONDS:
-        return True, age, source
-    return False, age, source
+        return True, price, age, source
+    return False, price, age, source
 
 
 def prefetch_symbols(symbols, series=("intraday", "daily", "1hr", "4hr")):

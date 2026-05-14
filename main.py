@@ -2205,10 +2205,12 @@ def scan_all_symbols():
             result["status"] = "no data"; results.append(result); continue
 
         # Stale-price guard. On free Alpaca (IEX-only feed) the latest
-        # quote/trade can be minutes old for non-IEX-heavy names. Skip
-        # the symbol entirely rather than feed a wrong spot into the
-        # entry/strike/target math.
-        stale, age_s, source = data_fetcher.is_price_stale(symbol)
+        # quote/trade can be minutes old for non-IEX-heavy names. When
+        # that happens we try Yahoo Finance as a rescue inside
+        # is_price_stale(); if Yahoo agrees with prior close within
+        # +/- 20% we accept it and override the (stale) IEX bar close
+        # downstream so entry/strike/target math uses the real spot.
+        stale, fresh_price, age_s, source = data_fetcher.is_price_stale(symbol)
         if stale:
             if age_s is None:
                 result["status"] = "no price"
@@ -2216,6 +2218,7 @@ def scan_all_symbols():
                 result["status"] = "stale price ({}s old from {})".format(
                     int(age_s), source or "?")
             results.append(result); continue
+        result["price_source"] = source
 
         # --- 0DTE earnings flag (don't block, just warn) ---
         if HAS_SAFETY_GATES:
@@ -2235,6 +2238,13 @@ def scan_all_symbols():
         orb_low  = min(b["l"] for b in orb)
         current  = intraday[-1]
         price    = current["c"]
+        # When the latest IEX bar is stale and Yahoo rescued the spot,
+        # override the bar close so strike selection, vs_orb_high and
+        # entry/target math use the real consolidated-tape price. VWAP
+        # and the ORB high/low stay as-is -- they're the day's session
+        # data, not "current".
+        if source == "yahoo" and fresh_price is not None:
+            price = fresh_price
         vwap     = calculate_vwap(intraday)
 
         if not vwap:
