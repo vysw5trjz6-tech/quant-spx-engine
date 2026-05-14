@@ -234,7 +234,7 @@ def compute_iv_rank(symbol, today_iv=None, min_history_days=30):
     below = sum(1 for v in ivs if v < today_iv)
     iv_percentile = below / len(ivs) * 100
 
-    return {
+    out = {
         "iv_today":      round(today_iv, 4),
         "iv_rank":       round(iv_rank, 1),
         "iv_percentile": round(iv_percentile, 1),
@@ -242,6 +242,77 @@ def compute_iv_rank(symbol, today_iv=None, min_history_days=30):
         "iv_max":        round(iv_max, 4),
         "iv_median":     round(iv_median, 4),
         "samples":       len(ivs),
+    }
+    # Attach the variance-risk-premium snapshot when realized vol is
+    # computable. Cheap: one Alpaca daily-bars call. None on quiet failure.
+    try:
+        gap = get_rv_iv_gap(symbol)
+        if gap:
+            out["rv"]            = gap["rv"]
+            out["iv_rv_gap_pct"] = gap["gap_pct"]
+            out["iv_rv_ratio"]   = gap["ratio"]
+            out["vrp_favorable"] = gap["vrp_favorable"]
+    except Exception:
+        pass
+    return out
+
+
+# =============================================
+# REALIZED vs IMPLIED VOL GAP (variance risk premium)
+# =============================================
+
+# Threshold for "premium selling is favorable": IV is at least 20% richer
+# than 20-day realized vol. Empirically SPY's long-run IV/RV ratio is
+# ~1.15-1.25; readings below 1.0 are "vol on sale" (don't sell), and
+# readings above 1.4 are crowded fear premium (best sell setups).
+VRP_FAVORABLE_RATIO = 1.20
+
+
+def get_rv_iv_gap(symbol, lookback_days=20):
+    """
+    Compute the variance risk premium: implied vol minus realized vol.
+
+    Returns dict (decimals -- 0.18 = 18%):
+      {
+        'iv':            latest stored ATM IV,
+        'rv':            trailing N-day realized vol,
+        'gap':           iv - rv,
+        'gap_pct':       gap expressed in vol points (e.g. 4.5 = 4.5%),
+        'ratio':         iv / rv,
+        'vrp_favorable': True when ratio >= VRP_FAVORABLE_RATIO,
+      }
+    or None when either input is missing.
+
+    Use vrp_favorable as a gate on premium-selling setups (short straddles,
+    iron condors, call/put-credit spreads). When False, you are paid less
+    for vol than the underlying is actually delivering -- a losing trade
+    in expectation.
+    """
+    # Local import to avoid circulars; regime_filter is a sibling module.
+    import regime_filter
+
+    rv_pct = regime_filter.get_realized_vol(symbol, lookback_days=lookback_days)
+    if rv_pct is None:
+        return None
+    rv = rv_pct / 100.0  # to decimal
+
+    history = get_history(symbol, 5)
+    if not history:
+        return None
+    iv = history[0][1]
+
+    if rv <= 0 or iv <= 0:
+        return None
+
+    gap   = iv - rv
+    ratio = iv / rv
+    return {
+        "iv":            round(iv, 4),
+        "rv":            round(rv, 4),
+        "gap":           round(gap, 4),
+        "gap_pct":       round(gap * 100, 2),
+        "ratio":         round(ratio, 3),
+        "vrp_favorable": ratio >= VRP_FAVORABLE_RATIO,
     }
 
 
