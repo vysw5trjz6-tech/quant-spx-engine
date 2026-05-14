@@ -114,7 +114,14 @@ ACCOUNT_SIZE  = int(os.getenv("ACCOUNT_SIZE", "30000"))
 SCAN_INTERVAL = 300
 ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
-SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN"]
+SYMBOLS = [
+    # Index ETFs
+    "SPY", "QQQ",
+    # Mega-cap tech
+    "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN",
+    # AI infrastructure (datacenter compute, power, cooling, networking)
+    "AVGO", "INTC", "LRCX", "CRWV", "GEV", "VRT", "ANET",
+]
 
 # Broader universe for swing scanner - liquid, optionable stocks
 SWING_UNIVERSE = [
