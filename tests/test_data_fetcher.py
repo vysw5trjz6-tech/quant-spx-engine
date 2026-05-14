@@ -1,7 +1,7 @@
 import data_fetcher
 
 
-def _fake_bars(symbol, timeframe, limit):
+def _fake_bars(symbol, timeframe, limit, **kwargs):
     _fake_bars.calls += 1
     return [{"o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100, "t": "2026-01-01T14:30:00Z"}
             for _ in range(limit)]

@@ -88,7 +88,7 @@ except ImportError as _e:
 
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
-# Default is premarket since most users only need an 8:30 AM ET alert.
+# Default is premarket since most users only need a morning brief.
 OPERATING_MODE = os.getenv("OPERATING_MODE", "premarket").strip().lower()
 if OPERATING_MODE not in ("premarket", "continuous"):
     OPERATING_MODE = "premarket"
@@ -2189,8 +2189,33 @@ def scan_all_symbols():
         bars_1hr = get_1hr_bars(symbol)
         bars_4hr = get_4hr_bars(symbol)
 
-        if not intraday or len(intraday) < ORB_BARS + 2 or not daily:
+        # ORB window = first 30 min of RTH (9:30 - 10:00 ET). Even with
+        # a valid bar count, never fire an ORB signal before the opening
+        # range has fully formed -- gives a known-good high/low to break.
+        et          = pytz.timezone("America/New_York")
+        et_now      = datetime.now(et)
+        et_minutes  = et_now.hour * 60 + et_now.minute
+        ORB_DONE_ET = 10 * 60   # 10:00 AM ET in minutes-of-day
+
+        if et_minutes < ORB_DONE_ET:
+            result["status"] = "pre-ORB ({}m to go)".format(ORB_DONE_ET - et_minutes)
+            results.append(result); continue
+
+        if not intraday or len(intraday) < ORB_BARS + 1 or not daily:
             result["status"] = "no data"; results.append(result); continue
+
+        # Stale-price guard. On free Alpaca (IEX-only feed) the latest
+        # quote/trade can be minutes old for non-IEX-heavy names. Skip
+        # the symbol entirely rather than feed a wrong spot into the
+        # entry/strike/target math.
+        stale, age_s, source = data_fetcher.is_price_stale(symbol)
+        if stale:
+            if age_s is None:
+                result["status"] = "no price"
+            else:
+                result["status"] = "stale price ({}s old from {})".format(
+                    int(age_s), source or "?")
+            results.append(result); continue
 
         # --- 0DTE earnings flag (don't block, just warn) ---
         if HAS_SAFETY_GATES:
@@ -2224,8 +2249,6 @@ def scan_all_symbols():
         sym_chg          = get_symbol_change(intraday)
         rs               = relative_strength(sym_chg, spy_chg_global)
 
-        et         = pytz.timezone("America/New_York")
-        et_now     = datetime.now(et)
         et_hour    = et_now.hour + et_now.minute / 60.0
         late_entry = et_hour >= 14.0
 
@@ -5104,7 +5127,8 @@ def _refresh_iv_snapshots():
 # =============================================
 #
 # This is the heart of "premarket mode" — one Databento batch query at
-# 8:30 AM ET that pulls everything you need to know before the open:
+# 9:10 AM ET (20 min before the open) that pulls everything you need to
+# know before the bell:
 #
 #   - Overnight ES/NQ range + inventory classification
 #   - VIX previous close → regime classification
@@ -5117,7 +5141,7 @@ def _refresh_iv_snapshots():
 
 def run_premarket_brief():
     """
-    Run once at 8:30 AM ET. Populates _market_state and fires a single
+    Run once at 9:10 AM ET. Populates _market_state and fires a single
     consolidated Telegram alert with everything you need before the open.
     """
     et = pytz.timezone("America/New_York")
@@ -5495,8 +5519,8 @@ def background_scheduler():
         threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
         # Build yesterday's Market Profile (needed for today's opening classification)
         threading.Thread(target=_build_market_profile, daemon=True).start()
-    # Brief on boot ONLY if we're in the pre-open window (8:30 AM – 10:30 AM ET)
-    if 8.5 <= boot_hour <= 10.5:
+    # Brief on boot ONLY if we're in the pre-open window (9:00 AM – 10:30 AM ET)
+    if 9.0 <= boot_hour <= 10.5:
         threading.Thread(target=run_premarket_brief, daemon=True).start()
     # Opening flow: pull at boot if we're past 10:05 AM today
     if 10.1 <= boot_hour <= 16.0:
@@ -5569,10 +5593,12 @@ def background_scheduler():
                 threading.Thread(target=_build_market_profile, daemon=True).start()
                 _daily_refresh_done["mprofile"] = True
 
-            # --- PREMARKET BRIEF (8:30 AM ET, once daily) ---
-            # In premarket mode, this is THE main alert of the day.
-            # In continuous mode, it still runs as an early heads-up.
-            if (et_hour >= 8.5 and et_hour < 8.7
+            # --- PREMARKET BRIEF (9:10 AM ET, once daily) ---
+            # Fires 20 min before the bell so it captures the full overnight
+            # + premarket picture (futures gap, options flow, news pricing-in)
+            # without missing the action that builds in the final hour of
+            # premarket. In premarket mode, this is THE main alert of the day.
+            if (et_hour >= 9.166 and et_hour < 9.34
                     and not _daily_refresh_done.get("premarket")):
                 _daily_refresh_done["premarket"] = True
                 threading.Thread(target=run_premarket_brief, daemon=True).start()
@@ -7391,7 +7417,7 @@ def overnight_endpoint():
     if not brief:
         return jsonify({
             "status":        "no_data",
-            "note":          "Premarket brief refreshes at 9:25 AM ET.",
+            "note":          "Premarket brief refreshes at 9:10 AM ET.",
             "module_loaded": HAS_OVERNIGHT,
         })
     return jsonify({
@@ -7543,7 +7569,7 @@ def databento_endpoint():
 def brief_endpoint():
     """
     Manually trigger the premarket brief. Useful for testing and for
-    on-demand re-runs if the 8:30 AM scheduled run was missed.
+    on-demand re-runs if the 9:10 AM scheduled run was missed.
     """
     threading.Thread(target=run_premarket_brief, daemon=True).start()
     return jsonify({
