@@ -47,6 +47,159 @@ def is_available():
 
 
 # =============================================
+# HISTORICAL DAILY OPTIONS (for IVR backfill)
+# =============================================
+#
+# Pulls OPRA.PILLAR definition + ohlcv-1d for a symbol over a date range,
+# joined and pre-filtered by DTE so the result fits in memory. The IVR
+# backfill picks the closest-to-ATM contract per day from this and solves
+# Black-Scholes for IV via vol_math.implied_vol.
+#
+# This is the only "fat" Databento query in the codebase: a one-year
+# OPRA pull for a single underlying is on the order of tens of MB.
+# Run it once per symbol per backfill (the iv_history table is the cache).
+
+def get_historical_daily_options(symbol, start_date, end_date,
+                                  dte_min=20, dte_max=40):
+    """
+    Returns list of joined contract-day records for `symbol`'s options that
+    were `dte_min`..`dte_max` calendar days from expiry on each observation.
+
+    Each record:
+      {
+        'date':   'YYYY-MM-DD' observation date (UTC date the bar settled),
+        'expiry': 'YYYY-MM-DD',
+        'strike': float,
+        'type':   'call' | 'put',
+        'close':  float (option close price),
+        'volume': int,
+        'dte':    int,
+      }
+
+    Returns [] when Databento is unavailable or the query yields nothing.
+    """
+    from datetime import date as _date  # local to avoid polluting module
+
+    client = _get_client()
+    if not client:
+        return []
+
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+
+    parent    = symbol + ".OPT"
+    start_iso = start_date.isoformat()
+    end_iso   = end_date.isoformat()
+
+    try:
+        def_df = client.timeseries.get_range(
+            dataset  = "OPRA.PILLAR",
+            symbols  = [parent],
+            stype_in = "parent",
+            schema   = "definition",
+            start    = start_iso,
+            end      = end_iso,
+        ).to_df()
+    except Exception as e:
+        print("[databento] {} definitions failed: {}".format(symbol, e))
+        return []
+
+    if def_df is None or def_df.empty:
+        return []
+
+    # Build instrument_id -> (strike, expiry_date, type)
+    inst_meta = {}
+    for _, row in def_df.iterrows():
+        try:
+            iid = int(row.get("instrument_id"))
+            strike = row.get("strike_price")
+            if strike is None:
+                continue
+            strike = float(strike)
+            if strike > 100000:           # OPRA quotes strikes in 1e9 fixed point
+                strike = strike / 1e9
+
+            expiry = row.get("expiration")
+            if expiry is not None and hasattr(expiry, "date"):
+                exp_date = expiry.date()
+            elif expiry:
+                exp_date = datetime.fromisoformat(str(expiry)[:10]).date()
+            else:
+                continue
+
+            inst_class = str(row.get("instrument_class", "")).upper()
+            opt_type = "call" if "C" in inst_class else \
+                       "put"  if "P" in inst_class else None
+            if not opt_type:
+                continue
+            inst_meta[iid] = (strike, exp_date, opt_type)
+        except Exception:
+            continue
+
+    if not inst_meta:
+        return []
+
+    try:
+        ohlcv_df = client.timeseries.get_range(
+            dataset  = "OPRA.PILLAR",
+            symbols  = [parent],
+            stype_in = "parent",
+            schema   = "ohlcv-1d",
+            start    = start_iso,
+            end      = end_iso,
+        ).to_df()
+    except Exception as e:
+        print("[databento] {} ohlcv-1d failed: {}".format(symbol, e))
+        return []
+
+    if ohlcv_df is None or ohlcv_df.empty:
+        return []
+
+    out = []
+    for _, row in ohlcv_df.iterrows():
+        try:
+            iid = int(row.get("instrument_id"))
+            meta = inst_meta.get(iid)
+            if not meta:
+                continue
+            strike, exp_date, opt_type = meta
+
+            # ts_event is the bar's settlement timestamp (UTC).
+            ts = row.get("ts_event")
+            if ts is None:
+                continue
+            obs_date = ts.date() if hasattr(ts, "date") else \
+                       datetime.fromisoformat(str(ts)[:10]).date()
+
+            dte = (exp_date - obs_date).days
+            if dte < dte_min or dte > dte_max:
+                continue
+
+            close = row.get("close")
+            if close is None:
+                continue
+            close = float(close)
+            if close > 1e6:               # OPRA prices use 1e9 fixed point too
+                close = close / 1e9
+
+            out.append({
+                "date":   obs_date.isoformat(),
+                "expiry": exp_date.isoformat(),
+                "strike": strike,
+                "type":   opt_type,
+                "close":  close,
+                "volume": int(row.get("volume", 0) or 0),
+                "dte":    dte,
+            })
+        except Exception:
+            continue
+
+    return out
+
+
+# =============================================
 # LOCAL CACHE
 # =============================================
 

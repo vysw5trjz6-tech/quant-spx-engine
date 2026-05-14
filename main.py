@@ -114,7 +114,14 @@ ACCOUNT_SIZE  = int(os.getenv("ACCOUNT_SIZE", "30000"))
 SCAN_INTERVAL = 300
 ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
-SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN"]
+SYMBOLS = [
+    # Index ETFs
+    "SPY", "QQQ",
+    # Mega-cap tech
+    "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN",
+    # AI infrastructure (datacenter compute, power, cooling, networking)
+    "AVGO", "INTC", "LRCX", "CRWV", "GEV", "VRT", "ANET",
+]
 
 # Broader universe for swing scanner - liquid, optionable stocks
 SWING_UNIVERSE = [
@@ -122,6 +129,8 @@ SWING_UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD", "AVGO", "CRM",
     # Semis & hardware
     "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "MRVL", "ON", "SMCI",
+    # AI infrastructure (datacenter compute, power, cooling, networking)
+    "CRWV", "GEV", "VRT", "ANET",
     # Finance
     "JPM", "GS", "MS", "BAC", "C", "V", "MA", "AXP", "BX", "KKR",
     # Healthcare & biotech
@@ -3960,6 +3969,12 @@ def _check_earnings_iv_crush(symbol):
         iv_data = iv_rank.compute_iv_rank(symbol)
         if not iv_data or iv_data["iv_rank"] < 70:
             return None
+        # Variance-risk-premium gate: don't sell premium when implied vol is
+        # not at least 20% richer than realized. iv_rv_ratio is added by
+        # compute_iv_rank when realized vol is computable; if absent we let
+        # the trade through (back-compat for symbols without RV history).
+        if iv_data.get("iv_rv_ratio") is not None and not iv_data.get("vrp_favorable"):
+            return None
 
         # Need ATM straddle pricing
         call_premium, _ck, _cl, _cd = get_liquid_option(symbol, "CALL", spot)
@@ -5119,15 +5134,23 @@ def run_premarket_brief():
         premarket = _market_state.get("premarket_brief")
         gex_bias  = _market_state.get("gex_bias")
 
-    # Top high-IVR names for earnings IV crush watchlist
+    # Top high-IVR names for earnings IV crush watchlist. Each entry is
+    # (symbol, iv_rank, iv_rv_ratio, vrp_favorable). VRP-favorable names
+    # bubble to the top of the brief.
     high_ivr = []
     if HAS_IV_RANK:
         try:
             for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
                 d = iv_rank.compute_iv_rank(sym)
                 if d and d["iv_rank"] >= 70:
-                    high_ivr.append((sym, d["iv_rank"]))
-            high_ivr.sort(key=lambda x: -x[1])
+                    high_ivr.append((
+                        sym,
+                        d["iv_rank"],
+                        d.get("iv_rv_ratio"),
+                        d.get("vrp_favorable"),
+                    ))
+            # Favorable VRP first, then by IV rank desc.
+            high_ivr.sort(key=lambda x: (0 if x[3] else 1, -x[1]))
             high_ivr = high_ivr[:5]
         except Exception:
             pass
@@ -5194,11 +5217,17 @@ def run_premarket_brief():
         msg_lines.append("  Size mult: x{:.2f}".format(rules.get("size_multiplier", 1.0)))
         msg_lines.append("")
 
-    # Top IVR for earnings IV crush
+    # Top IVR for earnings IV crush. Tag with VRP ratio so we can see at a
+    # glance whether IV is actually rich vs realized -- a 70 IVR with a 1.0
+    # ratio is a trap (vol earned what it priced).
     if high_ivr:
         msg_lines.append("HIGH IV RANK (>70):")
-        for sym, ivr in high_ivr:
-            msg_lines.append("  {} — {:.0f}".format(sym, ivr))
+        for sym, ivr, ratio, vrp_ok in high_ivr:
+            tag = ""
+            if ratio is not None:
+                marker = "✅" if vrp_ok else "⚠️"
+                tag = "  {} VRP {:.2f}x".format(marker, ratio)
+            msg_lines.append("  {} — IVR {:.0f}{}".format(sym, ivr, tag))
         msg_lines.append("")
 
     # Plain-English summary line
@@ -7386,6 +7415,10 @@ def iv_endpoint():
                     "iv_today":      data["iv_today"],
                     "iv_rank":       data["iv_rank"],
                     "iv_percentile": data["iv_percentile"],
+                    "rv":            data.get("rv"),
+                    "iv_rv_gap_pct": data.get("iv_rv_gap_pct"),
+                    "iv_rv_ratio":   data.get("iv_rv_ratio"),
+                    "vrp_favorable": data.get("vrp_favorable"),
                     "samples":       data["samples"],
                 })
         except Exception:
@@ -7396,6 +7429,35 @@ def iv_endpoint():
         "status":   "ok",
         "symbols":  out,
         "count":    len(out),
+    })
+
+
+@app.route("/iv/coverage")
+def iv_coverage_endpoint():
+    """Per-symbol IV history coverage. Use to verify iv_backfill ran."""
+    if not HAS_IV_RANK:
+        return jsonify({"status": "no_module"})
+    try:
+        conn = db_utils.connect(iv_rank.IV_CACHE_DB)
+        rows = conn.execute("""
+            SELECT symbol, COUNT(*) as n,
+                   MIN(obs_date) as first_date,
+                   MAX(obs_date) as last_date
+            FROM iv_history
+            GROUP BY symbol
+            ORDER BY symbol
+        """).fetchall()
+        conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)})
+    return jsonify({
+        "status":  "ok",
+        "symbols": [
+            {"symbol": r[0], "samples": r[1],
+             "first_date": r[2], "last_date": r[3],
+             "ready_for_ivr": r[1] >= 30}
+            for r in rows
+        ],
     })
 
 
@@ -7418,6 +7480,8 @@ def edge_endpoint():
                         "symbol": sym,
                         "iv_rank": d["iv_rank"],
                         "iv_percentile": d["iv_percentile"],
+                        "iv_rv_ratio":   d.get("iv_rv_ratio"),
+                        "vrp_favorable": d.get("vrp_favorable"),
                     })
             top_iv.sort(key=lambda x: -x["iv_rank"])
             top_iv = top_iv[:5]
