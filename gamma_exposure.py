@@ -21,11 +21,9 @@ import math
 import json
 import sqlite3
 import db_utils
-import requests
 from datetime import datetime, timedelta
 import pytz
 
-POLYGON_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 
 
 # =============================================
@@ -241,15 +239,11 @@ def compute_gex_by_tenor(chain_data, spot_price):
 # DATA FETCH — Polygon
 # =============================================
 
-def fetch_polygon_chain(underlying):
+def fetch_options_chain(underlying):
     """
-    Fetch full SPY/QQQ chain for first 3 monthly expiries.
-
-    Provider priority:
-      1. Databento (best — direct OPRA feed with OI)
-      2. Polygon snapshot
+    Fetch SPY/QQQ chain for the next several expiries via Databento OPRA.
+    Returns a list of {strike, expiry, type, open_interest, implied_volatility}.
     """
-    # --- Path 1: Databento ---
     try:
         import databento_adapter
         if databento_adapter.is_available():
@@ -260,50 +254,7 @@ def fetch_polygon_chain(underlying):
         pass
     except Exception:
         pass
-
-    # --- Path 2: Polygon (legacy) ---
-    if not POLYGON_KEY:
-        return None
-    url = "https://api.polygon.io/v3/snapshot/options/{}".format(underlying)
-    params = {
-        "limit":  250,
-        "apiKey": POLYGON_KEY,
-    }
-    out = []
-    cursor = None
-    pages = 0
-    while pages < 6:
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code != 200:
-                break
-            data = r.json()
-        except Exception:
-            break
-
-        for c in data.get("results", []) or []:
-            details = c.get("details", {}) or {}
-            day     = c.get("day", {}) or {}
-            iv      = c.get("implied_volatility")
-            oi      = c.get("open_interest")
-            out.append({
-                "strike":             details.get("strike_price"),
-                "expiry":             details.get("expiration_date"),
-                "type":               details.get("contract_type"),
-                "open_interest":      oi,
-                "implied_volatility": iv,
-            })
-
-        cursor = data.get("next_url")
-        if cursor and "cursor=" in cursor:
-            cursor = cursor.split("cursor=")[1].split("&")[0]
-        else:
-            break
-        pages += 1
-
-    return out
+    return None
 
 
 # =============================================
@@ -382,18 +333,15 @@ def refresh_gex(symbol="SPY", spot_price=None):
     Run after market close (or before open) to build the day's GEX snapshot.
     Requires either Databento or Polygon key for the chain data.
     """
-    # Check at least one provider is available
-    have_provider = bool(POLYGON_KEY)
+    # Databento is the sole chain provider.
     try:
         import databento_adapter
-        if databento_adapter.is_available():
-            have_provider = True
+        if not databento_adapter.is_available():
+            return None
     except ImportError:
-        pass
-    if not have_provider:
         return None
 
-    chain = fetch_polygon_chain(symbol)
+    chain = fetch_options_chain(symbol)
     if not chain or spot_price is None:
         return None
     gex = compute_gex_from_chain(chain, spot_price)
@@ -515,4 +463,4 @@ if __name__ == "__main__":
         print("Usage: python gamma_exposure.py SPY <spot_price>")
         sys.exit(1)
     g = refresh_gex(sym, spot)
-    print(json.dumps(g, indent=2) if g else "Failed (check POLYGON_API_KEY)")
+    print(json.dumps(g, indent=2) if g else "Failed (check DATABENTO_API_KEY)")

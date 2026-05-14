@@ -164,61 +164,59 @@ _init_earnings_db()
 
 def update_earnings_calendar(symbol, fmp_api_key=None):
     """
-    Fetch upcoming AND historical earnings dates for a symbol.
+    Fetch upcoming + historical earnings dates for a symbol via Yahoo Finance
+    (yfinance). No API key required.
 
-    Stores both. Historical ones are used by the IV crush strategy to
-    compute the historical post-earnings move.
+    Past dates are kept for the IV-crush strategy's historical move stats;
+    upcoming dates feed the earnings_filter() block on swing trades.
 
-    Free source: Financial Modeling Prep — generous free tier.
-    Sign up at financialmodelingprep.com, pass key as fmp_api_key or env.
+    The fmp_api_key argument is accepted for backwards-compat but ignored.
+    Returns True if any rows were written.
     """
-    api_key = fmp_api_key or os.getenv("FMP_API_KEY", "").strip()
-    if not api_key:
+    try:
+        import yfinance as yf
+    except ImportError:
         return False
 
     et  = pytz.timezone("America/New_York")
     now = datetime.now(et).isoformat()
 
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.earnings_dates
+    except Exception:
+        return False
+
+    if df is None or len(df) == 0:
+        return False
+
     conn = db_utils.connect(EARNINGS_CACHE_DB)
     c    = conn.cursor()
     rows_written = 0
 
-    # FMP /api/v3/historical/earning_calendar/{symbol} returns past + upcoming
-    url = "https://financialmodelingprep.com/api/v3/historical/earning_calendar/{}".format(symbol)
     try:
-        r = requests.get(url, params={"apikey": api_key, "limit": 12}, timeout=10)
-        if r.status_code == 200:
-            for e in r.json() or []:
-                if e.get("date"):
-                    c.execute("""
-                        INSERT OR REPLACE INTO earnings
-                        (symbol, report_date, time_of_day, updated_at)
-                        VALUES (?, ?, ?, ?)
-                    """, (symbol, e["date"], e.get("time", ""), now))
-                    rows_written += 1
-    except Exception:
-        pass
+        for idx in df.index:
+            try:
+                report_date = idx.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+            # Yahoo's index time tells us BMO vs AMC: <10:00 ET = BMO,
+            # >=14:00 ET = AMC. Close enough for the safety gate.
+            try:
+                hr = idx.hour
+                tod = "amc" if hr >= 14 else ("bmo" if hr < 10 else "")
+            except Exception:
+                tod = ""
+            c.execute("""
+                INSERT OR REPLACE INTO earnings
+                (symbol, report_date, time_of_day, updated_at)
+                VALUES (?, ?, ?, ?)
+            """, (symbol, report_date, tod, now))
+            rows_written += 1
+    finally:
+        conn.commit()
+        conn.close()
 
-    # Also pull the standard /earning_calendar endpoint for upcoming if the
-    # historical one is empty
-    if rows_written == 0:
-        url2 = "https://financialmodelingprep.com/api/v3/earning_calendar/{}".format(symbol)
-        try:
-            r = requests.get(url2, params={"apikey": api_key}, timeout=10)
-            if r.status_code == 200:
-                for e in (r.json() or [])[:8]:
-                    if e.get("date"):
-                        c.execute("""
-                            INSERT OR REPLACE INTO earnings
-                            (symbol, report_date, time_of_day, updated_at)
-                            VALUES (?, ?, ?, ?)
-                        """, (symbol, e["date"], e.get("time", ""), now))
-                        rows_written += 1
-        except Exception:
-            pass
-
-    conn.commit()
-    conn.close()
     return rows_written > 0
 
 
