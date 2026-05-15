@@ -312,12 +312,38 @@ def log_error(msg):
             debug_log.pop(0)
 
 
+_last_auth_state = None
+
+
+def _log_auth_state_if_changed():
+    """Log auth booleans only on first call and when any flag flips.
+    Avoids the per-scan "Key set: True | Secret set: True | Bot: True"
+    boilerplate that dominated the log volume."""
+    global _last_auth_state
+    state = (bool(ALPACA_KEY), bool(ALPACA_SECRET), bool(bot_enabled))
+    if state == _last_auth_state:
+        return
+    msg = "Auth: Alpaca key={} secret={} | Telegram bot={}".format(*state)
+    if _last_auth_state is None:
+        log(msg)
+    else:
+        # A flip on a previously-set credential is worth surfacing.
+        log_warn(msg + " (changed)")
+    _last_auth_state = state
+
+
 # Werkzeug's default request handler writes every "GET / 200" line to stderr,
 # which the log shipper then tags as `error`. Silence the 2xx/3xx access logs
 # at the source so only actual server errors (5xx) bubble up there.
+#
+# yfinance's logger emits "$SYM: possibly delisted" + "Failed to get ticker"
+# whenever Yahoo returns an empty body (rate-limit), which is misleading
+# (SPY/NVDA/etc. are obviously not delisted) and noisy. We quiet it and let
+# the Alpaca/Databento fallback paths handle the real outcome.
 try:
     import logging as _logging
     _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+    _logging.getLogger("yfinance").setLevel(_logging.CRITICAL)
 except Exception:
     pass
 
@@ -798,10 +824,17 @@ def send_telegram(message):
     try:
         resp = requests.post(url, json={"chat_id": chat_id, "text": message},
                              timeout=10)
-        log("Telegram HTTP {}: {}".format(resp.status_code, resp.text[:150]))
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            try:
+                mid = resp.json().get("result", {}).get("message_id")
+                log("Telegram OK message_id={}".format(mid))
+            except Exception:
+                log("Telegram OK")
+            return True
+        log_error("Telegram HTTP {}: {}".format(resp.status_code, resp.text[:150]))
+        return False
     except Exception as e:
-        log("Telegram exception: {}".format(e))
+        log_error("Telegram exception: {}".format(e))
         return False
 
 
@@ -974,7 +1007,7 @@ def calculate_vwap_bands(bars, num_std=2.0):
 
 def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
                       gap_pct, gap_dir, rs, market_bias,
-                      time_vol_ratio, vol_mult):
+                      time_vol_ratio, vol_mult, symbol="?"):
     """
     When price stays consistently on one side of VWAP with trending
     structure (HH/HL or LH/LL), it's a high-prob continuation signal.
@@ -1049,8 +1082,7 @@ def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
     score = score * vol_mult
 
     log("{}: VWAP_TREND {} | dist={:.2f}% | trend={:.0f}% | vol={:.1f}x".format(
-        intraday[-1].get("t", "?")[:5] if isinstance(intraday[-1].get("t"), str) else "?",
-        direction, vwap_dist_pct, trend_pct * 100, time_vol_ratio))
+        symbol, direction, vwap_dist_pct, trend_pct * 100, time_vol_ratio))
 
     return {
         "signal_type":  "VWAP_TREND",
@@ -2359,7 +2391,7 @@ def scan_all_symbols():
                 alt_signal = detect_vwap_trend(
                     intraday, daily, vwap, cfg, et_hour,
                     gap_pct, gap_dir, rs, market_bias,
-                    time_vol_ratio, vol_mult)
+                    time_vol_ratio, vol_mult, symbol=symbol)
 
             # 2. VWAP Mean Reversion (deviation band snap-back)
             if not alt_signal and strat_rules.get("vwap_mr", True):
@@ -2671,8 +2703,7 @@ def scan_all_symbols():
 def run_signal_scan():
     global all_signals, next_scan_at
     log("=== Running signal scan ===")
-    log("Key set: {} | Secret set: {} | Bot: {}".format(
-        bool(ALPACA_KEY), bool(ALPACA_SECRET), bot_enabled))
+    _log_auth_state_if_changed()
 
     if not market_open():
         log("Market closed - skipping scan")
