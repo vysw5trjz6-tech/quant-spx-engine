@@ -294,6 +294,89 @@ def log(msg):
             debug_log.pop(0)
 
 
+def log_warn(msg):
+    # Stays on stdout (the platform classifies stdout as `info`) but the
+    # WARN prefix makes it filterable in log search.
+    log("WARN: {}".format(msg))
+
+
+def log_error(msg):
+    # Writes to stderr so the platform log shipper tags it as `error`.
+    import sys as _sys
+    ts    = datetime.now(pytz.utc).strftime("%H:%M:%S")
+    entry = "[{}] ERROR: {}".format(ts, msg)
+    print(entry, file=_sys.stderr, flush=True)
+    with state_lock:
+        debug_log.append(entry)
+        if len(debug_log) > 150:
+            debug_log.pop(0)
+
+
+LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
+
+
+def log_event(event, level="info", **fields):
+    """Structured log entry. Emits JSON when LOG_JSON=1 (so the log shipper
+    can index `symbol`/`source`/`status` etc. as fields), otherwise a
+    readable `[HH:MM:SS] event | k=v k=v` line. Level controls severity:
+    `error` writes to stderr (which the platform tags as error), `info`
+    and `warn` write to stdout."""
+    import sys as _sys
+    ts = datetime.now(pytz.utc).strftime("%H:%M:%S")
+    if LOG_JSON:
+        payload = {"ts": ts, "level": level, "event": event}
+        for k, v in fields.items():
+            payload[k] = v
+        line = json.dumps(payload, default=str)
+    else:
+        kvs = " ".join("{}={}".format(k, v) for k, v in fields.items())
+        prefix = {"error": "ERROR: ", "warn": "WARN: "}.get(level, "")
+        line = "[{}] {}{}{}".format(ts, prefix, event,
+                                     " | " + kvs if kvs else "")
+    stream = _sys.stderr if level == "error" else _sys.stdout
+    print(line, file=stream, flush=True)
+    with state_lock:
+        debug_log.append(line)
+        if len(debug_log) > 150:
+            debug_log.pop(0)
+
+
+_last_auth_state = None
+
+
+def _log_auth_state_if_changed():
+    """Log auth booleans only on first call and when any flag flips.
+    Avoids the per-scan "Key set: True | Secret set: True | Bot: True"
+    boilerplate that dominated the log volume."""
+    global _last_auth_state
+    state = (bool(ALPACA_KEY), bool(ALPACA_SECRET), bool(bot_enabled))
+    if state == _last_auth_state:
+        return
+    msg = "Auth: Alpaca key={} secret={} | Telegram bot={}".format(*state)
+    if _last_auth_state is None:
+        log(msg)
+    else:
+        # A flip on a previously-set credential is worth surfacing.
+        log_warn(msg + " (changed)")
+    _last_auth_state = state
+
+
+# Werkzeug's default request handler writes every "GET / 200" line to stderr,
+# which the log shipper then tags as `error`. Silence the 2xx/3xx access logs
+# at the source so only actual server errors (5xx) bubble up there.
+#
+# yfinance's logger emits "$SYM: possibly delisted" + "Failed to get ticker"
+# whenever Yahoo returns an empty body (rate-limit), which is misleading
+# (SPY/NVDA/etc. are obviously not delisted) and noisy. We quiet it and let
+# the Alpaca/Databento fallback paths handle the real outcome.
+try:
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+    _logging.getLogger("yfinance").setLevel(_logging.CRITICAL)
+except Exception:
+    pass
+
+
 # =============================================
 # DATABASE
 # =============================================
@@ -770,10 +853,18 @@ def send_telegram(message):
     try:
         resp = requests.post(url, json={"chat_id": chat_id, "text": message},
                              timeout=10)
-        log("Telegram HTTP {}: {}".format(resp.status_code, resp.text[:150]))
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            try:
+                mid = resp.json().get("result", {}).get("message_id")
+            except Exception:
+                mid = None
+            log_event("telegram.send", status=200, message_id=mid)
+            return True
+        log_event("telegram.error", level="error",
+                  status=resp.status_code, body=resp.text[:150])
+        return False
     except Exception as e:
-        log("Telegram exception: {}".format(e))
+        log_event("telegram.exception", level="error", error=str(e))
         return False
 
 
@@ -946,7 +1037,7 @@ def calculate_vwap_bands(bars, num_std=2.0):
 
 def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
                       gap_pct, gap_dir, rs, market_bias,
-                      time_vol_ratio, vol_mult):
+                      time_vol_ratio, vol_mult, symbol="?"):
     """
     When price stays consistently on one side of VWAP with trending
     structure (HH/HL or LH/LL), it's a high-prob continuation signal.
@@ -1021,8 +1112,7 @@ def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
     score = score * vol_mult
 
     log("{}: VWAP_TREND {} | dist={:.2f}% | trend={:.0f}% | vol={:.1f}x".format(
-        intraday[-1].get("t", "?")[:5] if isinstance(intraday[-1].get("t"), str) else "?",
-        direction, vwap_dist_pct, trend_pct * 100, time_vol_ratio))
+        symbol, direction, vwap_dist_pct, trend_pct * 100, time_vol_ratio))
 
     return {
         "signal_type":  "VWAP_TREND",
@@ -2129,13 +2219,33 @@ def scan_all_symbols():
         strat_rules["size_multiplier"] *= gex_bias.get("size_mult", 1.0)
 
     if regime:
-        log("Regime: {} (VIX {}) | size x{:.2f} | {}".format(
+        _regime_line = "Regime: {} (VIX {}) | size x{:.2f} | {}".format(
             regime.get("regime"), regime.get("vix"),
-            strat_rules["size_multiplier"], regime.get("note", "")))
+            strat_rules["size_multiplier"], regime.get("note", ""))
+        if regime.get("vix") is None:
+            log_warn(_regime_line + " (VIX unavailable — using fallback)")
+        else:
+            log(_regime_line)
     if gex_bias:
-        log("GEX: ${}B {} | {}".format(
-            gex_bias.get("gex_b"), gex_bias.get("regime"),
-            gex_bias.get("note", "")))
+        _note = gex_bias.get("note", "")
+        # If the Databento billing breaker is tripped, surface the actual cause
+        # instead of the generic "No GEX data — defaulting to trend-mode" line,
+        # which made it look like a normal regime decision in today's logs.
+        if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
+            try:
+                import databento_adapter as _da
+                if _da.billing_status().get("blocked"):
+                    _note = ("GEX unavailable: Databento billing breaker engaged "
+                             "until {}").format(
+                        _da.billing_status().get("blocked_until"))
+            except Exception:
+                pass
+        _gex_line = "GEX: ${}B {} | {}".format(
+            gex_bias.get("gex_b"), gex_bias.get("regime"), _note)
+        if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
+            log_warn(_gex_line)
+        else:
+            log(_gex_line)
 
     # Warm all bar caches in parallel before the per-symbol loop.
     # SYMBOLS + SPY/QQQ for the market-alignment block below.
@@ -2323,7 +2433,7 @@ def scan_all_symbols():
                 alt_signal = detect_vwap_trend(
                     intraday, daily, vwap, cfg, et_hour,
                     gap_pct, gap_dir, rs, market_bias,
-                    time_vol_ratio, vol_mult)
+                    time_vol_ratio, vol_mult, symbol=symbol)
 
             # 2. VWAP Mean Reversion (deviation band snap-back)
             if not alt_signal and strat_rules.get("vwap_mr", True):
@@ -2635,8 +2745,7 @@ def scan_all_symbols():
 def run_signal_scan():
     global all_signals, next_scan_at
     log("=== Running signal scan ===")
-    log("Key set: {} | Secret set: {} | Bot: {}".format(
-        bool(ALPACA_KEY), bool(ALPACA_SECRET), bot_enabled))
+    _log_auth_state_if_changed()
 
     if not market_open():
         log("Market closed - skipping scan")
@@ -2725,9 +2834,11 @@ def run_signal_scan():
                 "\n\nWaiting for ORB breakout + volume confirmation."
             )
 
-    log("Scan done: {} SIGNAL, {} WATCHING, {} other".format(
-        len(signals), len(watching),
-        len(results) - len(signals) - len(watching)))
+    log_event("scan.done",
+              signal=len(signals),
+              watching=len(watching),
+              other=len(results) - len(signals) - len(watching),
+              total=len(results))
 
 
 # =============================================
@@ -2925,10 +3036,13 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
             },
             timeout=60
         )
-        log("AI: Anthropic HTTP {} (model={})".format(resp.status_code, ai_model))
+        log_event("anthropic.response", source="ai_loop",
+                  status=resp.status_code, model=ai_model)
 
         if resp.status_code != 200:
-            log("AI: API error: {}".format(resp.text[:200]))
+            log_event("anthropic.error", level="error", source="ai_loop",
+                      status=resp.status_code, model=ai_model,
+                      body=resp.text[:200])
             # Backoff on auth/billing errors — these don't fix themselves
             # within minutes, so stop retrying until tomorrow.
             err_text = resp.text.lower()
@@ -2939,7 +3053,7 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
                 et = pytz.timezone("America/New_York")
                 _ai_last_run_date = datetime.now(et).strftime("%Y-%m-%d")
                 _ai_last_trade_cnt = len(trades)
-                log("AI: backoff engaged — will not retry until tomorrow")
+                log_warn("AI: backoff engaged — will not retry until tomorrow")
             return
 
         raw = resp.json()["content"][0]["text"].strip()
@@ -3146,13 +3260,16 @@ Be direct. No "consider" / "you might want to". No emojis. No closing pleasantri
             },
             timeout=90,
         )
-        log("FridayDigest: Anthropic HTTP {}".format(resp.status_code))
+        log_event("anthropic.response", source="friday_digest",
+                  status=resp.status_code)
         if resp.status_code != 200:
-            log("FridayDigest: API error: {}".format(resp.text[:200]))
+            log_event("anthropic.error", level="error", source="friday_digest",
+                      status=resp.status_code, body=resp.text[:200])
             return
         body = resp.json()["content"][0]["text"].strip()
     except Exception as e:
-        log("FridayDigest: API exception: {}".format(e))
+        log_event("anthropic.exception", level="error",
+                  source="friday_digest", error=str(e))
         return
 
     header  = "Weekly Upgrade Digest - {}".format(now.strftime("%Y-%m-%d"))
@@ -3254,7 +3371,9 @@ If the data does not yet support any specific proposal, return: {{"proposals": [
         )
 
         if resp.status_code != 200:
-            log("AI proposals: API error {}".format(resp.status_code))
+            log_event("anthropic.error", level="error",
+                      source="ai_proposals", status=resp.status_code,
+                      body=resp.text[:200])
             return
 
         raw = resp.json()["content"][0]["text"].strip()

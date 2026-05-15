@@ -1,10 +1,17 @@
-from datetime import date, timedelta
+from datetime import datetime, timedelta
+
+import pytz
 
 import gamma_exposure as gex
 
 
 def _expiry(days_out):
-    return (date.today() + timedelta(days=days_out)).isoformat()
+    # Match prod: gamma_exposure computes DTE from America/New_York's date,
+    # so the fixture must anchor to the same tz or 0DTE entries spill into
+    # the 1-7 bucket whenever this test runs after ~04:00 UTC.
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).date()
+    return (today + timedelta(days=days_out)).isoformat()
 
 
 def test_bs_gamma_zero_inputs_returns_zero():

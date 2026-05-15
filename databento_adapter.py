@@ -9,6 +9,7 @@
 # Auth: set DATABENTO_API_KEY env var.
 
 import os
+import sys
 import json
 import sqlite3
 import db_utils
@@ -27,6 +28,82 @@ except ImportError:
 _client = None
 
 
+# =============================================
+# BILLING / 402 CIRCUIT BREAKER
+# =============================================
+#
+# When the account runs out of credit Databento returns 402
+# `account_insufficient_funds`. Without a breaker the scanner re-hits the
+# same endpoint for every symbol on every scan (50+ tickers × 5min), which
+# both spams the logs and wastes any retry budget. After the first billing
+# failure we suppress all further Databento calls for _BILLING_COOLDOWN_SECS
+# so the scheduler can keep running with fallback data.
+
+_BILLING_COOLDOWN_SECS = 30 * 60
+_billing_blocked_until = None  # datetime in UTC, or None
+
+
+def _is_billing_error(exc):
+    s = "{} {}".format(type(exc).__name__, exc).lower()
+    return (
+        "account_insufficient_funds" in s
+        or "insufficient budget" in s
+        or "insufficient funds" in s
+        or " 402" in s
+        or s.startswith("402")
+    )
+
+
+def _billing_blocked():
+    return (
+        _billing_blocked_until is not None
+        and datetime.utcnow() < _billing_blocked_until
+    )
+
+
+_LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
+
+
+def _emit_error(event, **fields):
+    """Single-line structured stderr write. Mirrors main.log_event so this
+    module stays import-cycle-free."""
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    if _LOG_JSON:
+        payload = {"ts": ts, "level": "error", "event": event}
+        payload.update(fields)
+        line = json.dumps(payload, default=str)
+    else:
+        kvs = " ".join("{}={}".format(k, v) for k, v in fields.items())
+        line = "[{}] ERROR: {}{}".format(ts, event,
+                                          " | " + kvs if kvs else "")
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
+def _trip_billing_breaker(context):
+    global _billing_blocked_until
+    first_trip = not _billing_blocked()
+    _billing_blocked_until = datetime.utcnow() + timedelta(
+        seconds=_BILLING_COOLDOWN_SECS
+    )
+    if first_trip:
+        _emit_error(
+            "databento.billing_blocked",
+            context=context,
+            cooldown_min=_BILLING_COOLDOWN_SECS // 60,
+            until=_billing_blocked_until.isoformat() + "Z",
+        )
+
+
+def billing_status():
+    """Returns dict with breaker state for the /diagnostic endpoint."""
+    return {
+        "blocked":       _billing_blocked(),
+        "blocked_until": (_billing_blocked_until.isoformat() + "Z")
+                         if _billing_blocked_until else None,
+    }
+
+
 def _get_client():
     """Lazily instantiate the historical client."""
     global _client
@@ -42,8 +119,13 @@ def _get_client():
 
 
 def is_available():
-    """Returns True if SDK is installed AND a key is configured."""
-    return _SDK_AVAILABLE and bool(DATABENTO_KEY)
+    """Returns True if SDK is installed, a key is configured, and the
+    billing breaker is not currently tripped."""
+    if not (_SDK_AVAILABLE and DATABENTO_KEY):
+        return False
+    if _billing_blocked():
+        return False
+    return True
 
 
 # =============================================
@@ -81,7 +163,7 @@ def get_historical_daily_options(symbol, start_date, end_date,
     from datetime import date as _date  # local to avoid polluting module
 
     client = _get_client()
-    if not client:
+    if not client or _billing_blocked():
         return []
 
     if isinstance(start_date, datetime):
@@ -103,7 +185,11 @@ def get_historical_daily_options(symbol, start_date, end_date,
             end      = end_iso,
         ).to_df()
     except Exception as e:
-        print("[databento] {} definitions failed: {}".format(symbol, e))
+        if _is_billing_error(e):
+            _trip_billing_breaker("{} definitions".format(symbol))
+        else:
+            _emit_error("databento.fetch_failed", source="definitions",
+                        symbol=symbol, exc=type(e).__name__)
         return []
 
     if def_df is None or def_df.empty:
@@ -151,7 +237,11 @@ def get_historical_daily_options(symbol, start_date, end_date,
             end      = end_iso,
         ).to_df()
     except Exception as e:
-        print("[databento] {} ohlcv-1d failed: {}".format(symbol, e))
+        if _is_billing_error(e):
+            _trip_billing_breaker("{} ohlcv-1d".format(symbol))
+        else:
+            _emit_error("databento.fetch_failed", source="ohlcv-1d",
+                        symbol=symbol, exc=type(e).__name__)
         return []
 
     if ohlcv_df is None or ohlcv_df.empty:
@@ -291,7 +381,7 @@ def get_overnight_bars(contract="ES", target_date_et=None):
     Returns list of bars: [{t, o, h, l, c, v}, ...]
     """
     client = _get_client()
-    if not client:
+    if not client or _billing_blocked():
         return []
 
     et = pytz.timezone("America/New_York")
@@ -341,8 +431,11 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         return bars
 
     except Exception as e:
-        print("[databento] {} overnight failed ({}): {}".format(
-            contract, type(e).__name__, e))
+        if _is_billing_error(e):
+            _trip_billing_breaker("{} overnight".format(contract))
+        else:
+            _emit_error("databento.fetch_failed", source="overnight",
+                        symbol=contract, exc=type(e).__name__)
         return []
 
 
@@ -356,7 +449,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     Returns EOD options chain with open interest.
     """
     client = _get_client()
-    if not client:
+    if not client or _billing_blocked():
         return []
 
     et = pytz.timezone("America/New_York")
@@ -474,8 +567,11 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         return chain
 
     except Exception as e:
-        print("[databento] {} chain failed ({}): {}".format(
-            underlying, type(e).__name__, e))
+        if _is_billing_error(e):
+            _trip_billing_breaker("{} chain".format(underlying))
+        else:
+            _emit_error("databento.fetch_failed", source="chain",
+                        symbol=underlying, exc=type(e).__name__)
         return []
 
 
