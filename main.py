@@ -312,6 +312,35 @@ def log_error(msg):
             debug_log.pop(0)
 
 
+LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
+
+
+def log_event(event, level="info", **fields):
+    """Structured log entry. Emits JSON when LOG_JSON=1 (so the log shipper
+    can index `symbol`/`source`/`status` etc. as fields), otherwise a
+    readable `[HH:MM:SS] event | k=v k=v` line. Level controls severity:
+    `error` writes to stderr (which the platform tags as error), `info`
+    and `warn` write to stdout."""
+    import sys as _sys
+    ts = datetime.now(pytz.utc).strftime("%H:%M:%S")
+    if LOG_JSON:
+        payload = {"ts": ts, "level": level, "event": event}
+        for k, v in fields.items():
+            payload[k] = v
+        line = json.dumps(payload, default=str)
+    else:
+        kvs = " ".join("{}={}".format(k, v) for k, v in fields.items())
+        prefix = {"error": "ERROR: ", "warn": "WARN: "}.get(level, "")
+        line = "[{}] {}{}{}".format(ts, prefix, event,
+                                     " | " + kvs if kvs else "")
+    stream = _sys.stderr if level == "error" else _sys.stdout
+    print(line, file=stream, flush=True)
+    with state_lock:
+        debug_log.append(line)
+        if len(debug_log) > 150:
+            debug_log.pop(0)
+
+
 _last_auth_state = None
 
 
@@ -827,14 +856,15 @@ def send_telegram(message):
         if resp.status_code == 200:
             try:
                 mid = resp.json().get("result", {}).get("message_id")
-                log("Telegram OK message_id={}".format(mid))
             except Exception:
-                log("Telegram OK")
+                mid = None
+            log_event("telegram.send", status=200, message_id=mid)
             return True
-        log_error("Telegram HTTP {}: {}".format(resp.status_code, resp.text[:150]))
+        log_event("telegram.error", level="error",
+                  status=resp.status_code, body=resp.text[:150])
         return False
     except Exception as e:
-        log_error("Telegram exception: {}".format(e))
+        log_event("telegram.exception", level="error", error=str(e))
         return False
 
 
@@ -2197,9 +2227,21 @@ def scan_all_symbols():
         else:
             log(_regime_line)
     if gex_bias:
+        _note = gex_bias.get("note", "")
+        # If the Databento billing breaker is tripped, surface the actual cause
+        # instead of the generic "No GEX data — defaulting to trend-mode" line,
+        # which made it look like a normal regime decision in today's logs.
+        if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
+            try:
+                import databento_adapter as _da
+                if _da.billing_status().get("blocked"):
+                    _note = ("GEX unavailable: Databento billing breaker engaged "
+                             "until {}").format(
+                        _da.billing_status().get("blocked_until"))
+            except Exception:
+                pass
         _gex_line = "GEX: ${}B {} | {}".format(
-            gex_bias.get("gex_b"), gex_bias.get("regime"),
-            gex_bias.get("note", ""))
+            gex_bias.get("gex_b"), gex_bias.get("regime"), _note)
         if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
             log_warn(_gex_line)
         else:
@@ -2792,9 +2834,11 @@ def run_signal_scan():
                 "\n\nWaiting for ORB breakout + volume confirmation."
             )
 
-    log("Scan done: {} SIGNAL, {} WATCHING, {} other".format(
-        len(signals), len(watching),
-        len(results) - len(signals) - len(watching)))
+    log_event("scan.done",
+              signal=len(signals),
+              watching=len(watching),
+              other=len(results) - len(signals) - len(watching),
+              total=len(results))
 
 
 # =============================================
@@ -2992,11 +3036,13 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
             },
             timeout=60
         )
-        log("AI: Anthropic HTTP {} (model={})".format(resp.status_code, ai_model))
+        log_event("anthropic.response", source="ai_loop",
+                  status=resp.status_code, model=ai_model)
 
         if resp.status_code != 200:
-            log_error("AI: Anthropic HTTP {} {}".format(
-                resp.status_code, resp.text[:200]))
+            log_event("anthropic.error", level="error", source="ai_loop",
+                      status=resp.status_code, model=ai_model,
+                      body=resp.text[:200])
             # Backoff on auth/billing errors — these don't fix themselves
             # within minutes, so stop retrying until tomorrow.
             err_text = resp.text.lower()
@@ -3214,14 +3260,16 @@ Be direct. No "consider" / "you might want to". No emojis. No closing pleasantri
             },
             timeout=90,
         )
-        log("FridayDigest: Anthropic HTTP {}".format(resp.status_code))
+        log_event("anthropic.response", source="friday_digest",
+                  status=resp.status_code)
         if resp.status_code != 200:
-            log_error("FridayDigest: Anthropic HTTP {} {}".format(
-                resp.status_code, resp.text[:200]))
+            log_event("anthropic.error", level="error", source="friday_digest",
+                      status=resp.status_code, body=resp.text[:200])
             return
         body = resp.json()["content"][0]["text"].strip()
     except Exception as e:
-        log_error("FridayDigest: API exception: {}".format(e))
+        log_event("anthropic.exception", level="error",
+                  source="friday_digest", error=str(e))
         return
 
     header  = "Weekly Upgrade Digest - {}".format(now.strftime("%Y-%m-%d"))
@@ -3323,7 +3371,9 @@ If the data does not yet support any specific proposal, return: {{"proposals": [
         )
 
         if resp.status_code != 200:
-            log_error("AI proposals: Anthropic HTTP {}".format(resp.status_code))
+            log_event("anthropic.error", level="error",
+                      source="ai_proposals", status=resp.status_code,
+                      body=resp.text[:200])
             return
 
         raw = resp.json()["content"][0]["text"].strip()

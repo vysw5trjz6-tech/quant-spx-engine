@@ -61,6 +61,25 @@ def _billing_blocked():
     )
 
 
+_LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
+
+
+def _emit_error(event, **fields):
+    """Single-line structured stderr write. Mirrors main.log_event so this
+    module stays import-cycle-free."""
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    if _LOG_JSON:
+        payload = {"ts": ts, "level": "error", "event": event}
+        payload.update(fields)
+        line = json.dumps(payload, default=str)
+    else:
+        kvs = " ".join("{}={}".format(k, v) for k, v in fields.items())
+        line = "[{}] ERROR: {}{}".format(ts, event,
+                                          " | " + kvs if kvs else "")
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
 def _trip_billing_breaker(context):
     global _billing_blocked_until
     first_trip = not _billing_blocked()
@@ -68,12 +87,12 @@ def _trip_billing_breaker(context):
         seconds=_BILLING_COOLDOWN_SECS
     )
     if first_trip:
-        # One line to stderr → surfaces as `error` in the log shipper.
-        sys.stderr.write(
-            "[databento] billing breaker tripped ({}): suppressing calls for {}m\n"
-            .format(context, _BILLING_COOLDOWN_SECS // 60)
+        _emit_error(
+            "databento.billing_blocked",
+            context=context,
+            cooldown_min=_BILLING_COOLDOWN_SECS // 60,
+            until=_billing_blocked_until.isoformat() + "Z",
         )
-        sys.stderr.flush()
 
 
 def billing_status():
@@ -169,8 +188,8 @@ def get_historical_daily_options(symbol, start_date, end_date,
         if _is_billing_error(e):
             _trip_billing_breaker("{} definitions".format(symbol))
         else:
-            sys.stderr.write("[databento] {} definitions failed: {}\n".format(
-                symbol, type(e).__name__))
+            _emit_error("databento.fetch_failed", source="definitions",
+                        symbol=symbol, exc=type(e).__name__)
         return []
 
     if def_df is None or def_df.empty:
@@ -221,8 +240,8 @@ def get_historical_daily_options(symbol, start_date, end_date,
         if _is_billing_error(e):
             _trip_billing_breaker("{} ohlcv-1d".format(symbol))
         else:
-            sys.stderr.write("[databento] {} ohlcv-1d failed: {}\n".format(
-                symbol, type(e).__name__))
+            _emit_error("databento.fetch_failed", source="ohlcv-1d",
+                        symbol=symbol, exc=type(e).__name__)
         return []
 
     if ohlcv_df is None or ohlcv_df.empty:
@@ -415,8 +434,8 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         if _is_billing_error(e):
             _trip_billing_breaker("{} overnight".format(contract))
         else:
-            sys.stderr.write("[databento] {} overnight failed: {}\n".format(
-                contract, type(e).__name__))
+            _emit_error("databento.fetch_failed", source="overnight",
+                        symbol=contract, exc=type(e).__name__)
         return []
 
 
@@ -551,8 +570,8 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         if _is_billing_error(e):
             _trip_billing_breaker("{} chain".format(underlying))
         else:
-            sys.stderr.write("[databento] {} chain failed: {}\n".format(
-                underlying, type(e).__name__))
+            _emit_error("databento.fetch_failed", source="chain",
+                        symbol=underlying, exc=type(e).__name__)
         return []
 
 
