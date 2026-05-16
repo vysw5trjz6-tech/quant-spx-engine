@@ -13,8 +13,15 @@ import sys
 import json
 import sqlite3
 import db_utils
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 import pytz
+
+
+def _utcnow():
+    """Timezone-aware UTC now. datetime.utcnow() is deprecated in 3.12+
+    and its DeprecationWarning was flooding stderr (→ `error` severity)
+    on every scan."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 DATABENTO_KEY = os.getenv("DATABENTO_API_KEY", "").strip()
 
@@ -57,7 +64,7 @@ def _is_billing_error(exc):
 def _billing_blocked():
     return (
         _billing_blocked_until is not None
-        and datetime.utcnow() < _billing_blocked_until
+        and _utcnow() < _billing_blocked_until
     )
 
 
@@ -67,7 +74,7 @@ _LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
 def _emit_error(event, **fields):
     """Single-line structured stderr write. Mirrors main.log_event so this
     module stays import-cycle-free."""
-    ts = datetime.utcnow().strftime("%H:%M:%S")
+    ts = _utcnow().strftime("%H:%M:%S")
     if _LOG_JSON:
         payload = {"ts": ts, "level": "error", "event": event}
         payload.update(fields)
@@ -83,7 +90,7 @@ def _emit_error(event, **fields):
 def _trip_billing_breaker(context):
     global _billing_blocked_until
     first_trip = not _billing_blocked()
-    _billing_blocked_until = datetime.utcnow() + timedelta(
+    _billing_blocked_until = _utcnow() + timedelta(
         seconds=_BILLING_COOLDOWN_SECS
     )
     if first_trip:
@@ -322,7 +329,7 @@ def _cache_get(key, max_age_seconds=300):
         return None
     try:
         stored = datetime.fromisoformat(row[1])
-        age    = (datetime.utcnow() - stored).total_seconds()
+        age    = (_utcnow() - stored).total_seconds()
         if age > max_age_seconds:
             return None
         return json.loads(row[0])
@@ -335,7 +342,7 @@ def _cache_set(key, value):
     conn.execute("""
         INSERT OR REPLACE INTO cache (key, value, stored_at)
         VALUES (?, ?, ?)
-    """, (key, json.dumps(value, default=str), datetime.utcnow().isoformat()))
+    """, (key, json.dumps(value, default=str), _utcnow().isoformat()))
     conn.commit()
     conn.close()
 
