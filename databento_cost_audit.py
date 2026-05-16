@@ -41,15 +41,18 @@ def price(client, label, **kw):
         return (label, None, "{}: {}".format(type(e).__name__, e))
 
 
-def audit_symbol(client, sym):
-    """Price the two OPRA queries get_options_chain_snapshot() issues."""
+def audit_symbol(client, sym, window_days=1):
+    """Price the two OPRA queries get_options_chain_snapshot() issues.
+
+    window_days=1 is the new default path; pass 2 to see the old cost.
+    """
     parent = sym + ".OPT"
     end    = _utcdate()
-    start  = end - timedelta(days=2)            # matches the adapter window
+    start  = end - timedelta(days=window_days)
     rows = []
     for schema in ("definition", "statistics"):
         rows.append(price(
-            client, "{}:{}".format(sym, schema),
+            client, "{}:{}:{}d".format(sym, schema, window_days),
             dataset="OPRA.PILLAR", symbols=[parent], stype_in="parent",
             schema=schema, start=start.isoformat(), end=end.isoformat(),
         ))
@@ -86,20 +89,23 @@ def main():
     client = db.Historical(key)
 
     sample = [s.strip().upper() for s in args.sample.split(",") if s.strip()]
-    print("=== Per-query cost (OI/GEX snapshot path, 2-day OPRA window) ===")
+    print("=== Per-query cost: NEW 1-day window vs OLD 2-day window ===")
     per_symbol = {}
     for sym in sample:
-        rows = audit_symbol(client, sym)
-        sym_total = 0.0
-        for label, usd, err in rows:
-            if err:
-                print("  {:<28} ERROR {}".format(label, err))
-            else:
-                print("  {:<28} ${:.4f}".format(label, usd))
-                sym_total += usd
-        per_symbol[sym] = sym_total
-        print("  {:<28} ${:.4f}  <- per-symbol snapshot".format(
-            sym + ":TOTAL", sym_total))
+        for wd in (1, 2):
+            rows = audit_symbol(client, sym, window_days=wd)
+            sym_total = 0.0
+            for label, usd, err in rows:
+                if err:
+                    print("  {:<24} ERROR {}".format(label, err))
+                else:
+                    print("  {:<24} ${:.4f}".format(label, usd))
+                    sym_total += usd
+            tag = "NEW" if wd == 1 else "OLD"
+            print("  {:<24} ${:.4f}  <- {} per-symbol snapshot".format(
+                "{}:TOTAL:{}d".format(sym, wd), sym_total, tag))
+            if wd == 1:
+                per_symbol[sym] = sym_total
 
     if per_symbol:
         avg = sum(per_symbol.values()) / len(per_symbol)

@@ -5148,12 +5148,50 @@ def _refresh_earnings_calendar():
         log("earnings calendar refresh error: {}".format(e))
 
 
+def _sweep_marker_get(key):
+    """Last ET date (YYYY-MM-DD) a costly Databento sweep completed OK."""
+    try:
+        conn = db_utils.connect(DB_FILE)
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_marker "
+                      "(key TEXT PRIMARY KEY, ymd TEXT)")
+        row = conn.execute("SELECT ymd FROM daily_marker WHERE key = ?",
+                           (key,)).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _sweep_marker_set(key, ymd):
+    try:
+        conn = db_utils.connect(DB_FILE)
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_marker "
+                      "(key TEXT PRIMARY KEY, ymd TEXT)")
+        conn.execute("INSERT OR REPLACE INTO daily_marker (key, ymd) "
+                     "VALUES (?, ?)", (key, ymd))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _sweep_already_done_today(key):
+    """True if this sweep already completed today (ET). Persists across
+    process restarts, so a Railway redeploy after 16:30 ET does not
+    re-run a full Databento sweep the daily job already paid for."""
+    et = pytz.timezone("America/New_York")
+    return _sweep_marker_get(key) == datetime.now(et).date().isoformat()
+
+
 def _refresh_gex_snapshots():
     """
     End-of-day chain snapshot: builds GEX, saves OI history for delta tracking.
     Uses Databento (or Polygon fallback).
     """
     if not HAS_GEX:
+        return
+    if _sweep_already_done_today("gex"):
+        log("GEX snapshot already completed today; skipping (cost guard)")
         return
     # Databento is the sole chain provider for GEX.
     try:
@@ -5163,6 +5201,7 @@ def _refresh_gex_snapshots():
     except ImportError:
         return
 
+    built = 0
     try:
         for sym in ("SPY", "QQQ"):
             spot = get_current_price(sym)
@@ -5172,6 +5211,7 @@ def _refresh_gex_snapshots():
                 continue
             gex = gamma_exposure.refresh_gex(sym, spot)
             if gex:
+                built += 1
                 log_event("gex.snapshot_built", symbol=sym,
                           gex_b=round(gex.get("total_gex", 0) / 1e9, 2))
             else:
@@ -5180,6 +5220,12 @@ def _refresh_gex_snapshots():
                           databento_blocked=_databento_blocked())
     except Exception as e:
         log_event("gex.snapshot_error", level="error", error=str(e))
+
+    # Only mark done on success, so a genuine failure still retries on the
+    # next restart rather than being suppressed by the cost guard.
+    if built > 0:
+        et = pytz.timezone("America/New_York")
+        _sweep_marker_set("gex", datetime.now(et).date().isoformat())
 
 
 def _refresh_oi_snapshots():
@@ -5192,6 +5238,9 @@ def _refresh_oi_snapshots():
     schema typically <$0.01 per symbol.
     """
     if not HAS_OI_DELTA:
+        return
+    if _sweep_already_done_today("oi"):
+        log("OI snapshot already completed today; skipping (cost guard)")
         return
     try:
         import databento_adapter
@@ -5220,6 +5269,12 @@ def _refresh_oi_snapshots():
                 log("OI snapshot {} error: {}".format(sym, e))
 
     log("OI snapshots: {}/{} symbols stored".format(ok_count, len(all_syms)))
+
+    # Mark done only if we actually stored data, so a billing-breaker /
+    # network failure still retries on the next restart.
+    if ok_count > 0:
+        et = pytz.timezone("America/New_York")
+        _sweep_marker_set("oi", datetime.now(et).date().isoformat())
 
 
 def _build_market_profile():

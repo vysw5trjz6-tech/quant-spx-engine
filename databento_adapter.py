@@ -468,12 +468,19 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     if cached:
         return cached.get("chain", [])
 
-    start_iso = (target_date_et - timedelta(days=2)).isoformat()
-    end_iso   = target_date_et.isoformat()
-    parent    = underlying + ".OPT"
+    end_iso = target_date_et.isoformat()
+    parent  = underlying + ".OPT"
 
-    try:
-        def_df = client.timeseries.get_range(
+    # OPRA definition/statistics are billed by data volume, and the volume
+    # scales ~linearly with the query window (one record per instrument per
+    # day). A single-day window on the target trading date returns the full
+    # active chain at ~1/2 the cost of the old 2-day window. On a
+    # weekend/holiday (or before EOD stats publish) the 1-day window is
+    # empty, so we widen back to 4 days only on that rare path — paying the
+    # higher cost only when we'd otherwise lose the snapshot entirely.
+    def _pull(window_days):
+        start_iso = (target_date_et - timedelta(days=window_days)).isoformat()
+        ddf = client.timeseries.get_range(
             dataset  = "OPRA.PILLAR",
             symbols  = [parent],
             stype_in = "parent",
@@ -481,6 +488,12 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             start    = start_iso,
             end      = end_iso,
         ).to_df()
+        return ddf, start_iso
+
+    try:
+        def_df, start_iso = _pull(1)
+        if def_df is None or def_df.empty:
+            def_df, start_iso = _pull(4)
 
         if def_df is None or def_df.empty:
             print("[databento] {} definitions empty".format(underlying))
@@ -523,14 +536,21 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             print("[databento] {} no parseable definitions".format(underlying))
             return []
 
-        stats_df = client.timeseries.get_range(
-            dataset  = "OPRA.PILLAR",
-            symbols  = [parent],
-            stype_in = "parent",
-            schema   = "statistics",
-            start    = start_iso,
-            end      = end_iso,
-        ).to_df()
+        def _pull_stats(start):
+            return client.timeseries.get_range(
+                dataset  = "OPRA.PILLAR",
+                symbols  = [parent],
+                stype_in = "parent",
+                schema   = "statistics",
+                start    = start,
+                end      = end_iso,
+            ).to_df()
+
+        stats_df = _pull_stats(start_iso)
+        if stats_df is None or stats_df.empty:
+            wide_start = (target_date_et - timedelta(days=4)).isoformat()
+            if wide_start != start_iso:
+                stats_df = _pull_stats(wide_start)
 
         if stats_df is None or stats_df.empty:
             print("[databento] {} statistics empty".format(underlying))
