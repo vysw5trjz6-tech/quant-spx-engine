@@ -5748,7 +5748,7 @@ _regime_recheck_done = {"date": None, "flipped": False, "from": None, "to": None
 
 
 def background_scheduler():
-    global _ai_last_run_date, _ai_last_trade_cnt
+    global _ai_last_run_date
     log("Background scheduler started")
     time.sleep(10)
 
@@ -5915,12 +5915,17 @@ def background_scheduler():
                         log("paper trader error: {}".format(_e))
                 threading.Thread(target=_paper_run, daemon=True).start()
 
-            # 1. End-of-day AI: run once after 4:05 PM ET
-            if _session and et_hour >= 16.08 and _ai_last_run_date != today:
-                log("AI: End-of-day trigger")
+            # 1. Weekly AI improvement: once per week, Friday after the
+            #    close. weekday()==4 is Friday; _ai_last_run_date != today
+            #    keeps it to a single run that day. The Friday digest below
+            #    fires ~17 min later so it reports the fresh analysis.
+            if (_session and et_hour >= 16.08
+                    and datetime.now(et).weekday() == 4
+                    and _ai_last_run_date != today):
+                log("AI: Weekly Friday trigger")
                 threading.Thread(
                     target=run_ai_improvement,
-                    args=("end_of_day",),
+                    args=("weekly_friday",),
                     daemon=True
                 ).start()
 
@@ -5932,21 +5937,6 @@ def background_scheduler():
                 _daily_refresh_done["friday_digest"] = True
                 log("AI: Friday digest trigger")
                 threading.Thread(target=run_friday_digest, daemon=True).start()
-
-            # 2. Intraday: run after every 15 new closed trades
-            #    (was 3 — too noisy. Bayesian gate inside run_ai_improvement
-            #    will further reject any change without a 30+ sample group.)
-            all_closed = db_get_all_closed_trades()
-            n_closed   = len(all_closed)
-            if (n_closed >= 15 and
-                    n_closed - _ai_last_trade_cnt >= 15):
-                log("AI: Intraday trigger ({} new trades)".format(
-                    n_closed - _ai_last_trade_cnt))
-                threading.Thread(
-                    target=run_ai_improvement,
-                    args=("intraday_15trades",),
-                    daemon=True
-                ).start()
 
         except Exception as e:
             log("Scheduler error: {}".format(e))
