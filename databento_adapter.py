@@ -13,8 +13,15 @@ import sys
 import json
 import sqlite3
 import db_utils
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 import pytz
+
+
+def _utcnow():
+    """Timezone-aware UTC now. datetime.utcnow() is deprecated in 3.12+
+    and its DeprecationWarning was flooding stderr (→ `error` severity)
+    on every scan."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 DATABENTO_KEY = os.getenv("DATABENTO_API_KEY", "").strip()
 
@@ -57,7 +64,7 @@ def _is_billing_error(exc):
 def _billing_blocked():
     return (
         _billing_blocked_until is not None
-        and datetime.utcnow() < _billing_blocked_until
+        and _utcnow() < _billing_blocked_until
     )
 
 
@@ -67,7 +74,7 @@ _LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
 def _emit_error(event, **fields):
     """Single-line structured stderr write. Mirrors main.log_event so this
     module stays import-cycle-free."""
-    ts = datetime.utcnow().strftime("%H:%M:%S")
+    ts = _utcnow().strftime("%H:%M:%S")
     if _LOG_JSON:
         payload = {"ts": ts, "level": "error", "event": event}
         payload.update(fields)
@@ -83,7 +90,7 @@ def _emit_error(event, **fields):
 def _trip_billing_breaker(context):
     global _billing_blocked_until
     first_trip = not _billing_blocked()
-    _billing_blocked_until = datetime.utcnow() + timedelta(
+    _billing_blocked_until = _utcnow() + timedelta(
         seconds=_BILLING_COOLDOWN_SECS
     )
     if first_trip:
@@ -322,7 +329,7 @@ def _cache_get(key, max_age_seconds=300):
         return None
     try:
         stored = datetime.fromisoformat(row[1])
-        age    = (datetime.utcnow() - stored).total_seconds()
+        age    = (_utcnow() - stored).total_seconds()
         if age > max_age_seconds:
             return None
         return json.loads(row[0])
@@ -335,7 +342,7 @@ def _cache_set(key, value):
     conn.execute("""
         INSERT OR REPLACE INTO cache (key, value, stored_at)
         VALUES (?, ?, ?)
-    """, (key, json.dumps(value, default=str), datetime.utcnow().isoformat()))
+    """, (key, json.dumps(value, default=str), _utcnow().isoformat()))
     conn.commit()
     conn.close()
 
@@ -461,12 +468,19 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     if cached:
         return cached.get("chain", [])
 
-    start_iso = (target_date_et - timedelta(days=2)).isoformat()
-    end_iso   = target_date_et.isoformat()
-    parent    = underlying + ".OPT"
+    end_iso = target_date_et.isoformat()
+    parent  = underlying + ".OPT"
 
-    try:
-        def_df = client.timeseries.get_range(
+    # OPRA definition/statistics are billed by data volume, and the volume
+    # scales ~linearly with the query window (one record per instrument per
+    # day). A single-day window on the target trading date returns the full
+    # active chain at ~1/2 the cost of the old 2-day window. On a
+    # weekend/holiday (or before EOD stats publish) the 1-day window is
+    # empty, so we widen back to 4 days only on that rare path — paying the
+    # higher cost only when we'd otherwise lose the snapshot entirely.
+    def _pull(window_days):
+        start_iso = (target_date_et - timedelta(days=window_days)).isoformat()
+        ddf = client.timeseries.get_range(
             dataset  = "OPRA.PILLAR",
             symbols  = [parent],
             stype_in = "parent",
@@ -474,6 +488,12 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             start    = start_iso,
             end      = end_iso,
         ).to_df()
+        return ddf, start_iso
+
+    try:
+        def_df, start_iso = _pull(1)
+        if def_df is None or def_df.empty:
+            def_df, start_iso = _pull(4)
 
         if def_df is None or def_df.empty:
             print("[databento] {} definitions empty".format(underlying))
@@ -516,14 +536,21 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             print("[databento] {} no parseable definitions".format(underlying))
             return []
 
-        stats_df = client.timeseries.get_range(
-            dataset  = "OPRA.PILLAR",
-            symbols  = [parent],
-            stype_in = "parent",
-            schema   = "statistics",
-            start    = start_iso,
-            end      = end_iso,
-        ).to_df()
+        def _pull_stats(start):
+            return client.timeseries.get_range(
+                dataset  = "OPRA.PILLAR",
+                symbols  = [parent],
+                stype_in = "parent",
+                schema   = "statistics",
+                start    = start,
+                end      = end_iso,
+            ).to_df()
+
+        stats_df = _pull_stats(start_iso)
+        if stats_df is None or stats_df.empty:
+            wide_start = (target_date_et - timedelta(days=4)).isoformat()
+            if wide_start != start_iso:
+                stats_df = _pull_stats(wide_start)
 
         if stats_df is None or stats_df.empty:
             print("[databento] {} statistics empty".format(underlying))

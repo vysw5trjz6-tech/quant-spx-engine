@@ -341,6 +341,15 @@ def log_event(event, level="info", **fields):
             debug_log.pop(0)
 
 
+def _databento_blocked():
+    """True when the Databento billing breaker is currently engaged."""
+    try:
+        import databento_adapter as _da
+        return bool(_da.billing_status().get("blocked"))
+    except Exception:
+        return False
+
+
 _last_auth_state = None
 
 
@@ -936,17 +945,29 @@ def handle_telegram_command(text):
 # MARKET OPEN
 # =============================================
 
+_last_clock_open = None
+
+
 def market_open():
+    global _last_clock_open
     try:
         r = requests.get(CLOCK_URL, headers=HEADERS, timeout=5)
-        log("Clock HTTP {}".format(r.status_code))
         if r.status_code == 200:
-            clock = r.json()
-            log("Clock: {}".format(clock))
-            return clock.get("is_open", False)
-        log("Clock error: {}".format(r.text[:100]))
+            clock  = r.json()
+            is_open = clock.get("is_open", False)
+            # Only log the clock on an open<->closed transition; the
+            # per-scan "Clock HTTP 200 / Clock: {…}" pair was ~165 lines
+            # per closed session.
+            if is_open != _last_clock_open:
+                log_event("market.clock", is_open=is_open,
+                          next_open=clock.get("next_open"),
+                          next_close=clock.get("next_close"))
+                _last_clock_open = is_open
+            return is_open
+        log_event("market.clock_error", level="warn",
+                  status=r.status_code, body=r.text[:100])
     except Exception as e:
-        log("Clock exception: {}".format(e))
+        log_event("market.clock_exception", level="warn", error=str(e))
     et    = pytz.timezone("America/New_York")
     now   = datetime.now(et)
     if now.weekday() >= 5:
@@ -2231,15 +2252,11 @@ def scan_all_symbols():
         # If the Databento billing breaker is tripped, surface the actual cause
         # instead of the generic "No GEX data — defaulting to trend-mode" line,
         # which made it look like a normal regime decision in today's logs.
-        if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
-            try:
-                import databento_adapter as _da
-                if _da.billing_status().get("blocked"):
-                    _note = ("GEX unavailable: Databento billing breaker engaged "
-                             "until {}").format(
-                        _da.billing_status().get("blocked_until"))
-            except Exception:
-                pass
+        if (gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN") \
+                and _databento_blocked():
+            import databento_adapter as _da
+            _note = ("GEX unavailable: Databento billing breaker engaged "
+                     "until {}").format(_da.billing_status().get("blocked_until"))
         _gex_line = "GEX: ${}B {} | {}".format(
             gex_bias.get("gex_b"), gex_bias.get("regime"), _note)
         if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
@@ -2744,14 +2761,17 @@ def scan_all_symbols():
 
 def run_signal_scan():
     global all_signals, next_scan_at
-    log("=== Running signal scan ===")
-    _log_auth_state_if_changed()
 
     if not market_open():
-        log("Market closed - skipping scan")
+        # market.clock already logs the open->closed transition; stay
+        # silent on subsequent closed scans instead of emitting the
+        # "=== Running signal scan === / Market closed" pair every 5 min.
         with state_lock:
             next_scan_at = time.time() + SCAN_INTERVAL
         return
+
+    log("=== Running signal scan ===")
+    _log_auth_state_if_changed()
 
     results = scan_all_symbols()
 
@@ -5128,12 +5148,50 @@ def _refresh_earnings_calendar():
         log("earnings calendar refresh error: {}".format(e))
 
 
+def _sweep_marker_get(key):
+    """Last ET date (YYYY-MM-DD) a costly Databento sweep completed OK."""
+    try:
+        conn = db_utils.connect(DB_FILE)
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_marker "
+                      "(key TEXT PRIMARY KEY, ymd TEXT)")
+        row = conn.execute("SELECT ymd FROM daily_marker WHERE key = ?",
+                           (key,)).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _sweep_marker_set(key, ymd):
+    try:
+        conn = db_utils.connect(DB_FILE)
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_marker "
+                      "(key TEXT PRIMARY KEY, ymd TEXT)")
+        conn.execute("INSERT OR REPLACE INTO daily_marker (key, ymd) "
+                     "VALUES (?, ?)", (key, ymd))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _sweep_already_done_today(key):
+    """True if this sweep already completed today (ET). Persists across
+    process restarts, so a Railway redeploy after 16:30 ET does not
+    re-run a full Databento sweep the daily job already paid for."""
+    et = pytz.timezone("America/New_York")
+    return _sweep_marker_get(key) == datetime.now(et).date().isoformat()
+
+
 def _refresh_gex_snapshots():
     """
     End-of-day chain snapshot: builds GEX, saves OI history for delta tracking.
     Uses Databento (or Polygon fallback).
     """
     if not HAS_GEX:
+        return
+    if _sweep_already_done_today("gex"):
+        log("GEX snapshot already completed today; skipping (cost guard)")
         return
     # Databento is the sole chain provider for GEX.
     try:
@@ -5143,15 +5201,31 @@ def _refresh_gex_snapshots():
     except ImportError:
         return
 
+    built = 0
     try:
         for sym in ("SPY", "QQQ"):
             spot = get_current_price(sym)
             if not spot:
+                log_event("gex.snapshot_skipped", level="warn",
+                          symbol=sym, reason="no_spot_price")
                 continue
-            gamma_exposure.refresh_gex(sym, spot)
-            log("GEX snapshot built for {}".format(sym))
+            gex = gamma_exposure.refresh_gex(sym, spot)
+            if gex:
+                built += 1
+                log_event("gex.snapshot_built", symbol=sym,
+                          gex_b=round(gex.get("total_gex", 0) / 1e9, 2))
+            else:
+                # Empty chain — almost always the Databento billing breaker.
+                log_event("gex.snapshot_empty", level="warn", symbol=sym,
+                          databento_blocked=_databento_blocked())
     except Exception as e:
-        log("GEX snapshot error: {}".format(e))
+        log_event("gex.snapshot_error", level="error", error=str(e))
+
+    # Only mark done on success, so a genuine failure still retries on the
+    # next restart rather than being suppressed by the cost guard.
+    if built > 0:
+        et = pytz.timezone("America/New_York")
+        _sweep_marker_set("gex", datetime.now(et).date().isoformat())
 
 
 def _refresh_oi_snapshots():
@@ -5164,6 +5238,9 @@ def _refresh_oi_snapshots():
     schema typically <$0.01 per symbol.
     """
     if not HAS_OI_DELTA:
+        return
+    if _sweep_already_done_today("oi"):
+        log("OI snapshot already completed today; skipping (cost guard)")
         return
     try:
         import databento_adapter
@@ -5192,6 +5269,12 @@ def _refresh_oi_snapshots():
                 log("OI snapshot {} error: {}".format(sym, e))
 
     log("OI snapshots: {}/{} symbols stored".format(ok_count, len(all_syms)))
+
+    # Mark done only if we actually stored data, so a billing-breaker /
+    # network failure still retries on the next restart.
+    if ok_count > 0:
+        et = pytz.timezone("America/New_York")
+        _sweep_marker_set("oi", datetime.now(et).date().isoformat())
 
 
 def _build_market_profile():

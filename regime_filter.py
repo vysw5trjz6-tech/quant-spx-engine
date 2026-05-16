@@ -7,11 +7,19 @@
 # the table and accepting losses you don't have to take.
 
 import os
+import io
+import csv
 import math
 import statistics
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
+
+try:
+    import db_utils
+    _HAS_DB = True
+except Exception:
+    _HAS_DB = False
 
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
@@ -100,14 +108,135 @@ REGIME_STRATEGY_RULES = {
 # DATA FETCH
 # =============================================
 
+# =============================================
+# VIX SOURCING (multi-source, cached)
+# =============================================
+#
+# The whole regime classifier hinges on VIX / VIX9D / VIX3M. Yahoo via
+# yfinance is the cheapest source but is unreliable from datacenter IPs
+# (Railway): it rate-limits and returns empty intermittently. To stop the
+# regime from going blank on a transient hiccup we layer:
+#
+#   1. Yahoo (yfinance)            -- primary, freshest
+#   2. Stooq free daily CSV        -- key-less, datacenter-friendly
+#   3. Persistent last-good cache  -- survives a full outage
+#
+# Cached values are accepted up to _VIX_CACHE_MAX_AGE old. Regime buckets
+# are coarse and this feeds a pre-market alert, so a day-old VIX is far
+# better than no regime at all (the original docstring already says
+# day-old is acceptable here).
+
+_VIX_CACHE_DB      = ((os.getenv("DATA_DIR")
+                       or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+                       or "/tmp").rstrip("/") + "/regime_cache.db")
+# 4 days covers a Fri close consumed after a 3-day holiday weekend.
+_VIX_CACHE_MAX_AGE = timedelta(days=4)
+
+_STOOQ_SYMBOLS = {
+    "^VIX":   "%5Evix",
+    "^VIX9D": "%5Evix9d",
+    "^VIX3M": "%5Evix3m",
+}
+
+
+def _vix_cache_init(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS vix_last_good "
+                 "(ticker TEXT PRIMARY KEY, value REAL, stored_at TEXT)")
+
+
+def _vix_cache_set(ticker, value):
+    if not _HAS_DB:
+        return
+    try:
+        conn = db_utils.connect(_VIX_CACHE_DB)
+        _vix_cache_init(conn)
+        conn.execute("INSERT OR REPLACE INTO vix_last_good "
+                     "(ticker, value, stored_at) VALUES (?, ?, ?)",
+                     (ticker, float(value),
+                      datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _vix_cache_get(ticker):
+    """Return last-good value if present and within max age, else None."""
+    if not _HAS_DB:
+        return None
+    try:
+        conn = db_utils.connect(_VIX_CACHE_DB)
+        _vix_cache_init(conn)
+        row = conn.execute("SELECT value, stored_at FROM vix_last_good "
+                           "WHERE ticker = ?", (ticker,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        stored = datetime.fromisoformat(row[1])
+        if datetime.now(timezone.utc) - stored > _VIX_CACHE_MAX_AGE:
+            print("[regime] cached {} is stale; ignoring".format(ticker))
+            return None
+        return float(row[0])
+    except Exception:
+        return None
+
+
+def _fetch_stooq_close(ticker):
+    """Latest daily close for a ^-index from Stooq's free CSV. None on fail."""
+    sym = _STOOQ_SYMBOLS.get(ticker)
+    if not sym:
+        return None
+    try:
+        r = requests.get("https://stooq.com/q/d/l/?s={}&i=d".format(sym),
+                         timeout=10)
+        if r.status_code != 200 or not r.text:
+            return None
+        rows = list(csv.DictReader(io.StringIO(r.text)))
+        if not rows or "Close" not in rows[-1]:
+            return None
+        return float(rows[-1]["Close"])
+    except Exception as e:
+        print("[regime] Stooq {} fetch failed: {}".format(ticker, e))
+        return None
+
+
+def _fetch_yahoo_close(ticker):
+    """Latest daily close via yfinance. None on any failure."""
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period="5d", interval="1d")
+        if hist is not None and not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except ImportError:
+        print("[regime] yfinance not installed")
+    except Exception as e:
+        print("[regime] Yahoo {} fetch failed: {}".format(ticker, e))
+    return None
+
+
+def _get_vix_value(ticker, lo=1.0, hi=200.0):
+    """Yahoo -> Stooq -> last-good cache. Caches every fresh good value."""
+    for fetch in (_fetch_yahoo_close, _fetch_stooq_close):
+        val = fetch(ticker)
+        if val is not None and lo <= val <= hi:
+            _vix_cache_set(ticker, val)
+            return val
+    cached = _vix_cache_get(ticker)
+    if cached is not None:
+        print("[regime] using cached last-good {}={:.2f}".format(
+            ticker, cached))
+    return cached
+
+
 def get_current_vix():
     """
     Fetch the latest VIX quote.
 
     Source priority:
-      1. Yahoo Finance (real VIX index, free, 15-min delayed)
-      2. VIXY ETF as last-resort proxy with tight sanity guard
-      3. None (caller uses realized vol fallback)
+      1. Yahoo Finance / Stooq (real VIX index, free)
+      2. Persistent last-good cache (<= 4 days old)
+      3. VIXY ETF as last-resort proxy with tight sanity guard
+      4. None (caller uses realized vol fallback)
 
     NOTE: Databento does NOT sell the VIX spot index — they only sell VIX
     futures (VX) on XCBF.PITCH which requires a paid live license. So
@@ -116,23 +245,12 @@ def get_current_vix():
     Yahoo's ^VIX is the actual CBOE VIX index value, 15-min delayed during
     RTH and EOD-current outside RTH. Fine for our pre-market regime alert.
     """
-    # --- Path 1: Yahoo Finance ---
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker("^VIX")
-        # 5 days gives us yesterday's close even on weekends/holidays
-        hist = ticker.history(period="5d", interval="1d")
-        if hist is not None and not hist.empty:
-            vix = float(hist["Close"].iloc[-1])
-            if 5 <= vix <= 80:
-                return vix
-            print("[regime] Yahoo VIX out of range: {}".format(vix))
-    except ImportError:
-        print("[regime] yfinance not installed — falling back to VIXY proxy")
-    except Exception as e:
-        print("[regime] Yahoo VIX fetch failed: {}".format(e))
+    # --- Paths 1-2: real VIX (Yahoo -> Stooq -> last-good cache) ---
+    vix = _get_vix_value("^VIX", 5, 80)
+    if vix is not None:
+        return vix
 
-    # --- Path 2: VIXY ETF as proxy (last resort, tightly bounded) ---
+    # --- Path 3: VIXY ETF as proxy (last resort, tightly bounded) ---
     try:
         et    = pytz.timezone("America/New_York")
         end   = datetime.now(et)
@@ -423,22 +541,15 @@ def get_vix_term_structure():
         "CONTANGO"            -- VIX3M > VIX9D         (normal, trend-friendly)
         "DEEP_CONTANGO"       -- VIX3M / VIX9D > 1.15  (complacent, vol-of-vol up)
     """
-    try:
-        import yfinance as yf
-    except ImportError:
-        return None
-
-    try:
-        tickers = yf.Tickers("^VIX9D ^VIX ^VIX3M")
-        out = {}
-        for tk in ("^VIX9D", "^VIX", "^VIX3M"):
-            hist = tickers.tickers[tk].history(period="5d", interval="1d")
-            if hist is None or hist.empty:
-                return None
-            out[tk] = float(hist["Close"].iloc[-1])
-    except Exception as e:
-        print("[regime] term-structure fetch failed: {}".format(e))
-        return None
+    # Each leg: Yahoo -> Stooq -> last-good cache. Only bail if a leg is
+    # unavailable from every source (term structure needs all three).
+    out = {}
+    for tk in ("^VIX9D", "^VIX", "^VIX3M"):
+        val = _get_vix_value(tk, 5, 90)
+        if val is None:
+            print("[regime] term-structure unavailable: no {}".format(tk))
+            return None
+        out[tk] = val
 
     vix9d, vix, vix3m = out["^VIX9D"], out["^VIX"], out["^VIX3M"]
     if vix9d <= 0 or vix3m <= 0:
