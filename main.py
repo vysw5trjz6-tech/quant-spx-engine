@@ -157,6 +157,7 @@ HEADERS = {
 DATA_URL  = "https://data.alpaca.markets/v2/stocks/{}/bars"
 QUOTE_URL = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
 CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
+CALENDAR_URL = "https://paper-api.alpaca.markets/v2/calendar"
 
 # Auto-detect persistent storage: Railway volume > DATA_DIR env > /tmp fallback
 _data_dir = os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "/tmp"
@@ -946,6 +947,42 @@ def handle_telegram_command(text):
 # =============================================
 
 _last_clock_open = None
+
+
+_trading_day_cache = {"date": None, "val": None}
+
+
+def is_trading_day():
+    """
+    True if today (ET) is a US equity trading session — holiday-aware.
+
+    Time-of-day independent: still True on a session day after the close,
+    so EOD jobs (GEX/OI/IV/AI) fire on Friday afternoon but NOT on the
+    weekend or on market holidays. Source is Alpaca's calendar endpoint;
+    falls back to a weekday check only if the API is unreachable.
+    """
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).strftime("%Y-%m-%d")
+    if _trading_day_cache["date"] == today:
+        return _trading_day_cache["val"]
+
+    val = None
+    try:
+        r = requests.get(CALENDAR_URL, headers=HEADERS,
+                         params={"start": today, "end": today}, timeout=5)
+        if r.status_code == 200:
+            days = r.json()
+            # Non-empty array => Alpaca lists a session for today.
+            val = bool(isinstance(days, list) and len(days) > 0)
+    except Exception as e:
+        log_event("calendar.error", level="warn", error=str(e))
+
+    if val is None:  # API failure: weekday heuristic (misses holidays)
+        val = datetime.now(et).weekday() < 5
+
+    _trading_day_cache["date"] = today
+    _trading_day_cache["val"]  = val
+    return val
 
 
 def market_open():
@@ -5731,15 +5768,17 @@ def background_scheduler():
         threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
         # Build yesterday's Market Profile (needed for today's opening classification)
         threading.Thread(target=_build_market_profile, daemon=True).start()
+    # Daily jobs only run on a trading session (skip weekends/holidays).
+    _is_session = is_trading_day()
     # Brief on boot ONLY if we're in the pre-open window (9:00 AM – 10:30 AM ET)
-    if 9.0 <= boot_hour <= 10.5:
+    if _is_session and 9.0 <= boot_hour <= 10.5:
         threading.Thread(target=run_premarket_brief, daemon=True).start()
     # Opening flow: pull at boot if we're past 10:05 AM today
-    if 10.1 <= boot_hour <= 16.0:
+    if _is_session and 10.1 <= boot_hour <= 16.0:
         threading.Thread(target=_pull_opening_flow, daemon=True).start()
-    if boot_hour >= 16.25:
+    if _is_session and boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
-    if boot_hour >= 16.5:
+    if _is_session and boot_hour >= 16.5:
         threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
         threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
 
@@ -5793,6 +5832,11 @@ def background_scheduler():
                 _daily_refresh_done["friday_digest"] = (
                     datetime.now(et).weekday() != 4
                 )
+            # Holiday/weekend-aware: gates the premarket brief and every
+            # EOD job so they don't fire (or spend on Databento) when the
+            # market is closed. Cached per-day, so this is one cheap call.
+            _session = is_trading_day()
+
             if et_hour >= 6.0 and not _daily_refresh_done.get("earnings"):
                 threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
                 _daily_refresh_done["earnings"] = True
@@ -5810,13 +5854,13 @@ def background_scheduler():
             # + premarket picture (futures gap, options flow, news pricing-in)
             # without missing the action that builds in the final hour of
             # premarket. In premarket mode, this is THE main alert of the day.
-            if (et_hour >= 9.166 and et_hour < 9.34
+            if (_session and et_hour >= 9.166 and et_hour < 9.34
                     and not _daily_refresh_done.get("premarket")):
                 _daily_refresh_done["premarket"] = True
                 threading.Thread(target=run_premarket_brief, daemon=True).start()
 
             # 10:05 AM ET: pull SPY+QQQ options flow for the 8:00-10:00 window
-            if (et_hour >= 10.08 and et_hour < 10.3
+            if (_session and et_hour >= 10.08 and et_hour < 10.3
                     and not _daily_refresh_done.get("flow")):
                 _daily_refresh_done["flow"] = True
                 threading.Thread(target=_pull_opening_flow, daemon=True).start()
@@ -5844,24 +5888,24 @@ def background_scheduler():
                     threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
 
             # 4:30 PM ET: post-close GEX snapshot (both modes — feeds tomorrow's brief)
-            if et_hour >= 16.5 and not _daily_refresh_done.get("gex"):
+            if _session and et_hour >= 16.5 and not _daily_refresh_done.get("gex"):
                 threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
                 _daily_refresh_done["gex"] = True
 
             # 4:35 PM ET: OI snapshot for delta tracking (full universe)
-            if et_hour >= 16.58 and not _daily_refresh_done.get("oi"):
+            if _session and et_hour >= 16.58 and not _daily_refresh_done.get("oi"):
                 threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
                 _daily_refresh_done["oi"] = True
 
             # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
-            if et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
+            if _session and et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
                 threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
                 _daily_refresh_done["iv"] = True
 
             # 0. Paper trader: replay today's signals at 4:04 PM ET so the
             #    AI improvement step below sees synthetic outcomes alongside
             #    any manually-logged real trades. Runs once per day.
-            if (HAS_PAPER_TRADER and et_hour >= 16.05
+            if (_session and HAS_PAPER_TRADER and et_hour >= 16.05
                     and not _daily_refresh_done.get("paper")):
                 _daily_refresh_done["paper"] = True
                 def _paper_run():
@@ -5872,7 +5916,7 @@ def background_scheduler():
                 threading.Thread(target=_paper_run, daemon=True).start()
 
             # 1. End-of-day AI: run once after 4:05 PM ET
-            if et_hour >= 16.08 and _ai_last_run_date != today:
+            if _session and et_hour >= 16.08 and _ai_last_run_date != today:
                 log("AI: End-of-day trigger")
                 threading.Thread(
                     target=run_ai_improvement,
@@ -5882,7 +5926,7 @@ def background_scheduler():
 
             # 1b. Friday weekly upgrade digest: ~10 min after EOD AI so the
             #     latest analysis is committed. Opus-generated, Telegram-sent.
-            if (et_hour >= 16.25
+            if (_session and et_hour >= 16.25
                     and datetime.now(et).weekday() == 4
                     and not _daily_refresh_done.get("friday_digest")):
                 _daily_refresh_done["friday_digest"] = True
