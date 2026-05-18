@@ -186,6 +186,45 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def _renormalize_weights(vals, lo=5, hi=40, target=100):
+    """
+    Return integer weights, each within [lo, hi], summing exactly to
+    target -- provided that is feasible (len*lo <= target <= len*hi).
+    Residual is distributed only onto keys with headroom in the needed
+    direction, so the band is never violated.
+    """
+    keys = list(vals)
+    if not keys:
+        return {}
+    v = {k: _clamp(float(vals[k]), lo, hi) for k in keys}
+
+    for _ in range(100):
+        diff = target - sum(v.values())
+        if abs(diff) < 1e-9:
+            break
+        movable = [k for k in keys
+                   if (diff > 0 and v[k] < hi) or (diff < 0 and v[k] > lo)]
+        if not movable:
+            break
+        share = diff / len(movable)
+        for k in movable:
+            v[k] = _clamp(v[k] + share, lo, hi)
+
+    r = {k: int(round(v[k])) for k in keys}
+    for _ in range(100):
+        d = target - sum(r.values())
+        if d == 0:
+            break
+        step = 1 if d > 0 else -1
+        cand = [k for k in keys if lo <= r[k] + step <= hi]
+        if not cand:
+            break
+        # Adjust whichever key the rounding most shortchanged.
+        k = max(cand, key=lambda k: (v[k] - r[k]) * step)
+        r[k] += step
+    return r
+
+
 def enforce_config_invariants(cfg):
     """
     Hard structural rules enforced in code (never trusted to the prompt):
@@ -203,21 +242,13 @@ def enforce_config_invariants(cfg):
     c["grade_a_min"] = int(_clamp(round(c.get("grade_a_min", 75)),
                                   max(65, c["grade_b_min"] + 5), 95))
 
-    # Factor weights: in-band, then renormalize to sum 100.
+    # Factor weights: each in [5,40] AND sum to 100. Naive scale-then-round
+    # can push a weight out of band, so water-fill the residual only onto
+    # keys that still have headroom, then fix integer drift the same way.
     wkeys = [k for k in c if k.startswith("weight_")]
     if wkeys:
-        for k in wkeys:
-            c[k] = _clamp(float(c.get(k, 0)), 5, 40)
-        tot = sum(c[k] for k in wkeys)
-        if tot > 0:
-            scaled = {k: c[k] / tot * 100 for k in wkeys}
-            rounded = {k: int(round(v)) for k, v in scaled.items()}
-            # Push the rounding remainder onto the largest weight.
-            drift = 100 - sum(rounded.values())
-            if drift and rounded:
-                big = max(rounded, key=rounded.get)
-                rounded[big] += drift
-            c.update(rounded)
+        c.update(_renormalize_weights(
+            {k: c.get(k, 0) for k in wkeys}, lo=5, hi=40, target=100))
 
     if "late_entry_hour" in c:
         c["late_entry_hour"] = round(

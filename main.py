@@ -571,6 +571,22 @@ def reset_ai_config_to_baseline(reason="manual"):
                               "AI tuning resumes once data accumulates.")
     update_config(baseline, updated_by="reset_baseline")
     db_save_ai_config(get_config(), trigger="reset_{}".format(reason))
+    # Verify the epoch actually persisted. If the DB write silently
+    # failed, idempotency is broken and every restart would re-wipe
+    # accumulated post-epoch trades -- surface that loudly.
+    try:
+        conn = db_utils.connect(DB_FILE)
+        row = conn.execute(
+            "SELECT config_json FROM ai_config ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        persisted = json.loads(row[0]).get("learning_epoch") if row else None
+        if persisted != baseline["learning_epoch"]:
+            log_event("ai.reset_not_persisted", level="error",
+                      reason=reason, expected=baseline["learning_epoch"],
+                      persisted=persisted)
+    except Exception as e:
+        log_event("ai.reset_verify_failed", level="error", error=str(e))
     log("AI: config reset to baseline ({}); learning_epoch={}".format(
         reason, baseline["learning_epoch"]))
 
@@ -6513,7 +6529,7 @@ def render_dashboard(toast=""):
     all_closed_trades = db_get_all_closed_trades()
     n_closed_all      = len(all_closed_trades)
     n_open_all        = len(db_get_open_trades())
-    ai_ready          = n_closed_all >= 3
+    ai_ready          = n_closed_all >= AI_MIN_TOTAL_SAMPLES
     ai_data_line = (
         "<div style='font-size:11px;margin-top:6px;padding-top:6px;"
         "border-top:1px solid #21262d'>"
@@ -6529,7 +6545,8 @@ def render_dashboard(toast=""):
         nc=n_closed_all, no=n_open_all,
         status=("<span style='color:#3fb950'>Learning active</span>" if ai_ready
                 else "<span style='color:#e3b341'>Need {} more closed trades"
-                     " (close open trades with WIN/LOSS buttons)</span>".format(3 - n_closed_all))
+                     " (close open trades with WIN/LOSS buttons)</span>".format(
+                         AI_MIN_TOTAL_SAMPLES - n_closed_all))
     )
 
     if ai_ver > 0:
@@ -7666,8 +7683,8 @@ def db_status():
                 "wins": win_count,
                 "losses": loss_count,
                 "closed_total": win_count + loss_count,
-                "ai_needs": "3 closed trades minimum",
-                "ai_ready": (win_count + loss_count) >= 3,
+                "ai_needs": "{} closed trades minimum".format(AI_MIN_TOTAL_SAMPLES),
+                "ai_ready": (win_count + loss_count) >= AI_MIN_TOTAL_SAMPLES,
             },
             "ai_engine": {
                 "config_version": cfg.get("ai_version", 0),
