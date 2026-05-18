@@ -2062,6 +2062,7 @@ def get_liquid_option(symbol, direction, underlying_price=None):
     url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
 
     expiry_dates = _next_expiry_dates(n=5)
+    skipped = []  # compact per-expiry skip reasons, logged once if we fail
 
     for expiry_str in expiry_dates:
         params = {
@@ -2076,14 +2077,13 @@ def get_liquid_option(symbol, direction, underlying_price=None):
 
         try:
             r = requests.get(url, headers=headers, params=params, timeout=10)
-            log("Alpaca options {} {} {}: HTTP {}".format(
-                symbol, option_type, expiry_str, r.status_code))
 
             if r.status_code == 422:
-                log("  No options for {} on {} -- trying next expiry".format(symbol, expiry_str))
+                skipped.append("{}:no-chain".format(expiry_str))
                 continue
             if r.status_code != 200:
-                log("  Options error {}: {}".format(r.status_code, r.text[:150]))
+                log("  Options error {} for {} {}: {}".format(
+                    r.status_code, symbol, option_type, r.text[:150]))
                 return None, None, False, None
 
             snapshots = r.json().get("snapshots", {})
@@ -2124,7 +2124,8 @@ def get_liquid_option(symbol, direction, underlying_price=None):
                 })
 
             if not candidates:
-                log("  No liquid ATM candidates on {} -- trying next".format(expiry_str))
+                skipped.append("{}:{}c-none-liquid".format(
+                    expiry_str, len(snapshots)))
                 continue
 
             if any(c["delta"] > 0 for c in candidates):
@@ -2148,7 +2149,8 @@ def get_liquid_option(symbol, direction, underlying_price=None):
             log("Alpaca options exception {} {}: {}".format(symbol, expiry_str, e))
             return None, None, False, None
 
-    log("  No options found for {} across all expiries".format(symbol))
+    log("  No tradable {} {} contract: {}".format(
+        symbol, option_type, ", ".join(skipped) if skipped else "no expiries"))
     return None, None, False, None
 
 
