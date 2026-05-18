@@ -262,7 +262,13 @@ DEFAULT_CONFIG = {
     "ai_insight": "Baseline config -- collecting trade data to begin optimization.",
     "ai_focus":   "Trade all A/B/C grade signals and log outcomes to build the dataset.",
     "ai_version": 0,
+    # ISO-UTC cutoff. Trades logged before this are excluded from AI
+    # tuning (set whenever the config is reset to baseline).
+    "learning_epoch": "",
 }
+
+# Minimum post-epoch closed trades before the AI may tune anything.
+AI_MIN_TOTAL_SAMPLES = 30
 
 # Live config -- loaded from DB on startup, updated by AI
 _scanner_config = dict(DEFAULT_CONFIG)
@@ -551,6 +557,34 @@ def db_save_ai_analysis(trades_used, win_rate, insight, focus, reasoning,
         log("DB save ai_analysis error: {}".format(e))
 
 
+def reset_ai_config_to_baseline(reason="manual"):
+    """
+    Wipe all AI tuning: restore DEFAULT_CONFIG and stamp a fresh
+    learning_epoch so the AI only learns from trades logged AFTER this
+    point. Persisted as the newest ai_config row so it survives restarts.
+    """
+    baseline = dict(DEFAULT_CONFIG)
+    baseline["learning_epoch"] = datetime.now(pytz.utc).isoformat()
+    baseline["ai_insight"] = ("Config reset to baseline ({}). Collecting "
+                              "fresh post-reset trades.".format(reason))
+    baseline["ai_focus"]   = ("Trade all A/B/C signals and log outcomes; "
+                              "AI tuning resumes once data accumulates.")
+    update_config(baseline, updated_by="reset_baseline")
+    db_save_ai_config(get_config(), trigger="reset_{}".format(reason))
+    log("AI: config reset to baseline ({}); learning_epoch={}".format(
+        reason, baseline["learning_epoch"]))
+
+
+def _maybe_reset_ai_baseline():
+    """
+    Idempotent: if the restored config has no learning_epoch it predates
+    the reset, so baseline it exactly once. After that this is a no-op.
+    """
+    if not get_config().get("learning_epoch"):
+        log("AI: pre-reset config detected -- applying one-time baseline reset")
+        reset_ai_config_to_baseline(reason="auto_migration")
+
+
 def db_load_latest_config():
     """Load most recent AI config from DB into memory on startup."""
     try:
@@ -649,20 +683,31 @@ def db_dismiss_proposal(proposal_id):
 
 
 def db_get_all_closed_trades():
-    """All closed trades for AI analysis."""
+    """
+    Closed trades for AI analysis -- ALL modes (paper + real), since the
+    AI must learn from every signal it suggested. P&L is intentionally
+    NOT selected: tuning is on pure win/loss + R-multiple (were the price
+    targets hit before the stop), never on dollars. Trades logged before
+    the active learning_epoch are excluded -- pre-reset data lacks
+    trustworthy VIX/GEX context and must not influence tuning.
+    """
     try:
+        epoch = get_config().get("learning_epoch") or ""
         conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
-            SELECT symbol, direction, outcome, pnl, r_mult,
-                   grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts
-            FROM trades WHERE outcome != 'OPEN'
+            SELECT symbol, direction, outcome, r_mult,
+                   grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts,
+                   signal_type
+            FROM trades
+            WHERE outcome != 'OPEN' AND ts >= ?
             ORDER BY ts DESC
-        """)
+        """, (epoch,))
         rows = c.fetchall()
         conn.close()
-        cols = ["symbol","direction","outcome","pnl","r_mult",
-                "grade","grade_pts","gap_pct","gap_dir","rs","entry_hour","ts"]
+        cols = ["symbol","direction","outcome","r_mult",
+                "grade","grade_pts","gap_pct","gap_dir","rs","entry_hour","ts",
+                "signal_type"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log("DB get all closed trades error: {}".format(e))
@@ -2907,83 +2952,60 @@ def run_signal_scan():
 _ai_last_run_date  = ""   # tracks last calendar day AI ran
 _ai_last_trade_cnt = 0    # tracks trade count at last AI run
 
+def _time_bucket(h):
+    if h < 10:   return "9:30-10:00"
+    elif h < 11: return "10:00-11:00"
+    elif h < 12: return "11:00-12:00"
+    elif h < 13: return "12:00-1:00"
+    elif h < 14: return "1:00-2:00"
+    else:        return "2:00+"
+
+
+def _wl_groups(trades, key_fn):
+    """{group: {'wins','losses','trades','win_rate'}} -- pure W/L, no $."""
+    g = {}
+    for t in trades:
+        k = key_fn(t)
+        if k not in g:
+            g[k] = {"wins": 0, "losses": 0}
+        if t["outcome"] == "WIN":
+            g[k]["wins"] += 1
+        else:
+            g[k]["losses"] += 1
+    for k, v in g.items():
+        n = v["wins"] + v["losses"]
+        v["trades"]   = n
+        v["win_rate"] = round(v["wins"] / n * 100, 1) if n else 0
+    return g
+
+
 def _build_stats_summary(trades):
-    """Build a compact stats dict for the AI prompt."""
+    """
+    Compact W/L stats for the AI prompt. Deliberately contains NO dollar
+    P&L -- only outcomes (WIN/LOSS) and R-multiple (did price hit the
+    target before the stop). Raw wins/losses per group are exposed so the
+    safety gate can sample-test every dimension the AI may tune.
+    """
     if not trades:
         return {}
 
-    total  = len(trades)
-    wins   = [t for t in trades if t["outcome"] == "WIN"]
-    losses = [t for t in trades if t["outcome"] == "LOSS"]
-    wr     = round(len(wins) / total * 100, 1) if total else 0
-    avg_r  = round(sum(t["r_mult"] or 0 for t in trades) / total, 2) if total else 0
-    total_pnl = round(sum(t["pnl"] or 0 for t in trades), 2)
-
-    def breakdown(key):
-        groups = {}
-        for t in trades:
-            k = str(t.get(key) or "?")
-            if k not in groups: groups[k] = {"w": 0, "l": 0, "pnl": 0}
-            if t["outcome"] == "WIN":  groups[k]["w"] += 1
-            else:                      groups[k]["l"] += 1
-            groups[k]["pnl"] = round(groups[k]["pnl"] + (t["pnl"] or 0), 2)
-        result = {}
-        for k, v in groups.items():
-            n = v["w"] + v["l"]
-            result[k] = {
-                "trades": n,
-                "win_rate": round(v["w"] / n * 100, 1) if n else 0,
-                "pnl": v["pnl"]
-            }
-        return result
-
-    # Time buckets
-    def time_bucket(h):
-        if h < 10:   return "9:30-10:00"
-        elif h < 11: return "10:00-11:00"
-        elif h < 12: return "11:00-12:00"
-        elif h < 13: return "12:00-1:00"
-        elif h < 14: return "1:00-2:00"
-        else:        return "2:00+"
-
-    time_groups = {}
-    for t in trades:
-        k = time_bucket(t["entry_hour"] or 9.5)
-        if k not in time_groups: time_groups[k] = {"w": 0, "l": 0, "pnl": 0}
-        if t["outcome"] == "WIN":  time_groups[k]["w"] += 1
-        else:                      time_groups[k]["l"] += 1
-        time_groups[k]["pnl"] = round(time_groups[k]["pnl"] + (t["pnl"] or 0), 2)
-    by_time = {}
-    for k, v in time_groups.items():
-        n = v["w"] + v["l"]
-        by_time[k] = {"trades": n, "win_rate": round(v["w"]/n*100,1) if n else 0, "pnl": v["pnl"]}
-
-    # RS sign breakdown
-    rs_pos = [t for t in trades if (t["rs"] or 0) > 0]
-    rs_neg = [t for t in trades if (t["rs"] or 0) <= 0]
-    rs_breakdown = {
-        "rs_positive": {
-            "trades": len(rs_pos),
-            "win_rate": round(sum(1 for t in rs_pos if t["outcome"]=="WIN") / len(rs_pos) * 100, 1) if rs_pos else 0
-        },
-        "rs_negative": {
-            "trades": len(rs_neg),
-            "win_rate": round(sum(1 for t in rs_neg if t["outcome"]=="WIN") / len(rs_neg) * 100, 1) if rs_neg else 0
-        }
-    }
+    total = len(trades)
+    wins  = sum(1 for t in trades if t["outcome"] == "WIN")
+    wr    = round(wins / total * 100, 1) if total else 0
+    avg_r = round(sum(t["r_mult"] or 0 for t in trades) / total, 2) if total else 0
 
     return {
-        "total_trades": total,
-        "win_rate":     wr,
-        "avg_r_mult":   avg_r,
-        "total_pnl":    total_pnl,
-        "by_symbol":    breakdown("symbol"),
-        "by_grade":     breakdown("grade"),
-        "by_direction": breakdown("direction"),
-        "by_gap_dir":   breakdown("gap_dir"),
-        "by_time":      by_time,
-        "rs_breakdown": rs_breakdown,
-        "recent_10":    trades[:10]
+        "total_trades":  total,
+        "win_rate":      wr,
+        "avg_r_mult":    avg_r,
+        "by_symbol":     _wl_groups(trades, lambda t: str(t.get("symbol") or "?")),
+        "by_grade":      _wl_groups(trades, lambda t: str(t.get("grade") or "?")),
+        "by_direction":  _wl_groups(trades, lambda t: str(t.get("direction") or "?")),
+        "by_gap_dir":    _wl_groups(trades, lambda t: str(t.get("gap_dir") or "?")),
+        "by_time":       _wl_groups(trades, lambda t: _time_bucket(t.get("entry_hour") or 9.5)),
+        "by_signal":     _wl_groups(trades, lambda t: str(t.get("signal_type") or "?")),
+        "by_rs":         _wl_groups(trades, lambda t: "rs_positive" if (t.get("rs") or 0) > 0 else "rs_negative"),
+        "by_alignment":  _wl_groups(trades, lambda t: "aligned" if t.get("aligned", True) else "counter_trend"),
     }
 
 
@@ -3000,8 +3022,12 @@ def run_ai_improvement(trigger="scheduled"):
         return
 
     trades = db_get_all_closed_trades()
-    if len(trades) < 3:
-        log("AI: Only {} closed trades - need at least 3 to analyze".format(len(trades)))
+    # Nothing is tuned on a thin sample. The safety gate also enforces a
+    # per-group minimum, but this is the cheap global cutoff that stops a
+    # handful of trades from triggering a run at all.
+    if len(trades) < AI_MIN_TOTAL_SAMPLES:
+        log("AI: only {} post-epoch closed trades (need {}) - skipping".format(
+            len(trades), AI_MIN_TOTAL_SAMPLES))
         return
 
     log("AI: Starting improvement run ({} trades, trigger={})".format(len(trades), trigger))
@@ -3011,38 +3037,56 @@ def run_ai_improvement(trigger="scheduled"):
 
     # Remove non-tunable keys from what we send
     cfg_tunable = {k: v for k, v in cfg.items()
-                   if k not in ("ai_insight", "ai_focus", "updated_at", "updated_by")}
+                   if k not in ("ai_insight", "ai_focus", "updated_at",
+                                 "updated_by", "learning_epoch")}
 
     prompt = """You are an expert quantitative trader and algorithm optimizer.
 You are analyzing a 0DTE (zero days to expiration) options day trading scanner.
-Your ONLY goal is to maximize the scanner's win rate and present the highest-conviction trade each day.
+Your ONLY goal is to maximize the scanner's WIN RATE -- the fraction of
+suggested trades whose price target was hit before the protective stop.
+
+## What you are optimizing on
+You are given ONLY win/loss outcomes and avg R-multiple (R = whether and
+how far price reached the target versus the stop). This is a pure
+"was the suggestion correct" signal.
+
+Dollar profit and loss is intentionally NOT provided and MUST NOT factor
+into any decision. Do not infer, estimate, or reason about position size,
+premium, capital, or dollar P&L. A high-win-rate group is better than a
+low-win-rate group regardless of any imagined dollar amount. If you
+mention money in your reasoning the analysis is invalid.
 
 ## Current Scanner Config
 ```json
 {config}
 ```
 
-## Trade Statistics
+## Trade Statistics (pure win/loss; counts are real trade counts)
 ```json
 {stats}
 ```
 
 ## Your Task
-Analyze the trade data and return an updated configuration that will improve win rate.
-Focus on:
-1. Which grade thresholds should shift based on actual win rates by grade?
-2. Which factor weights should increase/decrease based on which factors correlate with wins?
-3. Should counter-trend signals be filtered out entirely?
-4. Is the late_entry_hour cutoff optimal?
-5. Should VWAP reclaim strategy be enabled given the data?
-6. What is the single highest-conviction setup pattern in this data?
+Return config changes that should raise the win rate of correct calls.
+Consider, ONLY where the relevant group has enough trades:
+1. Grade thresholds vs actual win rate by grade (by_grade).
+2. Factor weights vs which factors separate winners from losers.
+3. Whether counter-trend signals should be filtered (by_alignment).
+4. Whether the late_entry_hour cutoff matches by_time win rates.
+5. Whether vwap_reclaim should stay enabled (by_signal).
 
 ## Rules
-- Only tune parameters that have statistical support (10+ trades in a group before drawing conclusions)
-- Be conservative -- never change a weight by more than 5 points in one update
-- Grade thresholds: A min must stay >= 65, C min must stay >= 25
-- The config changes must make mathematical sense (weights should roughly sum to 100)
-- If data is insufficient for a dimension, leave that parameter unchanged
+- A group needs >= {minsamp} trades before you may change a parameter
+  driven by it. If a group is below that, leave its parameters UNCHANGED.
+- Never change a weight or rank value by more than 3 in one update.
+- Never change a grade threshold by more than 3 in one update.
+- Grade thresholds: grade_a_min >= 65, must keep a_min > b_min > c_min,
+  c_min >= 25.
+- Factor weights (weight_*) must each stay within 5..40 and sum to ~100.
+- Stay close to a sane baseline; do not chase small win-rate noise.
+- If data is insufficient for a dimension, leave that parameter unchanged.
+  Returning the current value unchanged is the correct, expected answer
+  when evidence is weak.
 
 ## Response Format
 Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
@@ -3068,7 +3112,8 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
   "reasoning": "<3-5 sentences explaining the key config changes and why>"
 }}""".format(
         config=json.dumps(cfg_tunable, indent=2),
-        stats=json.dumps(stats, indent=2)
+        stats=json.dumps(stats, indent=2),
+        minsamp=AI_MIN_TOTAL_SAMPLES,
     )
 
     try:
@@ -3132,33 +3177,57 @@ Respond ONLY with valid JSON, no markdown, no explanation outside the JSON:
         focus        = parsed.get("focus", "")
         reasoning    = parsed.get("reasoning", "")
 
-        # --- Sample-size gate (Bayesian) — prevents tuning to noise ---
+        # --- Sample-size gate — every tuned key needs >= AI_MIN_TOTAL_SAMPLES
+        # supporting trades in its driving group, is delta-clipped, and is
+        # anchored so it cannot drift unboundedly from DEFAULT_CONFIG. ---
         if HAS_SAFETY_GATES:
             try:
-                # Build group_stats for the gate. Each group = a subset of trades
-                # we want a justification check for before flipping its key.
-                ct_wins   = sum(1 for t in trades
-                                if not t.get("aligned", True)
-                                and t.get("outcome") == "WIN")
-                ct_losses = sum(1 for t in trades
-                                if not t.get("aligned", True)
-                                and t.get("outcome") == "LOSS")
+                def _wl(group_map, name):
+                    g = (stats.get(group_map) or {}).get(name, {})
+                    return {"wins": g.get("wins", 0), "losses": g.get("losses", 0)}
+
+                # Map each tunable key to the trade group that justifies it.
                 group_stats = {
-                    "counter_trend": {"wins": ct_wins, "losses": ct_losses},
+                    "counter_trend": _wl("by_alignment", "counter_trend"),
+                    "vwap_reclaim":  _wl("by_signal", "vwap_reclaim"),
+                    "grade_a":       _wl("by_grade", "A"),
+                    "grade_b":       _wl("by_grade", "B"),
+                    "grade_c":       _wl("by_grade", "C"),
+                    "rs":            _wl("by_rs", "rs_positive"),
+                    # Global pool for parameters not tied to one sub-group.
+                    "global": {
+                        "wins":   sum(1 for t in trades if t["outcome"] == "WIN"),
+                        "losses": sum(1 for t in trades if t["outcome"] != "WIN"),
+                    },
                 }
                 safe_updates, rejected = safety_gates.filter_ai_proposed_changes(
-                    current_cfg = cfg_tunable,
+                    current_cfg  = cfg_tunable,
                     proposed_cfg = updates,
-                    group_stats = group_stats,
+                    group_stats  = group_stats,
+                    default_cfg  = DEFAULT_CONFIG,
+                    min_samples  = AI_MIN_TOTAL_SAMPLES,
                 )
                 if rejected:
                     log("AI: safety gate rejected/clipped {} changes:".format(len(rejected)))
                     for r in rejected:
                         log("AI:   {} -> {}".format(r.get("key"), r.get("reason")))
-                # Only keep keys that were actually proposed (filter returns full cfg)
                 updates = {k: safe_updates[k] for k in updates if k in safe_updates}
             except Exception as e:
-                log("AI: safety gate error (continuing without gate): {}".format(e))
+                log("AI: safety gate error (rejecting all changes this run): {}".format(e))
+                updates = {}
+
+        # Enforce structural invariants in code, regardless of what the AI
+        # or the gate produced (weights in-band + ~sum 100, grade ordering
+        # and floors). Prompt-stated rules are not trusted at face value.
+        if HAS_SAFETY_GATES and updates:
+            try:
+                merged = dict(cfg_tunable)
+                merged.update(updates)
+                merged = safety_gates.enforce_config_invariants(merged)
+                updates = {k: merged[k] for k in updates if k in merged}
+            except Exception as e:
+                log("AI: invariant enforcement error (rejecting changes): {}".format(e))
+                updates = {}
 
         # Compute diff for logging
         old_cfg    = get_config()
@@ -7174,6 +7243,27 @@ def ai_run_manual():
     return redirect("/ai")
 
 
+@app.route("/ai/reset")
+def ai_reset_baseline():
+    """Manual: wipe AI tuning, restore baseline, start a fresh epoch.
+
+    Guarded by ?confirm=1 so a stray click can't nuke tuning.
+    """
+    if request.args.get("confirm") != "1":
+        return ("<html><body style='background:#0d1117;color:#e6edf3;"
+                "font-family:Arial;padding:20px'>"
+                "<h2>Reset AI config to baseline?</h2>"
+                "<p>This restores DEFAULT_CONFIG and makes the AI ignore "
+                "all trades before now.</p>"
+                "<a href='/ai/reset?confirm=1' style='background:#f85149;"
+                "color:#fff;padding:8px 14px;border-radius:6px;"
+                "text-decoration:none'>Yes, reset</a>&nbsp;&nbsp;"
+                "<a href='/ai' style='color:#58a6ff'>Cancel</a>"
+                "</body></html>")
+    reset_ai_config_to_baseline(reason="manual")
+    return redirect("/ai")
+
+
 @app.route("/ai/dismiss")
 def ai_dismiss_proposal():
     pid = request.args.get("id", "")
@@ -8189,6 +8279,7 @@ log("DB_FILE: {} | data_dir: {} | RAILWAY_VOLUME_MOUNT_PATH: {}".format(
     DB_FILE, _data_dir,
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "(not set)")))
 db_load_latest_config()   # restore AI config from last session
+_maybe_reset_ai_baseline()  # one-time wipe of pre-reset drifted tuning
 threading.Thread(target=background_scheduler, daemon=True).start()
 threading.Thread(target=telegram_poller,      daemon=True).start()
 
