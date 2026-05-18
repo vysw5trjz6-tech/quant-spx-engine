@@ -80,17 +80,48 @@ def is_change_justified(group_wins, group_losses, baseline_rate=0.50,
     }
 
 
+# Which trade group must be statistically significant before a given key
+# may change. Anything unmapped falls back to the "global" pool.
+_KEY_GROUP = {
+    "grade_a_min":           "grade_a",
+    "grade_b_min":           "grade_b",
+    "grade_c_min":           "grade_c",
+    "counter_trend_allowed": "counter_trend",
+    "rank_align_bonus":      "counter_trend",
+    "rank_align_penalty":    "counter_trend",
+    "vwap_reclaim_enabled":  "vwap_reclaim",
+    "weight_rs":             "rs",
+}
+
+# Max absolute distance a key may sit from its DEFAULT_CONFIG value, so
+# week-over-week tuning cannot wander unboundedly even within delta limits.
+def _drift_band(key):
+    if key.startswith("weight_"):          return 10
+    if key.startswith("grade_"):           return 10
+    if key == "late_entry_hour":           return 2.0
+    if key.startswith("rank_"):            return 15
+    return None  # booleans / unmapped: no numeric band
+
+
 def filter_ai_proposed_changes(current_cfg, proposed_cfg, group_stats,
+                                default_cfg=None, min_samples=30,
                                 max_weight_delta=3, max_grade_delta=3):
     """
     Wrap this around the AI's proposed config changes BEFORE applying them.
 
+    A change is allowed ONLY if the trade group that justifies it has
+    >= min_samples trades AND its win-rate credible interval excludes the
+    0.50 baseline (i.e. there is real signal, not noise). Allowed numeric
+    changes are then per-run delta-clipped and hard-bounded to within a
+    drift band of default_cfg so they cannot run away over many weeks.
+
     Args:
-      current_cfg:   existing config dict
-      proposed_cfg:  AI's proposed config (already parsed JSON)
-      group_stats:   dict of {group_key: {"wins": x, "losses": y}}
-      max_weight_delta: max change per call for a weight key
-      max_grade_delta:  max change per call for a grade threshold
+      current_cfg:  existing config dict
+      proposed_cfg: AI's proposed config (parsed JSON)
+      group_stats:  {group_key: {"wins": x, "losses": y}}
+      default_cfg:  baseline anchor (DEFAULT_CONFIG); drift bound is skipped
+                    if not provided
+      min_samples:  minimum trades in the driving group
 
     Returns:
       (safe_cfg, rejected_changes_log)
@@ -104,33 +135,126 @@ def filter_ai_proposed_changes(current_cfg, proposed_cfg, group_stats,
             continue
         old_val = current_cfg[key]
 
-        # Rate-limit numeric changes
-        if isinstance(new_val, (int, float)) and isinstance(old_val, (int, float)):
+        if new_val == old_val:
+            continue  # no-op, nothing to gate
+
+        # Every change must be justified by its driving group's sample.
+        grp_name = _KEY_GROUP.get(key, "global")
+        grp      = group_stats.get(grp_name, {})
+        check    = is_change_justified(
+            grp.get("wins", 0), grp.get("losses", 0),
+            min_samples=min_samples)
+        if not check["justified"]:
+            rejected.append({
+                "key": key, "reason": "unjustified_{}".format(check["reason"]),
+                "group": grp_name, "stats": check,
+            })
+            continue
+
+        # Numeric: per-run delta clip, then absolute drift bound vs baseline.
+        if isinstance(new_val, (int, float)) and \
+           isinstance(old_val, (int, float)) and \
+           not isinstance(new_val, bool):
             limit = max_grade_delta if "grade" in key else max_weight_delta
             if abs(new_val - old_val) > limit:
-                # Clip rather than reject — let AI nudge in the right direction
-                direction = 1 if new_val > old_val else -1
-                new_val = old_val + direction * limit
+                step    = limit if new_val > old_val else -limit
+                new_val = old_val + step
                 rejected.append({
                     "key": key, "reason": "clipped_to_max_delta",
-                    "wanted": proposed_cfg[key], "applied": new_val
+                    "wanted": proposed_cfg[key], "applied": new_val,
                 })
-
-        # Booleans flipping the most-impactful filters need a sanity check
-        if key == "counter_trend_allowed" and new_val != old_val:
-            ct_stats = group_stats.get("counter_trend", {})
-            check = is_change_justified(
-                ct_stats.get("wins", 0), ct_stats.get("losses", 0))
-            if not check["justified"]:
-                rejected.append({
-                    "key": key, "reason": "boolean_flip_unjustified",
-                    "stats": check
-                })
-                continue
+            band = _drift_band(key)
+            if default_cfg is not None and band is not None \
+               and key in default_cfg:
+                base = default_cfg[key]
+                lo, hi = base - band, base + band
+                if new_val < lo or new_val > hi:
+                    clamped = max(lo, min(hi, new_val))
+                    rejected.append({
+                        "key": key, "reason": "drift_bound_to_baseline",
+                        "wanted": new_val, "applied": clamped,
+                        "baseline": base,
+                    })
+                    new_val = clamped
 
         safe_cfg[key] = new_val
 
     return safe_cfg, rejected
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _renormalize_weights(vals, lo=5, hi=40, target=100):
+    """
+    Return integer weights, each within [lo, hi], summing exactly to
+    target -- provided that is feasible (len*lo <= target <= len*hi).
+    Residual is distributed only onto keys with headroom in the needed
+    direction, so the band is never violated.
+    """
+    keys = list(vals)
+    if not keys:
+        return {}
+    v = {k: _clamp(float(vals[k]), lo, hi) for k in keys}
+
+    for _ in range(100):
+        diff = target - sum(v.values())
+        if abs(diff) < 1e-9:
+            break
+        movable = [k for k in keys
+                   if (diff > 0 and v[k] < hi) or (diff < 0 and v[k] > lo)]
+        if not movable:
+            break
+        share = diff / len(movable)
+        for k in movable:
+            v[k] = _clamp(v[k] + share, lo, hi)
+
+    r = {k: int(round(v[k])) for k in keys}
+    for _ in range(100):
+        d = target - sum(r.values())
+        if d == 0:
+            break
+        step = 1 if d > 0 else -1
+        cand = [k for k in keys if lo <= r[k] + step <= hi]
+        if not cand:
+            break
+        # Adjust whichever key the rounding most shortchanged.
+        k = max(cand, key=lambda k: (v[k] - r[k]) * step)
+        r[k] += step
+    return r
+
+
+def enforce_config_invariants(cfg):
+    """
+    Hard structural rules enforced in code (never trusted to the prompt):
+      - grade floors + strict ordering  a_min > b_min > c_min
+      - each weight_* in [5, 40], weights renormalized to sum 100
+      - late_entry_hour within the trading day
+    Mutates a copy and returns it.
+    """
+    c = dict(cfg)
+
+    # Grade thresholds: floors + ordering.
+    c["grade_c_min"] = int(_clamp(round(c.get("grade_c_min", 35)), 25, 85))
+    c["grade_b_min"] = int(_clamp(round(c.get("grade_b_min", 55)),
+                                  c["grade_c_min"] + 5, 90))
+    c["grade_a_min"] = int(_clamp(round(c.get("grade_a_min", 75)),
+                                  max(65, c["grade_b_min"] + 5), 95))
+
+    # Factor weights: each in [5,40] AND sum to 100. Naive scale-then-round
+    # can push a weight out of band, so water-fill the residual only onto
+    # keys that still have headroom, then fix integer drift the same way.
+    wkeys = [k for k in c if k.startswith("weight_")]
+    if wkeys:
+        c.update(_renormalize_weights(
+            {k: c.get(k, 0) for k in wkeys}, lo=5, hi=40, target=100))
+
+    if "late_entry_hour" in c:
+        c["late_entry_hour"] = round(
+            _clamp(float(c["late_entry_hour"]), 10.0, 15.5), 2)
+
+    return c
 
 
 # =============================================
