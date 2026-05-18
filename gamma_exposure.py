@@ -261,7 +261,14 @@ def fetch_options_chain(underlying):
 # CACHE / STATE
 # =============================================
 
-GEX_CACHE_DB = "gex_state.db"
+# Persist on the Railway volume (same resolver main.py uses for
+# trades.db). A bare relative path lived in the container's ephemeral
+# working dir, so every redeploy wiped the GEX snapshot and the bias
+# read back as "No GEX data" until the next 4:30 PM ET build.
+_DATA_DIR    = (os.getenv("DATA_DIR")
+                or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+                or "/tmp").rstrip("/")
+GEX_CACHE_DB = _DATA_DIR + "/gex_state.db"
 
 
 def _init_gex_db():

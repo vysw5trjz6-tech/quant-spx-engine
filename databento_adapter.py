@@ -300,7 +300,12 @@ def get_historical_daily_options(symbol, start_date, end_date,
 # LOCAL CACHE
 # =============================================
 
-_DB_CACHE = "databento_cache.db"
+# Persist on the Railway volume. As a bare relative path this lived in
+# the container's ephemeral dir, so every redeploy wiped the 1-hour
+# chain cache -- defeating the cost guard and forcing fresh OPRA pulls.
+_DB_CACHE = ((os.getenv("DATA_DIR")
+              or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+              or "/tmp").rstrip("/") + "/databento_cache.db")
 
 
 def _init_cache():
