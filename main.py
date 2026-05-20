@@ -307,6 +307,29 @@ def log_warn(msg):
     log("WARN: {}".format(msg))
 
 
+_state_log_last = {}
+_state_log_lock = threading.Lock()
+
+
+def log_state_transition(key, state, msg, level="warn"):
+    """
+    Emit `msg` only when `state` changes for `key`. Prevents per-scan
+    spam for steady-state conditions (e.g. VIX None every 5 min) while
+    still logging the moment it becomes None and the moment it recovers.
+    """
+    with _state_log_lock:
+        prev = _state_log_last.get(key)
+        if prev == state:
+            return
+        _state_log_last[key] = state
+    if level == "warn":
+        log_warn(msg)
+    elif level == "error":
+        log_error(msg)
+    else:
+        log(msg)
+
+
 def log_error(msg):
     # Writes to stderr so the platform log shipper tags it as `error`.
     import sys as _sys
@@ -2344,24 +2367,34 @@ def scan_all_symbols():
             regime.get("regime"), regime.get("vix"),
             strat_rules["size_multiplier"], regime.get("note", ""))
         if regime.get("vix") is None:
-            log_warn(_regime_line + " (VIX unavailable — using fallback)")
+            # Throttle: only log on transition into / out of "VIX unavailable"
+            # so the warn doesn't repeat every 5-min scan.
+            log_state_transition(
+                "regime.vix", "unavailable",
+                _regime_line + " (VIX unavailable — using fallback)")
         else:
+            log_state_transition("regime.vix", "ok",
+                                 "Regime VIX restored: " + _regime_line,
+                                 level="info")
             log(_regime_line)
     if gex_bias:
         _note = gex_bias.get("note", "")
+        gex_unhealthy = (gex_bias.get("gex_b") is None
+                         or gex_bias.get("regime") == "UNKNOWN")
         # If the Databento billing breaker is tripped, surface the actual cause
         # instead of the generic "No GEX data — defaulting to trend-mode" line,
         # which made it look like a normal regime decision in today's logs.
-        if (gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN") \
-                and _databento_blocked():
+        if gex_unhealthy and _databento_blocked():
             import databento_adapter as _da
             _note = ("GEX unavailable: Databento billing breaker engaged "
                      "until {}").format(_da.billing_status().get("blocked_until"))
         _gex_line = "GEX: ${}B {} | {}".format(
             gex_bias.get("gex_b"), gex_bias.get("regime"), _note)
-        if gex_bias.get("gex_b") is None or gex_bias.get("regime") == "UNKNOWN":
-            log_warn(_gex_line)
+        if gex_unhealthy:
+            log_state_transition("gex.bias", "unhealthy", _gex_line)
         else:
+            log_state_transition("gex.bias", "ok",
+                                 "GEX restored: " + _gex_line, level="info")
             log(_gex_line)
 
     # Warm all bar caches in parallel before the per-symbol loop.
@@ -4601,6 +4634,16 @@ def run_swing_scan():
     Updates both swing_signals (used by renderer) and all_swing_signals (used by chat).
     """
     global swing_signals, next_swing_scan, all_swing_signals, swing_next_scan_at
+    # Daily bars don't change overnight or on weekends/holidays, so a
+    # 72-symbol Alpaca sweep outside the session is guaranteed-empty
+    # waste. Gate on trading-day + a window that covers premarket + RTH
+    # + the post-close print (~9:00 AM -> 4:15 PM ET).
+    et       = pytz.timezone("America/New_York")
+    et_hour  = datetime.now(et).hour + datetime.now(et).minute / 60.0
+    if not (is_trading_day() and 9.0 <= et_hour <= 16.25):
+        next_swing_scan    = time.time() + SWING_SCAN_INTERVAL
+        swing_next_scan_at = next_swing_scan
+        return
     log("=== Swing scan starting ({} symbols) ===".format(len(SWING_SYMBOLS)))
 
     results      = []
@@ -5325,6 +5368,17 @@ def _refresh_gex_snapshots():
     except ImportError:
         return
 
+    # Pre-flight: if the Databento billing breaker is already open, do
+    # NOT iterate every symbol and emit a noisy snapshot_empty per name.
+    # Log one clear deferred line; the daily marker stays unset so the
+    # next run (after cooldown / next day's quota) retries cleanly.
+    if _databento_blocked():
+        import databento_adapter as _da
+        log_event("gex.snapshot_deferred", level="warn",
+                  reason="databento_billing_blocked",
+                  until=_da.billing_status().get("blocked_until"))
+        return
+
     built = 0
     try:
         for sym in ("SPY", "QQQ"):
@@ -5371,6 +5425,16 @@ def _refresh_oi_snapshots():
         if not databento_adapter.is_available():
             return
     except ImportError:
+        return
+
+    # Pre-flight: if the Databento billing breaker is already open, do
+    # not loop ~72 symbols just to emit per-symbol failures. One clean
+    # deferred line; daily marker stays unset so the next attempt retries.
+    if _databento_blocked():
+        import databento_adapter as _da
+        log_event("oi.snapshot_deferred", level="warn",
+                  reason="databento_billing_blocked",
+                  until=_da.billing_status().get("blocked_until"))
         return
 
     all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
