@@ -117,6 +117,8 @@ ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 SYMBOLS = [
     # Index ETFs
     "SPY", "QQQ",
+    # Leveraged ETFs (3x) -- 0DTE only, never swing (decay + gappy IV)
+    "TQQQ", "SOXL",
     # Mega-cap tech
     "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN",
     # AI infrastructure (datacenter compute, power, cooling, networking)
