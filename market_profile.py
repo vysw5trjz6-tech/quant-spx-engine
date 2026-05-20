@@ -212,7 +212,7 @@ def build_rth_profile(symbol="ES", target_date_et=None):
             dataset  = "GLBX.MDP3",
             symbols  = [contract],
             stype_in = "continuous",
-            schema   = "ohlcv-5m",
+            schema   = "ohlcv-1m",
             start    = rth_start,
             end      = rth_end,
         ).to_df()
