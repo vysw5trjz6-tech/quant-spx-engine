@@ -214,9 +214,31 @@ def _fetch_yahoo_close(ticker):
     return None
 
 
+def _fetch_databento_vix(ticker):
+    """
+    Spot-VIX proxy via the front-month VX future on Databento. Only valid
+    for the spot VIX itself (^VIX) -- VIX9D/VIX3M are separate indices the
+    VX front-month does not represent, so we return None for those and let
+    them fall through to the other sources.
+
+    Databento is reachable from datacenter IPs where Yahoo/Stooq are not,
+    so this is the primary source for the spot regime read.
+    """
+    if ticker != "^VIX":
+        return None
+    try:
+        import databento_adapter
+        if not databento_adapter.is_available():
+            return None
+        return databento_adapter.get_vix_proxy()
+    except Exception as e:
+        print("[regime] Databento VX proxy failed: {}".format(e))
+        return None
+
+
 def _get_vix_value(ticker, lo=1.0, hi=200.0):
-    """Yahoo -> Stooq -> last-good cache. Caches every fresh good value."""
-    for fetch in (_fetch_yahoo_close, _fetch_stooq_close):
+    """Databento VX -> Yahoo -> Stooq -> last-good cache. Caches good values."""
+    for fetch in (_fetch_databento_vix, _fetch_yahoo_close, _fetch_stooq_close):
         val = fetch(ticker)
         if val is not None and lo <= val <= hi:
             _vix_cache_set(ticker, val)
@@ -233,17 +255,15 @@ def get_current_vix():
     Fetch the latest VIX quote.
 
     Source priority:
-      1. Yahoo Finance / Stooq (real VIX index, free)
-      2. Persistent last-good cache (<= 4 days old)
-      3. VIXY ETF as last-resort proxy with tight sanity guard
-      4. None (caller uses realized vol fallback)
+      1. Databento front-month VX future (reachable from datacenter IPs)
+      2. Yahoo Finance / Stooq (real VIX index, free; often blocked on cloud)
+      3. Persistent last-good cache (<= 4 days old)
+      4. VIXY ETF as last-resort proxy with tight sanity guard
+      5. None (caller uses realized vol fallback)
 
-    NOTE: Databento does NOT sell the VIX spot index — they only sell VIX
-    futures (VX) on XCBF.PITCH which requires a paid live license. So
-    Databento is intentionally NOT in the VIX path here.
-
-    Yahoo's ^VIX is the actual CBOE VIX index value, 15-min delayed during
-    RTH and EOD-current outside RTH. Fine for our pre-market regime alert.
+    The VX front-month is a proxy (small contango premium vs spot), but it
+    is the only VIX source consistently reachable from Railway -- Yahoo and
+    Stooq both fail there. Good enough for regime bucketing.
     """
     # --- Paths 1-2: real VIX (Yahoo -> Stooq -> last-good cache) ---
     vix = _get_vix_value("^VIX", 5, 80)
