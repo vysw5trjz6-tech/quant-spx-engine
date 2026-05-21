@@ -379,6 +379,61 @@ def get_vix_spot():
 # OVERNIGHT FUTURES
 # =============================================
 
+def get_vix_proxy(target_date_et=None):
+    """
+    Spot-VIX proxy via the front-month VX future (Cboe / XCBF.PITCH) daily
+    settlement. Front-month VX tracks spot VIX within ~1-2 points, which is
+    plenty for regime bucketing (13/16/22/30). Unlike Yahoo/Stooq this is
+    reachable from datacenter IPs. Cached 1h. Returns float or None.
+
+    Uses the historical timeseries API (past settlements), which is a
+    separate entitlement from the live XCBF.PITCH license -- if the account
+    can't access it, this returns None and the caller falls back.
+    """
+    client = _get_client()
+    if not client or _billing_blocked():
+        return None
+
+    et = pytz.timezone("America/New_York")
+    if target_date_et is None:
+        target_date_et = datetime.now(et).date()
+
+    cache_key = "vixproxy_{}".format(target_date_et.isoformat())
+    cached = _cache_get(cache_key, max_age_seconds=3600)
+    if cached:
+        return cached.get("vix")
+
+    # 7-day window so weekends/holidays still yield a recent settlement.
+    start_iso = (target_date_et - timedelta(days=7)).isoformat()
+    end_iso   = target_date_et.isoformat()
+    try:
+        df = client.timeseries.get_range(
+            dataset  = "XCBF.PITCH",
+            symbols  = ["VX.c.0"],
+            stype_in = "continuous",
+            schema   = "ohlcv-1d",
+            start    = start_iso,
+            end      = end_iso,
+        ).to_df()
+        if df is None or df.empty:
+            print("[databento] VX proxy empty. Window: {} -> {}".format(
+                start_iso, end_iso))
+            return None
+        vix = round(float(df["close"].iloc[-1]), 2)
+        if not (5.0 <= vix <= 90.0):
+            print("[databento] VX proxy out of range: {}".format(vix))
+            return None
+        _cache_set(cache_key, {"vix": vix})
+        return vix
+    except Exception as e:
+        if _is_billing_error(e):
+            _trip_billing_breaker("vix proxy")
+        else:
+            _emit_error("databento.fetch_failed", source="vix_proxy",
+                        exc=type(e).__name__)
+        return None
+
+
 CONTRACT_MAP = {
     "ES":  "ES.n.0",
     "NQ":  "NQ.n.0",
