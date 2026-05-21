@@ -2173,7 +2173,6 @@ def get_liquid_option(symbol, direction, underlying_price=None):
                 return None, None, False, None
 
             snapshots = r.json().get("snapshots", {})
-            log("  {} contracts for {} {}".format(len(snapshots), symbol, expiry_str))
 
             candidates = []
             for contract_sym, snap in snapshots.items():
