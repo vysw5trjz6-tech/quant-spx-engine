@@ -309,7 +309,22 @@ def get_price_with_freshness(symbol):
         if sane:
             return yp, 0.0, "yahoo"
 
-    # No rescue -- return whatever Alpaca had (caller's is_price_stale
+    # No rescue -- fall back to the daily-bar close carried in the same
+    # snapshot. After the close (and pre-open) the IEX feed empties out and
+    # Yahoo is blocked from datacenter IPs, so trade/quote/minuteBar are all
+    # missing; without this the EOD GEX + IV snapshots get spot=None and
+    # silently produce no data. The day's close IS the correct spot for an
+    # end-of-day snapshot. age=None so is_price_stale() still marks it stale
+    # during RTH -- the scanner won't trade on it, but the EOD jobs can use it.
+    if price is None:
+        daily = snap.get("dailyBar") or {}
+        d_px  = daily.get("c")
+        if d_px and float(d_px) > 0:
+            return round(float(d_px), 2), None, "dailyBar"
+        if prev_close and prev_close > 0:
+            return round(prev_close, 2), None, "prevDailyClose"
+
+    # Last resort -- return whatever Alpaca had (caller's is_price_stale
     # gate will mark this stale and skip the signal).
     return price, age, source
 
