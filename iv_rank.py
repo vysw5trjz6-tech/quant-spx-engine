@@ -142,7 +142,14 @@ def fetch_atm_iv(symbol, underlying_price):
                     except Exception:
                         continue
                     greeks = snap.get("greeks") or {}
-                    iv = greeks.get("impliedVolatility")
+                    # impliedVolatility is a TOP-LEVEL field on the Alpaca
+                    # options snapshot; reading it from the nested greeks
+                    # object always returned None, which is why IV
+                    # snapshots stored 0/74 every day. Fall back to the
+                    # nested location only for forward-compat / safety.
+                    iv = snap.get("impliedVolatility")
+                    if iv is None:
+                        iv = greeks.get("impliedVolatility")
                     if iv is None or iv <= 0 or iv > 5.0:
                         continue
                     dist = abs(strike - underlying_price)
