@@ -4370,6 +4370,7 @@ def scan_swing_symbol(symbol):
         # WANT to trade into earnings.
         iv_crush_sig = _check_earnings_iv_crush(symbol)
         if iv_crush_sig:
+            _swing_stats_bump("iv_crush")
             return iv_crush_sig
 
         # --- Earnings blackout: skip directional swing trades within 10 trading days ---
@@ -4377,6 +4378,7 @@ def scan_swing_symbol(symbol):
             try:
                 allowed, reason = safety_gates.earnings_filter(symbol, "swing")
                 if not allowed:
+                    _swing_stats_bump("earnings_blackout")
                     log("swing {}: skipped — {}".format(symbol, reason))
                     return None
             except Exception as e:
@@ -4385,10 +4387,13 @@ def scan_swing_symbol(symbol):
         daily  = get_daily_extended(symbol, limit=260)
         weekly = get_weekly_bars(symbol, limit=52)
         if not daily or len(daily) < 60:
+            _swing_stats_bump("no_data")
             return None
         current = daily[-1]["c"]
         if not current or current <= 0:
+            _swing_stats_bump("no_data")
             return None
+        _swing_stats_bump("had_data")
 
         spy_d  = get_daily_extended("SPY", limit=10)
         spy_rs = 0.0
@@ -4400,15 +4405,16 @@ def scan_swing_symbol(symbol):
         type_pri = {"ONEIL_PIVOT": 4, "WYCKOFF_SPRING": 3, "HI52_BREAKOUT": 2, "EARNINGS_CONT": 1}
 
         tier1_sigs = []
-        for fn in [lambda: detect_oneil_pivot(daily, weekly),
-                   lambda: detect_wyckoff_spring(daily, weekly),
-                   lambda: detect_52w_breakout(daily, weekly),
-                   lambda: detect_earnings_continuation(daily, weekly)]:
+        for name, fn in [("oneil",   lambda: detect_oneil_pivot(daily, weekly)),
+                          ("wyckoff", lambda: detect_wyckoff_spring(daily, weekly)),
+                          ("hi52",    lambda: detect_52w_breakout(daily, weekly)),
+                          ("earn",    lambda: detect_earnings_continuation(daily, weekly))]:
             try:
                 r = fn()
                 if r:
                     r["tier"] = 1
                     tier1_sigs.append(r)
+                    _swing_stats_bump("t1_" + name)
             except Exception:
                 pass
 
@@ -4427,7 +4433,12 @@ def scan_swing_symbol(symbol):
 
         all_sigs = tier1_sigs + tier2_sigs
         if not all_sigs:
+            _swing_stats_bump("no_signal")
             return None
+        if tier1_sigs:
+            _swing_stats_bump("tier1")
+        else:
+            _swing_stats_bump("tier2_only")
 
         if tier1_sigs:
             best = max(tier1_sigs, key=lambda s: (s["prob"], type_pri.get(s["signal_type"], 0)))
@@ -4629,6 +4640,25 @@ def watch_earnings_gap_holding(daily, weekly=None):
             "notes": "Gap {:+.1f}% | {} days ago | Holding above ${:.2f}".format(
                 earn_gap, days_since, earn_open)}
 
+_swing_stats      = {}
+_swing_stats_lock = threading.Lock()
+
+
+def _swing_stats_bump(key):
+    with _swing_stats_lock:
+        _swing_stats[key] = _swing_stats.get(key, 0) + 1
+
+
+def _swing_stats_reset():
+    with _swing_stats_lock:
+        _swing_stats.clear()
+
+
+def _swing_stats_snapshot():
+    with _swing_stats_lock:
+        return dict(_swing_stats)
+
+
 def run_swing_scan():
     """
     Scan SWING_SYMBOLS concurrently (batches of 8).
@@ -4645,6 +4675,7 @@ def run_swing_scan():
         next_swing_scan    = time.time() + SWING_SCAN_INTERVAL
         swing_next_scan_at = next_swing_scan
         return
+    _swing_stats_reset()
     log("=== Swing scan starting ({} symbols) ===".format(len(SWING_SYMBOLS)))
 
     results      = []
@@ -4676,7 +4707,22 @@ def run_swing_scan():
         all_swing_signals  = results
         swing_next_scan_at = next_swing_scan
 
-    log("Swing scan done: {} setups found".format(len(results)))
+    # Compact filter-stage breakdown -- tells you WHY a 0-setups scan
+    # was 0 (no_data vs earnings_blocked vs no_signal) and which tier-1
+    # detectors fired. Keep keys short so the line is grep-friendly.
+    s = _swing_stats_snapshot()
+    parts = [
+        "data:{}/{}".format(s.get("had_data", 0), len(SWING_SYMBOLS)),
+        "earn_blk:{}".format(s.get("earnings_blackout", 0)),
+        "no_sig:{}".format(s.get("no_signal", 0)),
+        "t1:{}".format(s.get("tier1", 0)),
+        "t2_only:{}".format(s.get("tier2_only", 0)),
+        "iv_crush:{}".format(s.get("iv_crush", 0)),
+        "det[oneil={} wyckoff={} hi52={} earn={}]".format(
+            s.get("t1_oneil", 0), s.get("t1_wyckoff", 0),
+            s.get("t1_hi52", 0), s.get("t1_earn", 0)),
+    ]
+    log("Swing scan done: {} setups | {}".format(len(results), " ".join(parts)))
 
 
 def render_swing_dashboard():
