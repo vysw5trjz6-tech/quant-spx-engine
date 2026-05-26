@@ -565,13 +565,18 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     end_iso = target_date_et.isoformat()
     parent  = underlying + ".OPT"
 
-    # OPRA definition/statistics are billed by data volume, and the volume
-    # scales ~linearly with the query window (one record per instrument per
-    # day). A single-day window on the target trading date returns the full
-    # active chain at ~1/2 the cost of the old 2-day window. On a
-    # weekend/holiday (or before EOD stats publish) the 1-day window is
-    # empty, so we widen back to 4 days only on that rare path — paying the
-    # higher cost only when we'd otherwise lose the snapshot entirely.
+    # The `definition` schema is a DELTA STREAM: it emits one record per
+    # instrument only when something changes (Added/Modified/Deleted), not
+    # one per day. A 1-day window only captures instruments that had a
+    # definition event in that 24h window -- which for SPY/QQQ is typically
+    # a small subset of the active chain (newly listed strikes, expiry
+    # rolls). Most active contracts haven't been modified recently and so
+    # were INVISIBLE in our prior 1-day pull, producing an empty chain.
+    #
+    # Window of 60 days captures at least one event per instrument on the
+    # current chain in nearly all cases (weekly rolls + strike adjustments
+    # touch every active contract within that horizon). Falls back to 180d
+    # on the rare case where 60d is still empty.
     def _pull(window_days):
         start_iso = (target_date_et - timedelta(days=window_days)).isoformat()
         ddf = client.timeseries.get_range(
@@ -585,9 +590,9 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         return ddf, start_iso
 
     try:
-        def_df, start_iso = _pull(1)
+        def_df, start_iso = _pull(60)
         if def_df is None or def_df.empty:
-            def_df, start_iso = _pull(4)
+            def_df, start_iso = _pull(180)
 
         if def_df is None or def_df.empty:
             print("[databento] {} definitions empty".format(underlying))
@@ -597,6 +602,15 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         for _, row in def_df.iterrows():
             try:
                 iid = int(row.get("instrument_id"))
+
+                # Drop deleted instruments. Rows are time-ordered by Databento,
+                # so a Delete event for an iid we already added means the
+                # contract is no longer active -- remove from meta.
+                action = str(row.get("security_update_action", "")).upper().strip()
+                if action == "D":
+                    inst_meta.pop(iid, None)
+                    continue
+
                 strike = row.get("strike_price")
                 if strike is None:
                     continue
@@ -612,9 +626,21 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                 else:
                     continue
 
-                inst_class = str(row.get("instrument_class", "")).upper()
-                opt_type = "call" if "C" in inst_class else \
-                           "put"  if "P" in inst_class else None
+                # Primary signal: ISO 10962 CFI code. For OPRA options the
+                # second character is exactly "C" (call) or "P" (put), which
+                # is more reliable than substring-matching instrument_class
+                # (whose codes vary across venues).
+                opt_type = None
+                cfi = str(row.get("cfi", "")).upper().strip()
+                if len(cfi) >= 2 and cfi[0] == "O":
+                    if   cfi[1] == "C": opt_type = "call"
+                    elif cfi[1] == "P": opt_type = "put"
+                # Fallback: instrument_class substring match (kept for safety
+                # if cfi is ever missing for a row).
+                if opt_type is None:
+                    inst_class = str(row.get("instrument_class", "")).upper()
+                    if   "C" in inst_class: opt_type = "call"
+                    elif "P" in inst_class: opt_type = "put"
                 if not opt_type:
                     continue
 
@@ -627,7 +653,8 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                 continue
 
         if not inst_meta:
-            print("[databento] {} no parseable definitions".format(underlying))
+            print("[databento] {} no parseable definitions "
+                  "(def_df rows={})".format(underlying, len(def_df)))
             return []
 
         def _pull_stats(start):
@@ -640,11 +667,14 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                 end      = end_iso,
             ).to_df()
 
-        stats_df = _pull_stats(start_iso)
+        # Statistics window: keep this short (1d -> 4d) because stats ARE
+        # published daily per instrument, so a wider window just multiplies
+        # cost without adding active contracts.
+        stats_start = (target_date_et - timedelta(days=1)).isoformat()
+        stats_df = _pull_stats(stats_start)
         if stats_df is None or stats_df.empty:
-            wide_start = (target_date_et - timedelta(days=4)).isoformat()
-            if wide_start != start_iso:
-                stats_df = _pull_stats(wide_start)
+            stats_start = (target_date_et - timedelta(days=4)).isoformat()
+            stats_df = _pull_stats(stats_start)
 
         if stats_df is None or stats_df.empty:
             print("[databento] {} statistics empty".format(underlying))
@@ -684,15 +714,24 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             keep = set(unique_exp[:expiries_ahead])
             chain = [c for c in chain if c["expiry"] in keep]
         else:
-            # Diagnostic: chain is empty despite non-empty definitions and
-            # statistics responses. Tells us which leg was sparse so the
-            # next failure isn't a guess.
+            # Diagnostic: chain is empty despite non-empty defs and stats
+            # responses. Log a sample row's identity fields so the next
+            # failure tells us whether the parent symbol is mapping to the
+            # right product (`underlying` should equal SPY/QQQ; `cfi`
+            # should start with "O").
             stat9_rows = len(oi_df) if oi_df is not None else 0
-            oi_with_qty = len(oi_by_inst)
-            print("[databento] {} chain empty: defs={} stats_total={} "
-                  "stat9_rows={} oi_with_qty>0={} window={}->{}".format(
-                      underlying, len(inst_meta), len(stats_df),
-                      stat9_rows, oi_with_qty, start_iso, end_iso))
+            sample_info = "no_def_rows"
+            if def_df is not None and not def_df.empty:
+                s = def_df.iloc[0]
+                sample_info = "underlying={} raw_symbol={} cfi={} action={}".format(
+                    s.get("underlying"), s.get("raw_symbol"),
+                    s.get("cfi"), s.get("security_update_action"))
+            print("[databento] {} chain empty: def_rows={} parsed_meta={} "
+                  "stats_total={} stat9_rows={} oi_with_qty>0={} "
+                  "window={}->{} sample[{}]".format(
+                      underlying, len(def_df), len(inst_meta),
+                      len(stats_df), stat9_rows, len(oi_by_inst),
+                      start_iso, end_iso, sample_info))
 
         _cache_set(cache_key, {"chain": chain})
         return chain
