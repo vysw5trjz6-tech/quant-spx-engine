@@ -5440,8 +5440,15 @@ def _refresh_gex_snapshots():
                 log_event("gex.snapshot_built", symbol=sym,
                           gex_b=round(gex.get("total_gex", 0) / 1e9, 2))
             else:
-                # Empty chain — almost always the Databento billing breaker.
+                # Diagnostic: probe the chain directly so the log says
+                # which leg was empty (chain itself, vs. compute step
+                # downstream). databento_adapter.get_options_chain_snapshot
+                # is cached so this is essentially free on the same scan.
+                import databento_adapter as _da
+                chain_probe = _da.get_options_chain_snapshot(sym) or []
                 log_event("gex.snapshot_empty", level="warn", symbol=sym,
+                          spot=spot,
+                          chain_len=len(chain_probe),
                           databento_blocked=_databento_blocked())
     except Exception as e:
         log_event("gex.snapshot_error", level="error", error=str(e))
