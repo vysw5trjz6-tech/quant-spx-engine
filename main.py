@@ -2213,6 +2213,30 @@ def get_liquid_option(symbol, direction, underlying_price=None):
                     expiry_str, len(snapshots)))
                 continue
 
+            # Alpaca's greeks endpoint returns delta=0.0 for some 0DTE near-
+            # ATM contracts (their pricing engine collapses as T -> 0 on
+            # expiry day). Without the real delta our 0.40-target selector
+            # degrades to strike-distance sorting AND the card displays a
+            # misleading delta=0.000. Back-fill from Black-Scholes using the
+            # contract's own IV, with a 0.5-day floor on T to keep the math
+            # finite (same floor as gamma_exposure.py).
+            if underlying_price and any(c["delta"] == 0 for c in candidates):
+                exp_date  = _dt.datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                dte_days  = (exp_date - today_date).days
+                T_years   = max(dte_days, 0.5) / 365.0
+                for c in candidates:
+                    if c["delta"] > 0:
+                        continue
+                    iv = c["iv"] if c["iv"] > 0 else 0.50
+                    try:
+                        d1 = (math.log(underlying_price / c["strike"])
+                              + 0.5 * iv * iv * T_years) / (iv * math.sqrt(T_years))
+                        n_d1 = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+                        c["delta"] = round(
+                            n_d1 if option_type == "call" else (1.0 - n_d1), 3)
+                    except (ValueError, ZeroDivisionError):
+                        pass
+
             if any(c["delta"] > 0 for c in candidates):
                 candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
             elif underlying_price:
@@ -2248,9 +2272,13 @@ def get_daily_extended(symbol, limit=90):
         r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
                          params={"timeframe": "1Day", "limit": limit}, timeout=10)
         if r.status_code != 200:
+            _log_swing_fetch_err(symbol, "daily/http",
+                                 "{} {}".format(r.status_code, r.text[:120]))
             return None
         return r.json().get("bars", [])
-    except:
+    except Exception as e:
+        _log_swing_fetch_err(symbol, "daily/exc",
+                             "{}: {}".format(type(e).__name__, str(e)[:120]))
         return None
 
 
@@ -2259,9 +2287,13 @@ def get_weekly_bars(symbol, limit=52):
         r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
                          params={"timeframe": "1Week", "limit": limit}, timeout=10)
         if r.status_code != 200:
+            _log_swing_fetch_err(symbol, "weekly/http",
+                                 "{} {}".format(r.status_code, r.text[:120]))
             return None
         return r.json().get("bars", [])
-    except:
+    except Exception as e:
+        _log_swing_fetch_err(symbol, "weekly/exc",
+                             "{}: {}".format(type(e).__name__, str(e)[:120]))
         return None
 
 
@@ -4640,8 +4672,9 @@ def watch_earnings_gap_holding(daily, weekly=None):
             "notes": "Gap {:+.1f}% | {} days ago | Holding above ${:.2f}".format(
                 earn_gap, days_since, earn_open)}
 
-_swing_stats      = {}
-_swing_stats_lock = threading.Lock()
+_swing_stats           = {}
+_swing_stats_lock      = threading.Lock()
+_swing_fetch_err_count = 0  # rate-limit per-symbol fetch error logging
 
 
 def _swing_stats_bump(key):
@@ -4650,13 +4683,30 @@ def _swing_stats_bump(key):
 
 
 def _swing_stats_reset():
+    global _swing_fetch_err_count
     with _swing_stats_lock:
         _swing_stats.clear()
+        _swing_fetch_err_count = 0
 
 
 def _swing_stats_snapshot():
     with _swing_stats_lock:
         return dict(_swing_stats)
+
+
+def _log_swing_fetch_err(symbol, kind, detail):
+    """
+    Surface per-symbol Alpaca data-fetch failures with throttling.
+    Without this the swing scan can report "data:0/72" while bare excepts
+    swallow the actual cause (auth, rate limit, status code). Cap at 5
+    lines per scan so a full-universe outage doesn't flood the log.
+    """
+    global _swing_fetch_err_count
+    with _swing_stats_lock:
+        if _swing_fetch_err_count >= 5:
+            return
+        _swing_fetch_err_count += 1
+    log("  swing fetch fail [{}] {}: {}".format(kind, symbol, detail))
 
 
 def run_swing_scan():
@@ -4713,6 +4763,7 @@ def run_swing_scan():
     s = _swing_stats_snapshot()
     parts = [
         "data:{}/{}".format(s.get("had_data", 0), len(SWING_SYMBOLS)),
+        "no_data:{}".format(s.get("no_data", 0)),
         "earn_blk:{}".format(s.get("earnings_blackout", 0)),
         "no_sig:{}".format(s.get("no_signal", 0)),
         "t1:{}".format(s.get("tier1", 0)),
