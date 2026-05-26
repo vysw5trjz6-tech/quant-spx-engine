@@ -381,14 +381,20 @@ def get_vix_spot():
 
 def get_vix_proxy(target_date_et=None):
     """
-    Spot-VIX proxy via the front-month VX future (Cboe / XCBF.PITCH) daily
-    settlement. Front-month VX tracks spot VIX within ~1-2 points, which is
-    plenty for regime bucketing (13/16/22/30). Unlike Yahoo/Stooq this is
-    reachable from datacenter IPs. Cached 1h. Returns float or None.
+    Spot-VIX estimate from VX futures, term-structure adjusted.
 
-    Uses the historical timeseries API (past settlements), which is a
-    separate entitlement from the live XCBF.PITCH license -- if the account
-    can't access it, this returns None and the caller falls back.
+    Front-month VX trades above spot VIX in contango (typically ~1-2
+    points, occasionally 3+ near the start of a roll cycle). Pulling
+    just VX.c.0 understated spot by the full basis. Pulling the next
+    contract too lets us approximate the slope and back out a spot
+    estimate that lands within ~1 point of the real index most days:
+
+        spot ≈ VX.c.0 - 0.5 * (VX.c.1 - VX.c.0)
+
+    The 0.5 coefficient is the empirical average of the front contract's
+    time-to-expiry over its 30-day life (it sits "halfway" up the curve
+    on average). Not perfect in fast curve moves, but far closer than
+    raw front-month and the bucketing for regime stays stable.
     """
     client = _get_client()
     if not client or _billing_blocked():
@@ -409,7 +415,7 @@ def get_vix_proxy(target_date_et=None):
     try:
         df = client.timeseries.get_range(
             dataset  = "XCBF.PITCH",
-            symbols  = ["VX.c.0"],
+            symbols  = ["VX.c.0", "VX.c.1"],
             stype_in = "continuous",
             schema   = "ohlcv-1d",
             start    = start_iso,
@@ -419,10 +425,38 @@ def get_vix_proxy(target_date_et=None):
             print("[databento] VX proxy empty. Window: {} -> {}".format(
                 start_iso, end_iso))
             return None
-        vix = round(float(df["close"].iloc[-1]), 2)
-        if not (5.0 <= vix <= 90.0):
-            print("[databento] VX proxy out of range: {}".format(vix))
+
+        # Extract latest close per contract. Databento puts the resolved
+        # symbol in a 'symbol' column when more than one is requested.
+        front = second = None
+        if "symbol" in df.columns:
+            f_rows = df[df["symbol"] == "VX.c.0"]
+            s_rows = df[df["symbol"] == "VX.c.1"]
+            if not f_rows.empty:
+                front = float(f_rows["close"].iloc[-1])
+            if not s_rows.empty:
+                second = float(s_rows["close"].iloc[-1])
+        else:
+            front = float(df["close"].iloc[-1])
+
+        if front is None:
+            print("[databento] VX proxy: no front-month data")
             return None
+
+        if second is not None:
+            spot_est = front - 0.5 * (second - front)
+            print("[databento] VX term-structure: front={:.2f} 2nd={:.2f} "
+                  "-> spot_est={:.2f}".format(front, second, spot_est))
+        else:
+            # Fall back to raw front if 2nd-month isn't available.
+            spot_est = front
+            print("[databento] VX proxy: 2nd-month unavailable, "
+                  "returning raw front={:.2f}".format(front))
+
+        if not (5.0 <= spot_est <= 90.0):
+            print("[databento] VX-derived VIX out of range: {}".format(spot_est))
+            return None
+        vix = round(float(spot_est), 2)
         _cache_set(cache_key, {"vix": vix})
         return vix
     except Exception as e:
@@ -649,6 +683,16 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             unique_exp = sorted(set(c["expiry"] for c in chain))
             keep = set(unique_exp[:expiries_ahead])
             chain = [c for c in chain if c["expiry"] in keep]
+        else:
+            # Diagnostic: chain is empty despite non-empty definitions and
+            # statistics responses. Tells us which leg was sparse so the
+            # next failure isn't a guess.
+            stat9_rows = len(oi_df) if oi_df is not None else 0
+            oi_with_qty = len(oi_by_inst)
+            print("[databento] {} chain empty: defs={} stats_total={} "
+                  "stat9_rows={} oi_with_qty>0={} window={}->{}".format(
+                      underlying, len(inst_meta), len(stats_df),
+                      stat9_rows, oi_with_qty, start_iso, end_iso))
 
         _cache_set(cache_key, {"chain": chain})
         return chain

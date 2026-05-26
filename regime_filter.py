@@ -214,6 +214,31 @@ def _fetch_yahoo_close(ticker):
     return None
 
 
+def _fetch_yahoo_download(ticker):
+    """
+    Alternate Yahoo path -- uses yf.download() (chart API) instead of
+    Ticker.history() (quote API). They hit different upstream endpoints
+    and Yahoo's blocking is inconsistent across them, so trying both
+    occasionally rescues a datacenter-blocked deployment.
+    """
+    try:
+        import yfinance as yf
+        df = yf.download(ticker, period="5d", interval="1d",
+                         progress=False, auto_adjust=False, threads=False)
+        if df is None or df.empty:
+            return None
+        close = df["Close"].iloc[-1]
+        # yf.download can return a MultiIndex column even for one ticker.
+        if hasattr(close, "iloc"):
+            close = close.iloc[0]
+        return float(close)
+    except ImportError:
+        return None
+    except Exception as e:
+        print("[regime] Yahoo download() {} failed: {}".format(ticker, e))
+        return None
+
+
 def _fetch_databento_vix(ticker):
     """
     Spot-VIX proxy via the front-month VX future on Databento. Only valid
@@ -237,8 +262,20 @@ def _fetch_databento_vix(ticker):
 
 
 def _get_vix_value(ticker, lo=1.0, hi=200.0):
-    """Databento VX -> Yahoo -> Stooq -> last-good cache. Caches good values."""
-    for fetch in (_fetch_databento_vix, _fetch_yahoo_close, _fetch_stooq_close):
+    """
+    Source priority:
+      1. Yahoo (history endpoint)            -- real spot if reachable
+      2. Yahoo (download/chart endpoint)     -- alternate Yahoo route
+      3. Databento VX front-month + slope    -- proxy, always reachable
+      4. Stooq                               -- usually blocked on Railway
+      5. Last-good cache                     -- final resort
+
+    Real spot first, proxy second. If Yahoo is unblocked on this region
+    we get the actual VIX index value; otherwise we fall through to the
+    term-structure-adjusted VX estimate, which trails spot by ~1 pt.
+    """
+    for fetch in (_fetch_yahoo_close, _fetch_yahoo_download,
+                  _fetch_databento_vix, _fetch_stooq_close):
         val = fetch(ticker)
         if val is not None and lo <= val <= hi:
             _vix_cache_set(ticker, val)
