@@ -217,6 +217,11 @@ DEFAULT_CONFIG = {
     "time_decent_end": 13.0,
     "time_risky_end":  14.0,
     "late_entry_hour": 14.0,
+    # Hard cutoff for emitting new 0DTE SIGNAL rows. After this ET hour
+    # the picker still runs but the row is demoted to WATCHING since
+    # time decay dominates and stops are unlikely to clear before
+    # close. Set to 16.0 to disable the cutoff entirely.
+    "zero_dte_cutoff_hour": 14.5,
 
     # --- Rank score bonuses/penalties ---
     "rank_align_bonus":    20,
@@ -1935,16 +1940,18 @@ def get_1hr_trend(bars_1hr):
     BEAR  = 1hr making lower highs  AND lower lows   -> confirms PUT
     MIXED = neither condition met                    -> no confirmation
     """
-    if not bars_1hr or len(bars_1hr) < 8:
+    if not bars_1hr or len(bars_1hr) < 5:
         return "MIXED", "Insufficient 1hr data", 0.0
 
-    # Find swing highs and lows using a 2-bar lookback on each side
+    # Fractal pivots: 1-bar lookback on each side. The previous 2-bar
+    # symmetry rule was too strict on 30 bars of 1hr data and returned
+    # "Not enough 1hr pivots" for every symbol in choppy tape.
     highs, lows = [], []
-    for i in range(2, len(bars_1hr) - 2):
+    for i in range(1, len(bars_1hr) - 1):
         b = bars_1hr[i]
-        if b["h"] > bars_1hr[i-1]["h"] and b["h"] > bars_1hr[i-2]["h"]                 and b["h"] > bars_1hr[i+1]["h"] and b["h"] > bars_1hr[i+2]["h"]:
+        if b["h"] > bars_1hr[i-1]["h"] and b["h"] > bars_1hr[i+1]["h"]:
             highs.append(b["h"])
-        if b["l"] < bars_1hr[i-1]["l"] and b["l"] < bars_1hr[i-2]["l"]                 and b["l"] < bars_1hr[i+1]["l"] and b["l"] < bars_1hr[i+2]["l"]:
+        if b["l"] < bars_1hr[i-1]["l"] and b["l"] < bars_1hr[i+1]["l"]:
             lows.append(b["l"])
 
     if len(highs) < 2 or len(lows) < 2:
@@ -2136,8 +2143,11 @@ def get_liquid_option(symbol, direction, underlying_price=None):
     today_date  = datetime.now(et).date()
 
     if underlying_price:
-        lo = round(underlying_price * 0.98, 2)
-        hi = round(underlying_price * 1.02, 2)
+        # ±3% window. ±2% was too narrow on end-of-day 0DTE where the
+        # true 0.40-delta strike often sits 2-3% OTM, forcing the
+        # picker into ITM strikes (delta 0.5-0.7).
+        lo = round(underlying_price * 0.97, 2)
+        hi = round(underlying_price * 1.03, 2)
     else:
         lo, hi = None, None
 
@@ -2238,7 +2248,16 @@ def get_liquid_option(symbol, direction, underlying_price=None):
                         pass
 
             if any(c["delta"] > 0 for c in candidates):
-                candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
+                # Asymmetric distance to 0.40 target: ITM overshoot
+                # (delta > 0.40) costs 1.5x to nudge selection toward
+                # OTM when distances are otherwise comparable. Secondary
+                # key prefers lower delta on exact ties.
+                def _delta_key(x):
+                    d    = x["delta"]
+                    dist = abs(d - 0.40)
+                    overshoot = max(0.0, d - 0.40)
+                    return (dist + 0.5 * overshoot, d)
+                candidates.sort(key=_delta_key)
             elif underlying_price:
                 candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
 
@@ -2675,6 +2694,7 @@ def scan_all_symbols():
 
                 # Grade the alt signal (use moderate breakout strength proxy)
                 vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+                result["vol_ratio"] = round(vol_ratio, 2)
                 breakout_strength = abs(price - vwap) / vwap if vwap else 0
                 score = alt_signal["score"]
 
@@ -2740,6 +2760,16 @@ def scan_all_symbols():
                 else:
                     result["status"] = "SIGNAL (no options)"
 
+                # Hard 0DTE late-entry cutoff: too little time for the
+                # trade to clear stops before close. Keep the row on
+                # the dashboard but as WATCHING so it doesn't fire.
+                if (result.get("dte_label") == "0DTE"
+                        and et_hour >= cfg.get("zero_dte_cutoff_hour", 14.5)
+                        and result["status"] == "SIGNAL"):
+                    result["status"] = "WATCHING"
+                    log("{}: 0DTE demoted to WATCHING (et_hour={:.2f} >= {})".format(
+                        symbol, et_hour, cfg.get("zero_dte_cutoff_hour", 14.5)))
+
                 result["score"]       = round(score, 2)
                 result["grade"]       = grade
                 result["grade_pts"]   = grade_pts
@@ -2779,6 +2809,7 @@ def scan_all_symbols():
                 continue
 
         vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
+        result["vol_ratio"] = round(vol_ratio, 2)
         score     = (breakout_strength * 100 + vol_ratio) * vol_mult
 
         result["aligned"] = not (
@@ -2885,6 +2916,14 @@ def scan_all_symbols():
             result["status"]    = "SIGNAL"
         else:
             result["status"] = "SIGNAL (no options)"
+
+        # Hard 0DTE late-entry cutoff (mirrors alt-strategy path above).
+        if (result.get("dte_label") == "0DTE"
+                and et_hour >= cfg.get("zero_dte_cutoff_hour", 14.5)
+                and result["status"] == "SIGNAL"):
+            result["status"] = "WATCHING"
+            log("{}: 0DTE demoted to WATCHING (et_hour={:.2f} >= {})".format(
+                symbol, et_hour, cfg.get("zero_dte_cutoff_hour", 14.5)))
 
         result["direction"]   = direction
         result["score"]       = round(score, 2)
@@ -5615,14 +5654,23 @@ def _refresh_iv_snapshots():
     try:
         all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
         ok = 0
+        no_spot = []
+        no_iv   = []
         for sym in all_syms:
             spot = get_current_price(sym)
             if not spot:
+                no_spot.append(sym)
                 continue
             iv = iv_rank.snapshot_symbol(sym, spot)
             if iv:
                 ok += 1
+            else:
+                no_iv.append(sym)
         log("IV snapshots stored for {}/{} symbols".format(ok, len(all_syms)))
+        if no_spot:
+            log("  IV skipped (no spot): {}".format(",".join(sorted(no_spot))))
+        if no_iv:
+            log("  IV skipped (no chain/iv): {}".format(",".join(sorted(no_iv))))
     except Exception as e:
         log("IV snapshot error: {}".format(e))
 
