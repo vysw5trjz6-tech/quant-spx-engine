@@ -127,7 +127,9 @@ def get_1hr_bars(symbol):
         cached = _HR1_CACHE.get(symbol)
     if cached is not None:
         return cached
-    bars = _fetch_bars(symbol, "1Hour", 30)
+    # 60 bars (~9 RTH sessions of 1hr data) gives the pivot detector enough
+    # history to find ≥2 swing highs and lows even in choppy tape.
+    bars = _fetch_bars(symbol, "1Hour", 60)
     if bars is not None:
         with _LOCK:
             _HR1_CACHE[symbol] = bars
