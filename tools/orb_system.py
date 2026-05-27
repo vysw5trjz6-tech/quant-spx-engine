@@ -11,8 +11,9 @@ import sys
 from datetime import datetime, date, timedelta
 from collections import defaultdict
 
-# Realistic execution model (slippage + fees)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Realistic execution model (slippage + fees). Tool lives in tools/,
+# so step up one dir to reach project root where safety_gates lives.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from safety_gates import realistic_trade_pnl
     HAS_REALISTIC_EXEC = True
