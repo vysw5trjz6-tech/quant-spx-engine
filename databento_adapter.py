@@ -11,6 +11,7 @@
 import os
 import sys
 import json
+import time
 import sqlite3
 import db_utils
 from datetime import datetime, timedelta, time as dtime, timezone
@@ -66,6 +67,48 @@ def _billing_blocked():
         _billing_blocked_until is not None
         and _utcnow() < _billing_blocked_until
     )
+
+
+# Transient server/network errors (gateway timeouts, 5xx, dropped
+# connections) are NOT billing problems and must not trip the 30-minute
+# billing breaker -- doing so took down the whole GEX snapshot for half an
+# hour over a single 504. We retry these a couple of times with backoff and,
+# if they persist, log a fetch_failed and move on WITHOUT opening the breaker.
+_TRANSIENT_MARKERS = (
+    " 500", " 502", " 503", " 504", " 408", " 429",
+    "timed out", "timeout", "gateway", "temporarily unavailable",
+    "connection reset", "connection aborted", "read timed out",
+    "remote end closed", "service unavailable",
+)
+
+
+def _is_transient_error(exc):
+    if _is_billing_error(exc):
+        return False
+    s = "{} {}".format(type(exc).__name__, exc).lower()
+    return any(m in s for m in _TRANSIENT_MARKERS)
+
+
+def _pull_with_retry(fn, retries=2, backoff=1.5):
+    """
+    Run a Databento timeseries/symbology call, retrying transient failures.
+
+    Billing (402) errors propagate immediately so the caller can trip the
+    breaker. Non-transient, non-billing errors also propagate on the first
+    occurrence. Transient errors are retried up to `retries` times with
+    exponential backoff before the final exception propagates.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries and _is_transient_error(e):
+                time.sleep(backoff)
+                backoff *= 2
+                attempt += 1
+                continue
+            raise
 
 
 _LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
@@ -577,16 +620,54 @@ def _parse_osi_symbol(raw):
         return None
 
 
-def get_options_chain_snapshot(underlying, target_date_et=None,
-                                 expiries_ahead=3):
+# Databento statistics stat_type values (from databento/dbn enums.rs):
+#   3=SettlementPrice 9=OpenInterest 11=ClosePrice 20=IndicativeClosePrice
+#   10=FixingPrice 1=OpeningPrice. For a daily snapshot we want OI plus a
+# representative daily price to back out IV. Prefer the official settlement,
+# then the close, then progressively weaker fallbacks.
+_STAT_OPEN_INTEREST   = 9
+_STAT_PRICE_PRIORITY  = {3: 5, 11: 4, 20: 3, 10: 2, 1: 1}  # higher = preferred
+
+
+def _scale_dbn_price(raw):
+    """Normalize a Databento price to dollars.
+
+    `to_df()` usually returns float dollars, but some SDK/schema paths still
+    surface raw 1e-9 fixed-point integers (the existing OHLCV/strike code
+    guards the same way). The UNDEF sentinel (i64 max ~9.22e18, or ~9.22e9
+    after scaling) and non-positive values are rejected.
     """
-    Returns EOD options chain with open interest.
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    if v > 1e6:            # fixed-point nanos (no option trades at $1M+)
+        v = v / 1e9
+    if not (0 < v < 1e5):  # still absurd -> UNDEF/garbage
+        return None
+    return v
+
+
+def get_options_chain_snapshot(underlying, target_date_et=None,
+                                 expiries_ahead=3, with_price=False):
+    """
+    Returns EOD options chain with open interest (and, when with_price=True,
+    a per-contract daily price used downstream to solve implied volatility).
 
     Cost-optimized: pulls only the `statistics` schema (1d window, with a
-    4d fallback for long weekends) for the parent symbol, filters to
-    stat_type=9 (OpenInterest) rows, then resolves instrument_id ->
-    raw_symbol via `symbology.resolve` (a reference lookup, not a metered
-    timeseries pull). Strike/expiry/type are parsed from the OSI tail.
+    4d fallback for long weekends) for the parent symbol, then resolves
+    instrument_id -> raw_symbol via `symbology.resolve` (a reference lookup,
+    not a metered timeseries pull). Strike/expiry/type are parsed from the
+    OSI tail. Open interest comes from stat_type=9; a representative price
+    from the price stat_types (settlement/close/...) in the SAME pull, so
+    enabling prices for GEX is free.
+
+    with_price: also extract per-contract price and, only if the statistics
+    schema carried none, do a single cheap `ohlcv-1d` parent pull for close
+    prices. Gated because the 72-symbol OI sweep doesn't need prices and
+    shouldn't pay for the fallback. GEX (SPY/QQQ only) passes True.
 
     The prior implementation pulled a 60-180 day `definition` delta stream
     for every snapshot, which on SPY/QQQ runs to tens of dollars per
@@ -600,7 +681,10 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     if target_date_et is None:
         target_date_et = datetime.now(et).date()
 
-    cache_key = "chain_{}_{}".format(underlying, target_date_et.isoformat())
+    # Price-enriched chains cache separately so a price-less OI-sweep result
+    # can't satisfy a GEX request (which needs the price to compute IV).
+    cache_key = "chain_{}{}_{}".format(
+        "px_" if with_price else "", underlying, target_date_et.isoformat())
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("chain", [])
@@ -621,12 +705,13 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     # 1) Statistics: stat_type=9 (OpenInterest) is published daily per
     #    active contract, so a 1d window captures the full chain. Widen
     #    to 4d only if the first pull is empty (long weekend / holiday).
+    #    Transient 5xx/timeouts retry; only genuine 402s trip the breaker.
     try:
         stats_start = (target_date_et - timedelta(days=1)).isoformat()
-        stats_df = _pull_stats(stats_start)
+        stats_df = _pull_with_retry(lambda: _pull_stats(stats_start))
         if stats_df is None or stats_df.empty:
             stats_start = (target_date_et - timedelta(days=4)).isoformat()
-            stats_df = _pull_stats(stats_start)
+            stats_df = _pull_with_retry(lambda: _pull_stats(stats_start))
     except Exception as e:
         if _is_billing_error(e):
             _trip_billing_breaker("{} statistics".format(underlying))
@@ -640,8 +725,9 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         print("[databento] {} statistics empty".format(underlying))
         return []
 
-    if "stat_type" in stats_df.columns:
-        oi_df = stats_df[stats_df["stat_type"] == 9]
+    has_stat_type = "stat_type" in stats_df.columns
+    if has_stat_type:
+        oi_df = stats_df[stats_df["stat_type"] == _STAT_OPEN_INTEREST]
     else:
         oi_df = stats_df
 
@@ -661,6 +747,26 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             len(oi_df) if oi_df is not None else 0))
         return []
 
+    # 1b) Per-contract daily price from the SAME statistics pull (free).
+    #     Keep the highest-priority price stat seen per instrument.
+    px_by_inst = {}
+    if with_price and has_stat_type:
+        px_df = stats_df[stats_df["stat_type"].isin(_STAT_PRICE_PRIORITY.keys())]
+        best_rank = {}
+        for _, row in px_df.iterrows():
+            try:
+                iid  = int(row.get("instrument_id"))
+                rank = _STAT_PRICE_PRIORITY.get(int(row.get("stat_type")), 0)
+                if rank <= best_rank.get(iid, 0):
+                    continue
+                px = _scale_dbn_price(row.get("price"))
+                if px is None:
+                    continue
+                px_by_inst[iid] = px
+                best_rank[iid]  = rank
+            except Exception:
+                continue
+
     # 2) Resolve instrument_id -> raw_symbol. Symbology lookups are
     #    metadata calls (not metered as data records), so this is the
     #    cheap part. Chunked to stay under the 2000-symbol-per-request
@@ -671,13 +777,13 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     try:
         for i in range(0, len(iids), CHUNK):
             batch = iids[i:i + CHUNK]
-            resp = client.symbology.resolve(
+            resp = _pull_with_retry(lambda b=batch: client.symbology.resolve(
                 dataset    = "OPRA.PILLAR",
-                symbols    = [str(x) for x in batch],
+                symbols    = [str(x) for x in b],
                 stype_in   = "instrument_id",
                 stype_out  = "raw_symbol",
                 start_date = end_iso,
-            )
+            ))
             result = (resp or {}).get("result") or {}
             for iid_str, mappings in result.items():
                 if not mappings:
@@ -698,6 +804,39 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                         msg=str(e)[:200])
         return []
 
+    # 2b) Price fallback: if the statistics schema carried no usable price
+    #     stats, do ONE cheap ohlcv-1d parent pull for daily closes. Only on
+    #     the with_price (GEX) path so the OI sweep stays free.
+    if with_price and not px_by_inst:
+        try:
+            ohlcv_df = _pull_with_retry(lambda: client.timeseries.get_range(
+                dataset  = "OPRA.PILLAR",
+                symbols  = [parent],
+                stype_in = "parent",
+                schema   = "ohlcv-1d",
+                start    = (target_date_et - timedelta(days=1)).isoformat(),
+                end      = end_iso,
+            ).to_df())
+            if ohlcv_df is not None and not ohlcv_df.empty:
+                # Latest close per instrument (df is time-ordered).
+                for _, row in ohlcv_df.iterrows():
+                    try:
+                        iid = int(row.get("instrument_id"))
+                        px  = _scale_dbn_price(row.get("close"))
+                        if px is not None:
+                            px_by_inst[iid] = px
+                    except Exception:
+                        continue
+        except Exception as e:
+            if _is_billing_error(e):
+                _trip_billing_breaker("{} ohlcv-1d".format(underlying))
+                return []
+            _emit_error("databento.fetch_failed", source="ohlcv-1d-px",
+                        symbol=underlying, exc=type(e).__name__,
+                        msg=str(e)[:200])
+            # Non-fatal: continue with OI-only chain (IV solved downstream
+            # will just be skipped for contracts without a price).
+
     # 3) Build chain rows from OSI symbol parses.
     chain = []
     for iid, oi in oi_by_inst.items():
@@ -712,6 +851,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             "expiry":              parsed["expiry"],
             "type":                parsed["type"],
             "open_interest":       oi,
+            "price":               px_by_inst.get(iid),
             "implied_volatility":  None,
         })
 
