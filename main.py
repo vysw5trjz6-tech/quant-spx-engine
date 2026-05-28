@@ -2149,13 +2149,22 @@ def _next_expiry_dates(n=4):
     return dates
 
 
-def get_liquid_option(symbol, direction, underlying_price=None):
+def get_liquid_option(symbol, direction, underlying_price=None,
+                      et_hour=None, zero_dte_cutoff=None):
     """
     Fetch the nearest available ATM option via Alpaca options snapshot API.
 
     SPY/QQQ have daily 0DTE options.
     Individual stocks (TSLA, AMD, etc.) only have weekly options (Fri expiry).
     We try today first, then fall back up to 5 trading days out.
+
+    Past the 0DTE cutoff (et_hour >= zero_dte_cutoff) we do NOT select a 0DTE
+    contract: there's too little time left for the trade to clear stops, and
+    the EOD chain collapses to penny lottery quotes (mid ~$0.06). Rather than
+    pick a worthless contract that just gets demoted to WATCHING -- and rather
+    than silently rolling into overnight 1DTE risk -- we return "no contract"
+    once we've confirmed a same-day chain exists, so the caller keeps the row
+    on the board as WATCHING with no trade.
 
     Returns (premium, strike, is_live, dte_label)
       dte_label: '0DTE', '1DTE', '2DTE' etc. shown on card
@@ -2294,6 +2303,16 @@ def get_liquid_option(symbol, direction, underlying_price=None):
             exp_date  = _dt.datetime.strptime(expiry_str, "%Y-%m-%d").date()
             dte       = (exp_date - today_date).days
             dte_label = "{}DTE".format(dte) if dte > 0 else "0DTE"
+
+            # Past the 0DTE cutoff: a same-day chain exists but we won't trade
+            # it. Return "no contract" (dte_label flags it 0DTE) so the caller
+            # keeps the row as WATCHING. We stop here rather than rolling to a
+            # later expiry -- a late-day intraday signal shouldn't silently
+            # become an overnight 1DTE position.
+            if (dte == 0 and et_hour is not None
+                    and zero_dte_cutoff is not None
+                    and et_hour >= zero_dte_cutoff):
+                return None, None, False, "0DTE"
 
             log("  Selected {} {}: strike={} delta={:.3f} mid={} ({})".format(
                 symbol, option_type, best["strike"], best["delta"],
@@ -2843,7 +2862,9 @@ def scan_all_symbols():
                         symbol, alt_signal["signal_type"], grade_pts))
                     continue
 
-                premium, strike, is_live, dte_label = get_liquid_option(symbol, direction, price)
+                premium, strike, is_live, dte_label = get_liquid_option(
+                    symbol, direction, price, et_hour=et_hour,
+                    zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
 
                 if premium and is_live:
                     contracts, stp, tgt = calculate_contracts(premium, score)
@@ -2856,13 +2877,20 @@ def scan_all_symbols():
                     result["status"]    = "SIGNAL"
                 else:
                     result["status"] = "SIGNAL (no options)"
+                    # Only the suppressed-0DTE sentinel returns a label here;
+                    # a genuine no-tradable contract returns None -- don't
+                    # mislabel those as 0DTE (would wrongly demote them).
+                    if dte_label:
+                        result["dte_label"] = dte_label
 
                 # Hard 0DTE late-entry cutoff: too little time for the
                 # trade to clear stops before close. Keep the row on
-                # the dashboard but as WATCHING so it doesn't fire.
+                # the dashboard but as WATCHING so it doesn't fire. Also
+                # covers the case where get_liquid_option suppressed the
+                # 0DTE pick past cutoff (status "SIGNAL (no options)").
                 if (result.get("dte_label") == "0DTE"
                         and et_hour >= cfg.get("zero_dte_cutoff_hour", 14.5)
-                        and result["status"] == "SIGNAL"):
+                        and result["status"] in ("SIGNAL", "SIGNAL (no options)")):
                     result["status"] = "WATCHING"
                     log("{}: 0DTE demoted to WATCHING (et_hour={:.2f} >= {})".format(
                         symbol, et_hour, cfg.get("zero_dte_cutoff_hour", 14.5)))
@@ -3012,7 +3040,9 @@ def scan_all_symbols():
                     grade = "B"; grade_color = "#e3b341"; grade_pts = min(grade_pts + 10, 74)
                 result["grade_pts"] += 5  # small bonus in rank
 
-        premium, strike, is_live, dte_label = get_liquid_option(symbol, direction, price)
+        premium, strike, is_live, dte_label = get_liquid_option(
+            symbol, direction, price, et_hour=et_hour,
+            zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
 
         if premium and is_live:
             contracts, stp, tgt = calculate_contracts(premium, score)
@@ -3025,11 +3055,15 @@ def scan_all_symbols():
             result["status"]    = "SIGNAL"
         else:
             result["status"] = "SIGNAL (no options)"
+            # See alt-strategy path: only label the suppressed-0DTE sentinel.
+            if dte_label:
+                result["dte_label"] = dte_label
 
         # Hard 0DTE late-entry cutoff (mirrors alt-strategy path above).
+        # Also catches the suppressed-pick case ("SIGNAL (no options)").
         if (result.get("dte_label") == "0DTE"
                 and et_hour >= cfg.get("zero_dte_cutoff_hour", 14.5)
-                and result["status"] == "SIGNAL"):
+                and result["status"] in ("SIGNAL", "SIGNAL (no options)")):
             result["status"] = "WATCHING"
             log("{}: 0DTE demoted to WATCHING (et_hour={:.2f} >= {})".format(
                 symbol, et_hour, cfg.get("zero_dte_cutoff_hour", 14.5)))

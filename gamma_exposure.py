@@ -24,6 +24,17 @@ import db_utils
 from datetime import datetime, timedelta
 import pytz
 
+try:
+    import vol_math
+    _HAS_VOL_MATH = True
+except ImportError:
+    _HAS_VOL_MATH = False
+
+# Risk-free rate used for both the IV solve and the gamma calc (kept in sync
+# with bs_gamma's default). Dividend yield is ignored (q=0): the small bias is
+# immaterial for GEX wall/flip detection.
+_RISK_FREE = 0.045
+
 
 
 # =============================================
@@ -47,6 +58,52 @@ def bs_gamma(spot, strike, dte_years, iv, r=0.045):
     sqrt_t = math.sqrt(dte_years)
     d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * dte_years) / (iv * sqrt_t)
     return _norm_pdf(d1) / (spot * iv * sqrt_t)
+
+
+def _prep_contract(c, spot_price, today):
+    """
+    Normalize one chain row into (strike, opt_type, oi, iv, dte_days) or None.
+
+    The Databento statistics chain provides OI but no IV. When IV is missing
+    we solve it from the contract's daily price (settlement/close) via
+    Black-Scholes -- without this every contract is dropped (iv <= 0) and GEX
+    silently computes to nothing, which is why GEX has read "No data" even on
+    days the chain loaded fine.
+    """
+    try:
+        strike = float(c["strike"])
+        expiry = c["expiry"]
+        if isinstance(expiry, str):
+            expiry = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+        opt_type = (c.get("type") or "").lower()
+        oi       = int(c.get("open_interest") or 0)
+        iv       = float(c.get("implied_volatility") or 0)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    if oi == 0 or opt_type not in ("call", "put"):
+        return None
+
+    dte_days = (expiry - today).days
+    if dte_days < 0:
+        return None
+
+    # Solve IV from price when the feed didn't supply one.
+    if iv <= 0 and _HAS_VOL_MATH:
+        price = c.get("price")
+        if price:
+            # 0.5-day floor on T mirrors the gamma calc so 0DTE stays finite.
+            t_years = max(dte_days, 0.5) / 365.0
+            solved = vol_math.implied_vol(
+                float(price), spot_price, strike, t_years,
+                r=_RISK_FREE, option_type=opt_type)
+            if solved:
+                iv = solved
+
+    if iv <= 0 or iv > 5.0:
+        return None
+
+    return strike, opt_type, oi, iv, dte_days
 
 
 # =============================================
@@ -84,23 +141,11 @@ def compute_gex_from_chain(chain_data, spot_price):
     total = 0.0
 
     for c in chain_data:
-        try:
-            strike = float(c["strike"])
-            expiry = c["expiry"]
-            if isinstance(expiry, str):
-                expiry = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
-            opt_type = (c.get("type") or "").lower()
-            oi       = int(c.get("open_interest") or 0)
-            iv       = float(c.get("implied_volatility") or 0)
-        except (KeyError, ValueError, TypeError):
+        prepped = _prep_contract(c, spot_price, today)
+        if not prepped:
             continue
+        strike, opt_type, oi, iv, dte_days = prepped
 
-        if oi == 0 or iv <= 0 or iv > 5.0:
-            continue
-
-        dte_days  = (expiry - today).days
-        if dte_days < 0:
-            continue
         # Use minimum 0.5 days to avoid div-by-zero on 0DTE
         dte_years = max(dte_days, 0.5) / 365.0
 
@@ -194,23 +239,10 @@ def compute_gex_by_tenor(chain_data, spot_price):
     totals = {label: 0.0 for label, _, _ in TENOR_BUCKETS}
 
     for c in chain_data:
-        try:
-            strike = float(c["strike"])
-            expiry = c["expiry"]
-            if isinstance(expiry, str):
-                expiry = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
-            opt_type = (c.get("type") or "").lower()
-            oi       = int(c.get("open_interest") or 0)
-            iv       = float(c.get("implied_volatility") or 0)
-        except (KeyError, ValueError, TypeError):
+        prepped = _prep_contract(c, spot_price, today)
+        if not prepped:
             continue
-
-        if oi == 0 or iv <= 0 or iv > 5.0:
-            continue
-
-        dte_days = (expiry - today).days
-        if dte_days < 0:
-            continue
+        strike, opt_type, oi, iv, dte_days = prepped
         dte_years = max(dte_days, 0.5) / 365.0
 
         bucket = None
@@ -247,7 +279,10 @@ def fetch_options_chain(underlying):
     try:
         import databento_adapter
         if databento_adapter.is_available():
-            chain = databento_adapter.get_options_chain_snapshot(underlying)
+            # with_price=True so the chain carries a daily price we can solve
+            # IV from -- GEX is SPY/QQQ only, so the price pull is cheap.
+            chain = databento_adapter.get_options_chain_snapshot(
+                underlying, with_price=True)
             if chain:
                 return chain
     except ImportError:
