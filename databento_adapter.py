@@ -544,10 +544,53 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 # OPTIONS CHAIN with OI (for GEX)
 # =============================================
 
+def _parse_osi_symbol(raw):
+    """
+    Parse an OSI/OCC option raw_symbol into (strike, expiry, type).
+
+    OSI layout: 6-char root (space-padded), YYMMDD, C|P, 8-digit strike
+    in 1/1000ths. Databento emits either the padded form ("SPY   240315
+    C00450000") or compact ("SPY240315C00450000") -- we strip whitespace
+    and parse the 15-char tail (YYMMDD + C/P + strike).
+    """
+    s = str(raw).strip().replace(" ", "")
+    if len(s) < 15:
+        return None
+    tail = s[-15:]
+    try:
+        year   = 2000 + int(tail[0:2])
+        month  = int(tail[2:4])
+        day    = int(tail[4:6])
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return None
+        cp     = tail[6].upper()
+        if   cp == "C": opt_type = "call"
+        elif cp == "P": opt_type = "put"
+        else: return None
+        strike = int(tail[7:15]) / 1000.0
+        return {
+            "strike": strike,
+            "expiry": "{:04d}-{:02d}-{:02d}".format(year, month, day),
+            "type":   opt_type,
+        }
+    except (ValueError, TypeError):
+        return None
+
+
 def get_options_chain_snapshot(underlying, target_date_et=None,
                                  expiries_ahead=3):
     """
     Returns EOD options chain with open interest.
+
+    Cost-optimized: pulls only the `statistics` schema (1d window, with a
+    4d fallback for long weekends) for the parent symbol, filters to
+    stat_type=9 (OpenInterest) rows, then resolves instrument_id ->
+    raw_symbol via `symbology.resolve` (a reference lookup, not a metered
+    timeseries pull). Strike/expiry/type are parsed from the OSI tail.
+
+    The prior implementation pulled a 60-180 day `definition` delta stream
+    for every snapshot, which on SPY/QQQ runs to tens of dollars per
+    request and was the cause of the 402 / billing-breaker trips.
     """
     client = _get_client()
     if not client or _billing_blocked():
@@ -565,184 +608,127 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     end_iso = target_date_et.isoformat()
     parent  = underlying + ".OPT"
 
-    # The `definition` schema is a DELTA STREAM: it emits one record per
-    # instrument only when something changes (Added/Modified/Deleted), not
-    # one per day. A 1-day window only captures instruments that had a
-    # definition event in that 24h window -- which for SPY/QQQ is typically
-    # a small subset of the active chain (newly listed strikes, expiry
-    # rolls). Most active contracts haven't been modified recently and so
-    # were INVISIBLE in our prior 1-day pull, producing an empty chain.
-    #
-    # Window of 60 days captures at least one event per instrument on the
-    # current chain in nearly all cases (weekly rolls + strike adjustments
-    # touch every active contract within that horizon). Falls back to 180d
-    # on the rare case where 60d is still empty.
-    def _pull(window_days):
-        start_iso = (target_date_et - timedelta(days=window_days)).isoformat()
-        ddf = client.timeseries.get_range(
+    def _pull_stats(start):
+        return client.timeseries.get_range(
             dataset  = "OPRA.PILLAR",
             symbols  = [parent],
             stype_in = "parent",
-            schema   = "definition",
-            start    = start_iso,
+            schema   = "statistics",
+            start    = start,
             end      = end_iso,
         ).to_df()
-        return ddf, start_iso
 
+    # 1) Statistics: stat_type=9 (OpenInterest) is published daily per
+    #    active contract, so a 1d window captures the full chain. Widen
+    #    to 4d only if the first pull is empty (long weekend / holiday).
     try:
-        def_df, start_iso = _pull(60)
-        if def_df is None or def_df.empty:
-            def_df, start_iso = _pull(180)
-
-        if def_df is None or def_df.empty:
-            print("[databento] {} definitions empty".format(underlying))
-            return []
-
-        inst_meta = {}
-        for _, row in def_df.iterrows():
-            try:
-                iid = int(row.get("instrument_id"))
-
-                # Drop deleted instruments. Rows are time-ordered by Databento,
-                # so a Delete event for an iid we already added means the
-                # contract is no longer active -- remove from meta.
-                action = str(row.get("security_update_action", "")).upper().strip()
-                if action == "D":
-                    inst_meta.pop(iid, None)
-                    continue
-
-                strike = row.get("strike_price")
-                if strike is None:
-                    continue
-                strike = float(strike)
-                if strike > 100000:
-                    strike = strike / 1e9
-
-                expiry = row.get("expiration")
-                if expiry is not None and hasattr(expiry, "date"):
-                    expiry_str = expiry.date().isoformat()
-                elif expiry:
-                    expiry_str = str(expiry)[:10]
-                else:
-                    continue
-
-                # Primary signal: ISO 10962 CFI code. For OPRA options the
-                # second character is exactly "C" (call) or "P" (put), which
-                # is more reliable than substring-matching instrument_class
-                # (whose codes vary across venues).
-                opt_type = None
-                cfi = str(row.get("cfi", "")).upper().strip()
-                if len(cfi) >= 2 and cfi[0] == "O":
-                    if   cfi[1] == "C": opt_type = "call"
-                    elif cfi[1] == "P": opt_type = "put"
-                # Fallback: instrument_class substring match (kept for safety
-                # if cfi is ever missing for a row).
-                if opt_type is None:
-                    inst_class = str(row.get("instrument_class", "")).upper()
-                    if   "C" in inst_class: opt_type = "call"
-                    elif "P" in inst_class: opt_type = "put"
-                if not opt_type:
-                    continue
-
-                inst_meta[iid] = {
-                    "strike": strike,
-                    "expiry": expiry_str,
-                    "type":   opt_type,
-                }
-            except Exception:
-                continue
-
-        if not inst_meta:
-            print("[databento] {} no parseable definitions "
-                  "(def_df rows={})".format(underlying, len(def_df)))
-            return []
-
-        def _pull_stats(start):
-            return client.timeseries.get_range(
-                dataset  = "OPRA.PILLAR",
-                symbols  = [parent],
-                stype_in = "parent",
-                schema   = "statistics",
-                start    = start,
-                end      = end_iso,
-            ).to_df()
-
-        # Statistics window: keep this short (1d -> 4d) because stats ARE
-        # published daily per instrument, so a wider window just multiplies
-        # cost without adding active contracts.
         stats_start = (target_date_et - timedelta(days=1)).isoformat()
         stats_df = _pull_stats(stats_start)
         if stats_df is None or stats_df.empty:
             stats_start = (target_date_et - timedelta(days=4)).isoformat()
             stats_df = _pull_stats(stats_start)
-
-        if stats_df is None or stats_df.empty:
-            print("[databento] {} statistics empty".format(underlying))
-            return []
-
-        if "stat_type" in stats_df.columns:
-            oi_df = stats_df[stats_df["stat_type"] == 9]
-        else:
-            oi_df = stats_df
-
-        oi_by_inst = {}
-        for _, row in oi_df.iterrows():
-            try:
-                iid = int(row.get("instrument_id"))
-                qty = int(row.get("quantity", 0))
-                if qty > 0:
-                    oi_by_inst[iid] = qty
-            except Exception:
-                continue
-
-        chain = []
-        for iid, oi in oi_by_inst.items():
-            meta = inst_meta.get(iid)
-            if not meta:
-                continue
-            chain.append({
-                "strike":              meta["strike"],
-                "expiry":              meta["expiry"],
-                "type":                meta["type"],
-                "open_interest":       oi,
-                "implied_volatility":  None,
-            })
-
-        if chain:
-            chain.sort(key=lambda x: x["expiry"])
-            unique_exp = sorted(set(c["expiry"] for c in chain))
-            keep = set(unique_exp[:expiries_ahead])
-            chain = [c for c in chain if c["expiry"] in keep]
-        else:
-            # Diagnostic: chain is empty despite non-empty defs and stats
-            # responses. Log a sample row's identity fields so the next
-            # failure tells us whether the parent symbol is mapping to the
-            # right product (`underlying` should equal SPY/QQQ; `cfi`
-            # should start with "O").
-            stat9_rows = len(oi_df) if oi_df is not None else 0
-            sample_info = "no_def_rows"
-            if def_df is not None and not def_df.empty:
-                s = def_df.iloc[0]
-                sample_info = "underlying={} raw_symbol={} cfi={} action={}".format(
-                    s.get("underlying"), s.get("raw_symbol"),
-                    s.get("cfi"), s.get("security_update_action"))
-            print("[databento] {} chain empty: def_rows={} parsed_meta={} "
-                  "stats_total={} stat9_rows={} oi_with_qty>0={} "
-                  "window={}->{} sample[{}]".format(
-                      underlying, len(def_df), len(inst_meta),
-                      len(stats_df), stat9_rows, len(oi_by_inst),
-                      start_iso, end_iso, sample_info))
-
-        _cache_set(cache_key, {"chain": chain})
-        return chain
-
     except Exception as e:
         if _is_billing_error(e):
-            _trip_billing_breaker("{} chain".format(underlying))
+            _trip_billing_breaker("{} statistics".format(underlying))
         else:
-            _emit_error("databento.fetch_failed", source="chain",
-                        symbol=underlying, exc=type(e).__name__)
+            _emit_error("databento.fetch_failed", source="statistics",
+                        symbol=underlying, exc=type(e).__name__,
+                        msg=str(e)[:200])
         return []
+
+    if stats_df is None or stats_df.empty:
+        print("[databento] {} statistics empty".format(underlying))
+        return []
+
+    if "stat_type" in stats_df.columns:
+        oi_df = stats_df[stats_df["stat_type"] == 9]
+    else:
+        oi_df = stats_df
+
+    oi_by_inst = {}
+    for _, row in oi_df.iterrows():
+        try:
+            iid = int(row.get("instrument_id"))
+            qty = int(row.get("quantity", 0))
+            if qty > 0:
+                oi_by_inst[iid] = qty
+        except Exception:
+            continue
+
+    if not oi_by_inst:
+        print("[databento] {} no OI rows (stats_total={} stat9_rows={})".format(
+            underlying, len(stats_df),
+            len(oi_df) if oi_df is not None else 0))
+        return []
+
+    # 2) Resolve instrument_id -> raw_symbol. Symbology lookups are
+    #    metadata calls (not metered as data records), so this is the
+    #    cheap part. Chunked to stay under the 2000-symbol-per-request
+    #    cap on the resolve endpoint.
+    iids = list(oi_by_inst.keys())
+    raw_by_iid = {}
+    CHUNK = 2000
+    try:
+        for i in range(0, len(iids), CHUNK):
+            batch = iids[i:i + CHUNK]
+            resp = client.symbology.resolve(
+                dataset    = "OPRA.PILLAR",
+                symbols    = [str(x) for x in batch],
+                stype_in   = "instrument_id",
+                stype_out  = "raw_symbol",
+                start_date = end_iso,
+            )
+            result = (resp or {}).get("result") or {}
+            for iid_str, mappings in result.items():
+                if not mappings:
+                    continue
+                raw = mappings[-1].get("s")
+                if not raw:
+                    continue
+                try:
+                    raw_by_iid[int(iid_str)] = raw
+                except Exception:
+                    continue
+    except Exception as e:
+        if _is_billing_error(e):
+            _trip_billing_breaker("{} resolve".format(underlying))
+        else:
+            _emit_error("databento.fetch_failed", source="resolve",
+                        symbol=underlying, exc=type(e).__name__,
+                        msg=str(e)[:200])
+        return []
+
+    # 3) Build chain rows from OSI symbol parses.
+    chain = []
+    for iid, oi in oi_by_inst.items():
+        raw = raw_by_iid.get(iid)
+        if not raw:
+            continue
+        parsed = _parse_osi_symbol(raw)
+        if not parsed:
+            continue
+        chain.append({
+            "strike":              parsed["strike"],
+            "expiry":              parsed["expiry"],
+            "type":                parsed["type"],
+            "open_interest":       oi,
+            "implied_volatility":  None,
+        })
+
+    if chain:
+        chain.sort(key=lambda x: x["expiry"])
+        unique_exp = sorted(set(c["expiry"] for c in chain))
+        keep = set(unique_exp[:expiries_ahead])
+        chain = [c for c in chain if c["expiry"] in keep]
+    else:
+        sample_raw = next(iter(raw_by_iid.values()), None)
+        print("[databento] {} chain empty: stats_total={} oi_iids={} "
+              "resolved={} sample_raw={!r}".format(
+                  underlying, len(stats_df), len(oi_by_inst),
+                  len(raw_by_iid), sample_raw))
+
+    _cache_set(cache_key, {"chain": chain})
+    return chain
 
 
 # =============================================
