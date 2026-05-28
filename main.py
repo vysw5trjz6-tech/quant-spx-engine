@@ -265,6 +265,15 @@ DEFAULT_CONFIG = {
     "counter_trend_allowed":    True,
     "min_grade":                "C",
 
+    # --- Clear-air (resistance/support proximity) cap ---
+    # Levels within this % of current price are treated as already tested /
+    # within noise and do NOT block the path to T1. Without this, an intraday
+    # 1H swing-high sitting fractions of a percent overhead caps nearly every
+    # signal at C. A weak (1H) blocking level applies a softer one-grade
+    # penalty rather than the hard C cap reserved for 4hr/daily levels.
+    "clear_air_tol_pct":        0.12,
+    "clear_air_weak_strength":  1,
+
     # --- AI state ---
     "ai_insight": "Baseline config -- collecting trade data to begin optimization.",
     "ai_focus":   "Trade all A/B/C grade signals and log outcomes to build the dataset.",
@@ -1186,7 +1195,7 @@ def calculate_vwap_bands(bars, num_std=2.0):
 
 def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
                       gap_pct, gap_dir, rs, market_bias,
-                      time_vol_ratio, vol_mult, symbol="?"):
+                      time_vol_ratio, vol_mult, symbol="?", vol_data_ok=True):
     """
     When price stays consistently on one side of VWAP with trending
     structure (HH/HL or LH/LL), it's a high-prob continuation signal.
@@ -1235,7 +1244,13 @@ def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
     if vwap_dist_pct < cfg.get("vwap_trend_min_dist_pct", 0.15):
         return None
 
-    # Volume filter
+    # Volume filter. When the bar-of-day volume ratio is unavailable,
+    # get_time_vol_ratio returns the 1.0 sentinel ("N/A") -- which would
+    # otherwise sail past the >= 0.9 gate as if volume were confirmed.
+    # VWAP_TREND is a volume-confirmed continuation play, so refuse to
+    # fire on a placeholder rather than emit an unconfirmed signal.
+    if not vol_data_ok:
+        return None
     if time_vol_ratio < cfg.get("vwap_trend_vol_min", 0.9):
         return None
 
@@ -1281,7 +1296,7 @@ def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
 # =============================================
 
 def detect_vwap_mean_reversion(intraday, daily, vwap, cfg, et_hour,
-                                time_vol_ratio, vol_mult):
+                                time_vol_ratio, vol_mult, vol_data_ok=True):
     """
     When price extends to VWAP deviation bands and shows reversal,
     trade the snap-back toward VWAP. Works best on range-bound days
@@ -1303,7 +1318,10 @@ def detect_vwap_mean_reversion(intraday, daily, vwap, cfg, et_hour,
     price     = intraday[-1]["c"]
     prev_close = intraday[-2]["c"]
 
-    # Volume filter
+    # Volume filter. Skip on the N/A volume sentinel (see detect_vwap_trend)
+    # so the snap-back doesn't fire without real participation data.
+    if not vol_data_ok:
+        return None
     if time_vol_ratio < cfg.get("vwap_mr_vol_min", 0.8):
         return None
 
@@ -1352,7 +1370,7 @@ def detect_vwap_mean_reversion(intraday, daily, vwap, cfg, et_hour,
 # =============================================
 
 def detect_ib_extension(intraday, daily, vwap, cfg, et_hour,
-                        time_vol_ratio, vol_mult, market_bias):
+                        time_vol_ratio, vol_mult, market_bias, vol_data_ok=True):
     """
     The Initial Balance is the first hour's range (bars 0-11 at 5min).
     When price moves 1x IB range beyond IB high/low, it signals strong
@@ -1394,7 +1412,11 @@ def detect_ib_extension(intraday, daily, vwap, cfg, et_hour,
     else:
         return None
 
-    # Volume confirmation
+    # Volume confirmation. The N/A sentinel (1.0) already fails the >= 1.2
+    # gate below, but guard explicitly so intent is clear and the rule
+    # holds if the default is ever lowered.
+    if not vol_data_ok:
+        return None
     if time_vol_ratio < cfg.get("ib_ext_vol_min", 1.2):
         return None
 
@@ -1828,24 +1850,30 @@ def get_key_levels(daily_bars, bars_1hr, bars_4hr):
     return deduped
 
 
-def check_clear_air(price, direction, t1, t2, key_levels):
+def check_clear_air(price, direction, t1, t2, key_levels, tol_pct=0.0):
     """
     Checks if key levels block T1 or T2.
     Returns dict: clear_to_t1, clear_to_t2, blocking_level, context
+
+    tol_pct: levels within this % of current price are considered already
+    tested / within intraday noise and are ignored, so a level a hair
+    overhead doesn't spuriously block the path to T1.
     """
     if not key_levels or not t1 or not t2:
         return {"clear_to_t1": True, "clear_to_t2": True,
                 "blocking_level": None, "context": "No levels identified"}
 
+    tol_abs = price * (tol_pct / 100.0) if tol_pct else 0.0
+
     blocking = []
     if direction == "CALL":
         for lvl in key_levels:
-            if price < lvl["price"] <= t2:
+            if price < lvl["price"] <= t2 and (lvl["price"] - price) > tol_abs:
                 blocking.append(lvl)
         blocking.sort(key=lambda x: x["price"])
     else:
         for lvl in key_levels:
-            if t2 <= lvl["price"] < price:
+            if t2 <= lvl["price"] < price and (price - lvl["price"]) > tol_abs:
                 blocking.append(lvl)
         blocking.sort(key=lambda x: x["price"], reverse=True)
 
@@ -2286,34 +2314,89 @@ def get_liquid_option(symbol, direction, underlying_price=None):
 # SWING ENGINE -- DATA FETCHERS
 # =============================================
 
-def get_daily_extended(symbol, limit=90):
-    try:
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "1Day", "limit": limit}, timeout=10)
-        if r.status_code != 200:
-            _log_swing_fetch_err(symbol, "daily/http",
+# Daily/weekly bars barely change intraday, yet the swing scan re-pulls the
+# full 72-symbol universe (x2 timeframes) every few minutes in bursts of 8
+# threads. That hammers Alpaca's rate limiter -- a single 429 on the first
+# symbols cascades into a whole-universe "data:0/72" outage. A short-TTL cache
+# means the burst only happens once; a much longer stale window lets a
+# transient outage reuse the last good bars instead of zeroing the scan.
+_BARS_CACHE      = {}
+_BARS_CACHE_LOCK = threading.Lock()
+_BARS_FRESH_TTL  = 30 * 60       # serve from cache without re-fetching
+_BARS_STALE_TTL  = 6 * 3600      # last-resort reuse when a fetch fails
+
+
+def _bars_cache_get(key, max_age):
+    with _BARS_CACHE_LOCK:
+        entry = _BARS_CACHE.get(key)
+        if entry and (time.time() - entry[0]) <= max_age:
+            return entry[1]
+    return None
+
+
+def _bars_cache_set(key, bars):
+    with _BARS_CACHE_LOCK:
+        _BARS_CACHE[key] = (time.time(), bars)
+
+
+def _fetch_bars(symbol, timeframe, limit, kind):
+    """
+    Cached, rate-limit-aware bar fetch shared by the daily/weekly getters.
+
+    Order of preference: fresh cache -> live fetch (with 429 backoff) ->
+    stale cache. Records each non-200 status into the swing stats so a
+    0-setup scan can report the dominant cause instead of swallowing it.
+    """
+    cache_key = "{}|{}|{}".format(symbol, timeframe, limit)
+
+    fresh = _bars_cache_get(cache_key, _BARS_FRESH_TTL)
+    if fresh is not None:
+        return fresh
+
+    attempts = 3
+    backoff  = 0.5
+    for attempt in range(attempts):
+        try:
+            r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                             params={"timeframe": timeframe, "limit": limit},
+                             timeout=10)
+            if r.status_code == 200:
+                bars = r.json().get("bars", []) or []
+                if bars:
+                    _bars_cache_set(cache_key, bars)
+                return bars
+            _swing_stats_bump("http_{}".format(r.status_code))
+            # 429 = rate limited: back off and retry before giving up.
+            if r.status_code == 429 and attempt < attempts - 1:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            _log_swing_fetch_err(symbol, kind + "/http",
                                  "{} {}".format(r.status_code, r.text[:120]))
-            return None
-        return r.json().get("bars", [])
-    except Exception as e:
-        _log_swing_fetch_err(symbol, "daily/exc",
-                             "{}: {}".format(type(e).__name__, str(e)[:120]))
-        return None
+            break
+        except Exception as e:
+            _swing_stats_bump("http_exc")
+            if attempt < attempts - 1:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            _log_swing_fetch_err(symbol, kind + "/exc",
+                                 "{}: {}".format(type(e).__name__, str(e)[:120]))
+            break
+
+    # Live fetch failed -- reuse the last good bars if we have any.
+    stale = _bars_cache_get(cache_key, _BARS_STALE_TTL)
+    if stale is not None:
+        _swing_stats_bump("served_stale")
+    return stale
+
+
+def get_daily_extended(symbol, limit=90):
+    return _fetch_bars(symbol, "1Day", limit, "daily")
 
 
 def get_weekly_bars(symbol, limit=52):
-    try:
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params={"timeframe": "1Week", "limit": limit}, timeout=10)
-        if r.status_code != 200:
-            _log_swing_fetch_err(symbol, "weekly/http",
-                                 "{} {}".format(r.status_code, r.text[:120]))
-            return None
-        return r.json().get("bars", [])
-    except Exception as e:
-        _log_swing_fetch_err(symbol, "weekly/exc",
-                             "{}: {}".format(type(e).__name__, str(e)[:120]))
-        return None
+    return _fetch_bars(symbol, "1Week", limit, "weekly")
 
 
 # =============================================
@@ -2582,6 +2665,10 @@ def scan_all_symbols():
         # Time-adjusted volume (index of current bar in today's session)
         bar_idx                = len(intraday) - 1
         time_vol_ratio, tv_lbl = get_time_vol_ratio(intraday, daily, bar_idx, symbol=symbol)
+        # tv_lbl == "N/A" means get_time_vol_ratio had no real volume data and
+        # returned the 1.0 sentinel. Volume-confirmed strategies must not treat
+        # that placeholder as a passing volume reading.
+        vol_data_ok = tv_lbl != "N/A"
 
         result["price"]      = round(price, 2)
         result["vwap"]       = round(vwap, 2)
@@ -2635,19 +2722,21 @@ def scan_all_symbols():
                 alt_signal = detect_vwap_trend(
                     intraday, daily, vwap, cfg, et_hour,
                     gap_pct, gap_dir, rs, market_bias,
-                    time_vol_ratio, vol_mult, symbol=symbol)
+                    time_vol_ratio, vol_mult, symbol=symbol,
+                    vol_data_ok=vol_data_ok)
 
             # 2. VWAP Mean Reversion (deviation band snap-back)
             if not alt_signal and strat_rules.get("vwap_mr", True):
                 alt_signal = detect_vwap_mean_reversion(
                     intraday, daily, vwap, cfg, et_hour,
-                    time_vol_ratio, vol_mult)
+                    time_vol_ratio, vol_mult, vol_data_ok=vol_data_ok)
 
             # 3. Initial Balance Extension (Market Profile)
             if not alt_signal and strat_rules.get("ib_extension", True):
                 alt_signal = detect_ib_extension(
                     intraday, daily, vwap, cfg, et_hour,
-                    time_vol_ratio, vol_mult, market_bias)
+                    time_vol_ratio, vol_mult, market_bias,
+                    vol_data_ok=vol_data_ok)
 
             # 4. Opening Drive (overnight inventory + gap alignment) — NEW
             if not alt_signal and HAS_NEW_STRATS and premarket:
@@ -2726,13 +2815,21 @@ def scan_all_symbols():
                 t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
                 clear_air = check_clear_air(price, direction,
                                             result.get(t1_key), result.get(t2_key),
-                                            key_levels)
+                                            key_levels,
+                                            tol_pct=cfg.get("clear_air_tol_pct", 0.0))
                 result["clear_air"] = clear_air
 
                 if not clear_air["clear_to_t1"]:
-                    grade_pts = min(grade_pts, 52)
-                    if grade in ("A", "B"):
-                        grade = "C"; grade_color = "#f0883e"
+                    blk = clear_air.get("blocking_level") or {}
+                    weak = blk.get("strength", 3) <= cfg.get("clear_air_weak_strength", 1)
+                    if weak:
+                        grade_pts = min(grade_pts, 62)
+                        if grade == "A":
+                            grade = "B"; grade_color = "#3fb950"
+                    else:
+                        grade_pts = min(grade_pts, 52)
+                        if grade in ("A", "B"):
+                            grade = "C"; grade_color = "#f0883e"
 
                 result["rec_contract"] = recommend_contract(symbol, direction, price, orb_range)
 
@@ -2845,14 +2942,26 @@ def scan_all_symbols():
         t2_key = "und_call_t2" if direction == "CALL" else "und_put_t2"
         clear_air = check_clear_air(price, direction,
                                     result.get(t1_key), result.get(t2_key),
-                                    key_levels)
+                                    key_levels,
+                                    tol_pct=cfg.get("clear_air_tol_pct", 0.0))
         result["clear_air"] = clear_air
 
         if not clear_air["clear_to_t1"]:
-            grade_pts = min(grade_pts, 52)
-            if grade in ("A", "B"):
-                grade = "C"; grade_color = "#f0883e"
-                log("  {} grade capped C: {}".format(symbol, clear_air["context"]))
+            blk = clear_air.get("blocking_level") or {}
+            weak = blk.get("strength", 3) <= cfg.get("clear_air_weak_strength", 1)
+            if weak:
+                # A lone 1H swing-high is not strong enough for the hard C cap.
+                # Apply a softer one-grade penalty and a higher points ceiling.
+                grade_pts = min(grade_pts, 62)
+                if grade == "A":
+                    grade = "B"; grade_color = "#3fb950"
+                    log("  {} grade A->B (weak {} blocks T1): {}".format(
+                        symbol, blk.get("label", "level"), clear_air["context"]))
+            else:
+                grade_pts = min(grade_pts, 52)
+                if grade in ("A", "B"):
+                    grade = "C"; grade_color = "#f0883e"
+                    log("  {} grade capped C: {}".format(symbol, clear_air["context"]))
         elif clear_air["clear_to_t2"] and grade_pts >= 70:
             grade_pts = min(grade_pts + 5, 100)
 
@@ -4812,7 +4921,28 @@ def run_swing_scan():
             s.get("t1_oneil", 0), s.get("t1_wyckoff", 0),
             s.get("t1_hi52", 0), s.get("t1_earn", 0)),
     ]
+    if s.get("served_stale"):
+        parts.append("stale:{}".format(s.get("served_stale")))
     log("Swing scan done: {} setups | {}".format(len(results), " ".join(parts)))
+
+    # A whole-universe data outage is the single most common reason the swing
+    # engine silently goes dark. The per-symbol fetch errors are throttled to
+    # 5 lines/scan, so without this an outage looks identical to a quiet day.
+    # When nobody got data, report the dominant HTTP status so the cause
+    # (429 rate-limit vs 401/403 auth vs 5xx) is unambiguous.
+    if s.get("had_data", 0) == 0:
+        http_counts = {k[5:]: v for k, v in s.items() if k.startswith("http_")}
+        if http_counts:
+            dominant = max(http_counts.items(), key=lambda kv: kv[1])
+            log("Swing universe OUTAGE: 0/{} symbols had data | "
+                "dominant status={} ({} hits) | statuses={}".format(
+                    len(SWING_SYMBOLS), dominant[0], dominant[1],
+                    ", ".join("{}={}".format(k, v) for k, v in
+                              sorted(http_counts.items()))))
+        else:
+            log("Swing universe OUTAGE: 0/{} symbols had data | "
+                "no HTTP status captured (check Alpaca auth / connectivity)".format(
+                    len(SWING_SYMBOLS)))
 
 
 def render_swing_dashboard():
