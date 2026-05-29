@@ -868,7 +868,7 @@ def db_log_signal(sig):
         log("DB signal log error: {}".format(e))
 
 
-def db_log_trade(symbol, direction, premium, contracts, stop, target,
+def db_log_trade(symbol, direction, premium, contracts=None, stop=None, target=None,
                   grade=None, grade_pts=None, gap_pct=None,
                   gap_dir=None, rs=None, entry_hour=None,
                   entry_under=None, signal_type=None):
@@ -5243,6 +5243,31 @@ def _log_swing_fetch_err(symbol, kind, detail):
     log("  swing fetch fail [{}] {}: {}".format(kind, symbol, detail))
 
 
+def run_unified_scan(do_intraday=False, do_weekly=False):
+    """Assemble the unified tiered payload from current scanner state.
+
+    The intraday (scan_all_symbols/run_signal_scan) and weekly (run_swing_scan)
+    passes run on their own cadences from the scheduler; this is the single
+    read-side entry point that merges their latest results into one tiered,
+    conviction-ranked payload plus SPX/NDX context. Optionally (re)triggers a
+    pass first when do_intraday / do_weekly is set.
+    """
+    if do_weekly:
+        run_swing_scan()
+    if do_intraday:
+        run_signal_scan()
+
+    with state_lock:
+        intraday = [r for r in all_signals
+                    if r.get("status") in ("SIGNAL", "SIGNAL (no options)")]
+        weekly   = list(swing_signals)
+
+    context = {"index": index_context()}
+    if HAS_SCANNER_CORE:
+        return scanner_core.merge_and_rank(intraday, weekly, context)
+    return {"weekly": weekly, "intraday": intraday, "context": context}
+
+
 def run_swing_scan():
     """
     Scan SWING_SYMBOLS concurrently (batches of 8).
@@ -8091,9 +8116,16 @@ def swing_page():
 
 @app.route("/swing/scan")
 def swing_scan_now():
-    """Manually trigger a swing scan."""
-    threading.Thread(target=run_swing_scan, daemon=True).start()
+    """Manually trigger the weekly pass of the unified scan."""
+    threading.Thread(target=run_unified_scan, kwargs={"do_weekly": True},
+                     daemon=True).start()
     return redirect("/swing")
+
+
+@app.route("/scan/unified")
+def scan_unified():
+    """JSON view of the merged tiered payload (weekly + intraday + context)."""
+    return jsonify(run_unified_scan())
 
 
 def _build_scanner_context():
