@@ -1244,6 +1244,41 @@ def index_context():
     return out
 
 
+def render_index_context_strip():
+    """Small horizontal SPX/NDX context strip (display-only, no signal cards)."""
+    ctx = index_context()
+    if not ctx:
+        return ""
+    cells = ""
+    for c in ctx:
+        pct = c.get("pct")
+        col = "#8b949e" if pct is None else ("#3fb950" if pct >= 0 else "#f85149")
+        lvl = c.get("level")
+        cells += (
+            "<span style='margin-right:16px'>"
+            "<b style='color:#e6edf3'>{sym}</b> "
+            "<span style='font-family:monospace'>{lvl}</span> "
+            "<span style='color:{col}'>{pct}</span> "
+            "<span style='color:#6e7681;font-size:9px'>via {px}</span>"
+            "</span>"
+        ).format(
+            sym=c["symbol"],
+            lvl="{:,.2f}".format(lvl) if lvl else "-",
+            col=col,
+            pct="{:+.2f}%".format(pct) if pct is not None else "-",
+            px=c.get("proxy", "-"),
+        )
+    return (
+        "<div style='background:#0d1117;border:1px solid #30363d;border-radius:8px;"
+        "padding:8px 12px;margin-bottom:10px;font-size:11px'>"
+        "<span style='color:#8b949e;text-transform:uppercase;letter-spacing:.6px;"
+        "font-size:9px;font-weight:700;margin-right:12px'>Index Context</span>"
+        + cells +
+        "<span style='color:#6e7681;font-size:9px;margin-left:6px'>"
+        "(proxy levels &mdash; context only, trade SPY/QQQ)</span></div>"
+    )
+
+
 # =============================================
 # INDICATORS
 # =============================================
@@ -3361,6 +3396,11 @@ def run_signal_scan():
     # Telegram: alert on confirmed signals
     for sig in signals:
         if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
+            if HAS_SCANNER_CORE and "rationale" not in sig:
+                try:
+                    sig["rationale"] = scanner_core.build_rationale(sig)
+                except Exception:
+                    pass
             db_log_signal(sig)
 
             # Build context line — regime + GEX bias for situational awareness
@@ -4890,7 +4930,6 @@ def scan_swing_symbol(symbol):
 
         direction = best["direction"]
         tier      = best["tier"]
-        opt = get_swing_option(symbol, direction, current) if tier == 1 else None
 
         exts = best.get("extend", {})
         if direction == "CALL":
@@ -4944,6 +4983,25 @@ def scan_swing_symbol(symbol):
 
         rr1  = round(abs(t1 - current) / abs(current - stop), 2) if (
             t1 and stop and abs(current - stop) > 0) else 0
+
+        # Weekly option on the current-week settlement (tier-1 only). Build a
+        # dict the dashboard/renderers expect; premium-stop/target are
+        # size-free per-contract levels.
+        opt = None
+        if tier == 1:
+            prem, strike, is_live, dte_label = get_swing_option(
+                symbol, direction, current)
+            if prem and is_live:
+                opt = {
+                    "premium": prem,
+                    "strike":  strike,
+                    "expiry":  week_expiry,
+                    "dte":     dte,
+                    "delta":   0.40,
+                    "iv":      round(atm_iv * 100, 1) if atm_iv else 0,
+                    "bid":     "-",
+                    "ask":     "-",
+                }
 
         product_class = "ETF" if symbol in ETF_PRODUCTS else "STOCK"
 
@@ -5340,6 +5398,27 @@ def render_swing_dashboard():
                            "border:1px solid {};margin-right:4px'>STAGE {}</span>"
                            ).format(sc, sc, stage)
 
+        # Horizon / product-class / conviction / target-basis badges
+        _hz   = s.get("horizon", "WEEKLY")
+        _pc   = s.get("product_class", "")
+        _conv = s.get("conviction")
+        _basis = s.get("target_basis")
+        stage_badge += ("<span style='background:#0d1117;color:#58a6ff;font-size:9px;"
+                        "font-weight:700;padding:2px 7px;border-radius:3px;"
+                        "border:1px solid #1f3d5c;margin-right:4px'>{} {}</span>"
+                        ).format(_hz, _pc).replace("  ", " ")
+        if _conv is not None:
+            _cc = "#3fb950" if _conv >= 1.0 else "#e3b341" if _conv >= 0.7 else "#f85149"
+            stage_badge += ("<span style='background:#0d1117;color:{};font-size:9px;"
+                            "font-weight:700;padding:2px 7px;border-radius:3px;"
+                            "border:1px solid {};margin-right:4px'>conv x{:.2f}</span>"
+                            ).format(_cc, _cc, _conv)
+        if _basis:
+            stage_badge += ("<span style='background:#0d1117;color:#a371f7;font-size:9px;"
+                            "font-weight:700;padding:2px 7px;border-radius:3px;"
+                            "border:1px solid #2d1b69;margin-right:4px'>{}</span>"
+                            ).format(_basis)
+
         # Fib extensions block
         extend = s.get("extend", {})
         fib_html = ""
@@ -5413,7 +5492,7 @@ def render_swing_dashboard():
             opt_html = ("<div style='background:#0d1117;border-radius:6px;padding:8px 10px;"
                         "border:1px solid #30363d;font-size:11px;color:#8b949e;"
                         "margin-bottom:8px'>No options data &mdash; "
-                        "check broker for 2-week {dir} expiry</div>").format(dir=direction)
+                        "check broker for this-week {dir} expiry</div>").format(dir=direction)
 
         # RS badge
         rs     = s.get("spy_rs") or 0
@@ -5459,12 +5538,14 @@ def render_swing_dashboard():
     </div>
     <div style='background:#0d1117;border-radius:6px;padding:8px'>
       <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Fib Targets</div>
+                  letter-spacing:.5px;margin-bottom:3px'>Targets ({basis})</div>
       <div style='font-size:11px;line-height:1.7'>
         <span style='color:#8b949e'>T1 </span>
-        <span style='color:#58a6ff;font-family:monospace'>${t1}</span><br>
+        <span style='color:#58a6ff;font-family:monospace'>${t1}</span>
+        <span style='color:#6e7681'>{t1p}</span><br>
         <span style='color:#8b949e'>T2 </span>
-        <span style='color:#a371f7;font-family:monospace'>${t2}</span><br>
+        <span style='color:#a371f7;font-family:monospace'>${t2}</span>
+        <span style='color:#6e7681'>{t2p}</span><br>
         <span style='color:#8b949e'>T3 </span>
         <span style='color:#3fb950;font-family:monospace'>${t3}</span>
       </div>
@@ -5505,6 +5586,9 @@ def render_swing_dashboard():
             t1         = s.get("t1") or "-",
             t2         = s.get("t2") or "-",
             t3         = s.get("t3") or "-",
+            t1p        = "({}%)".format(s.get("t1_prob")) if s.get("t1_prob") is not None else "",
+            t2p        = "({}%)".format(s.get("t2_prob")) if s.get("t2_prob") is not None else "",
+            basis      = s.get("target_basis") or "FIB",
             vol        = s.get("vol_vs_avg") or "-",
             nfr        = s.get("near_fib_r") or "-",
             nfd        = s.get("fib_dist")   or "-",
@@ -5562,6 +5646,27 @@ def render_swing_dashboard():
                            "border:1px solid {};margin-right:4px'>STAGE {}</span>"
                            ).format(sc, sc, stage)
 
+        # Horizon / product-class / conviction / target-basis badges
+        _hz   = s.get("horizon", "WEEKLY")
+        _pc   = s.get("product_class", "")
+        _conv = s.get("conviction")
+        _basis = s.get("target_basis")
+        stage_badge += ("<span style='background:#0d1117;color:#58a6ff;font-size:9px;"
+                        "font-weight:700;padding:2px 7px;border-radius:3px;"
+                        "border:1px solid #1f3d5c;margin-right:4px'>{} {}</span>"
+                        ).format(_hz, _pc).replace("  ", " ")
+        if _conv is not None:
+            _cc = "#3fb950" if _conv >= 1.0 else "#e3b341" if _conv >= 0.7 else "#f85149"
+            stage_badge += ("<span style='background:#0d1117;color:{};font-size:9px;"
+                            "font-weight:700;padding:2px 7px;border-radius:3px;"
+                            "border:1px solid {};margin-right:4px'>conv x{:.2f}</span>"
+                            ).format(_cc, _cc, _conv)
+        if _basis:
+            stage_badge += ("<span style='background:#0d1117;color:#a371f7;font-size:9px;"
+                            "font-weight:700;padding:2px 7px;border-radius:3px;"
+                            "border:1px solid #2d1b69;margin-right:4px'>{}</span>"
+                            ).format(_basis)
+
         # Fib extensions block
         extend = s.get("extend", {})
         fib_html = ""
@@ -5635,7 +5740,7 @@ def render_swing_dashboard():
             opt_html = ("<div style='background:#0d1117;border-radius:6px;padding:8px 10px;"
                         "border:1px solid #30363d;font-size:11px;color:#8b949e;"
                         "margin-bottom:8px'>No options data &mdash; "
-                        "check broker for 2-week {dir} expiry</div>").format(dir=direction)
+                        "check broker for this-week {dir} expiry</div>").format(dir=direction)
 
         # RS badge
         rs     = s.get("spy_rs") or 0
@@ -5681,12 +5786,14 @@ def render_swing_dashboard():
     </div>
     <div style='background:#0d1117;border-radius:6px;padding:8px'>
       <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Fib Targets</div>
+                  letter-spacing:.5px;margin-bottom:3px'>Targets ({basis})</div>
       <div style='font-size:11px;line-height:1.7'>
         <span style='color:#8b949e'>T1 </span>
-        <span style='color:#58a6ff;font-family:monospace'>${t1}</span><br>
+        <span style='color:#58a6ff;font-family:monospace'>${t1}</span>
+        <span style='color:#6e7681'>{t1p}</span><br>
         <span style='color:#8b949e'>T2 </span>
-        <span style='color:#a371f7;font-family:monospace'>${t2}</span><br>
+        <span style='color:#a371f7;font-family:monospace'>${t2}</span>
+        <span style='color:#6e7681'>{t2p}</span><br>
         <span style='color:#8b949e'>T3 </span>
         <span style='color:#3fb950;font-family:monospace'>${t3}</span>
       </div>
@@ -5727,6 +5834,9 @@ def render_swing_dashboard():
             t1         = s.get("t1") or "-",
             t2         = s.get("t2") or "-",
             t3         = s.get("t3") or "-",
+            t1p        = "({}%)".format(s.get("t1_prob")) if s.get("t1_prob") is not None else "",
+            t2p        = "({}%)".format(s.get("t2_prob")) if s.get("t2_prob") is not None else "",
+            basis      = s.get("target_basis") or "FIB",
             vol        = s.get("vol_vs_avg") or "-",
             nfr        = s.get("near_fib_r") or "-",
             nfd        = s.get("fib_dist")   or "-",
@@ -5791,9 +5901,10 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
 </div>
 
 <div class='content'>
+  {index_strip}
   <div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
               letter-spacing:.8px;margin-bottom:4px;margin-top:4px'>
-    {nsig} ACTIVE SETUP{pl} &mdash; RANKED BY CONTINUATION PROBABILITY
+    PRIMARY &mdash; WEEKLY ({nsig} SETUP{pl}, SPY/QQQ + RS-RANKED STOCKS)
   </div>
   <div style='font-size:10px;color:#8b949e;margin-bottom:10px'>
     <span style='color:#a371f7'>&#9632; O'Neil Pivot</span> &nbsp;
@@ -5801,7 +5912,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
     <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
     <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
     &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
-    Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Delta ~0.55, 2-week options
+    Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Current-week Friday settlement (rides to 0DTE)
   </div>
   {cards}
 </div>
@@ -5810,6 +5921,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
         next  = next_str,
         pl    = "S" if len(sigs) != 1 else "",
         cards = cards_html,
+        index_strip = render_index_context_strip(),
     )
 
 
@@ -7345,11 +7457,14 @@ def render_dashboard(toast=""):
 <!-- AI INSIGHT PANEL -->
 {ai_panel}
 
+<!-- INDEX CONTEXT -->
+<div style="padding:12px 14px 0">{index_strip}</div>
+
 <!-- SIGNAL CARDS -->
 <div style="padding:12px 14px 0">
   <div style="font-size:10px;font-weight:700;color:#8b949e;
               text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">
-    Active Signals &mdash; {nsig} setup{pl_s} found
+    SECONDARY &mdash; INTRADAY / 0DTE (SPY/QQQ) &mdash; {nsig} setup{pl_s} found
   </div>
   {signal_cards}
   {no_sig_msg}
@@ -7383,6 +7498,7 @@ def render_dashboard(toast=""):
         toast_html=toast_html,
         mc=mkt_color, ml=mkt_label,
         ai_panel=ai_panel,
+        index_strip=render_index_context_strip(),
         bias=market_bias, biasc=bias_color, spy=spy_chg,
         pc=pnl_color, pl=total_pnl,
         wrc=wr_color, wr=win_rate, nw=wins, nl=losses,
@@ -8055,9 +8171,24 @@ def _build_scanner_context():
             spy_chg = s.get("spy_chg", 0.0)
             break
 
+    # Index context (display-only SPX/NDX proxy levels)
+    idx_lines = []
+    try:
+        for c in index_context():
+            idx_lines.append("  {sym} {lvl} ({pct}) RS {rs} [via {px}]".format(
+                sym=c["symbol"],
+                lvl="{:,.2f}".format(c["level"]) if c.get("level") else "-",
+                pct="{:+.2f}%".format(c["pct"]) if c.get("pct") is not None else "-",
+                rs=c.get("rs"), px=c.get("proxy")))
+    except Exception:
+        pass
+
     ctx = """=== SCANNER CONTEXT ({time} ET) ===
 
 MARKET: {bias} | SPY {spy:+.2f}% | {mkt}
+
+INDEX CONTEXT (proxy levels, context only):
+{idx}
 
 0DTE ACTIVE SIGNALS ({nact} setups):
 {dte_active}
@@ -8079,6 +8210,7 @@ AI CONFIG: v{ver} | Insight: {insight} | Focus: {focus}
         bias    = bias,
         spy     = float(spy_chg or 0),
         mkt     = "MARKET OPEN" if market_open() else "MARKET CLOSED",
+        idx     = "\n".join(idx_lines) or "  (n/a)",
         nact    = len(active),
         dte_active = "\n".join(dte_lines) or "  (none)",
         nwatch  = len(watching),
