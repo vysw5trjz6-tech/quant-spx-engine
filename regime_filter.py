@@ -57,6 +57,11 @@ REGIME_THRESHOLDS = [
 # days more often than chop days. Disabling ORB/vwap_trend means we miss the
 # moves we're best positioned to catch. Instead we keep them enabled at 0.5x
 # size with a score penalty so only the strongest setups fire.
+#
+# conviction_multiplier: a regime confidence weight (NOT position size, which
+# is no longer modeled). It scales the signal score during ranking/grading so
+# that signals fired in a favorable regime rank above identical signals fired
+# in a hostile one. Compounds with the GEX conviction_mult.
 REGIME_STRATEGY_RULES = {
     "COMPRESSED": {
         "orb":              True,
@@ -64,7 +69,7 @@ REGIME_STRATEGY_RULES = {
         "vwap_mr":          True,    # range-bound days favor MR
         "ib_extension":     True,
         "swing_breakout":   False,
-        "size_multiplier":  0.5,     # half size — premium bleeds in low IV
+        "conviction_multiplier":  0.5,     # low conviction — premium bleeds in low IV
         # Raise the bar for trend signals to fire while in COMPRESSED.
         # Scanner subtracts this from grade_pts before letter assignment.
         "score_penalty_trend": 15,
@@ -75,7 +80,7 @@ REGIME_STRATEGY_RULES = {
         "vwap_mr":          True,
         "ib_extension":     True,
         "swing_breakout":   True,
-        "size_multiplier":  0.85,
+        "conviction_multiplier":  0.85,
     },
     "NORMAL": {
         "orb":              True,
@@ -83,7 +88,7 @@ REGIME_STRATEGY_RULES = {
         "vwap_mr":          True,
         "ib_extension":     True,
         "swing_breakout":   True,
-        "size_multiplier":  1.0,
+        "conviction_multiplier":  1.0,
     },
     "ELEVATED": {
         "orb":              True,
@@ -91,7 +96,7 @@ REGIME_STRATEGY_RULES = {
         "vwap_mr":          False,   # bands break in high vol
         "ib_extension":     True,
         "swing_breakout":   True,
-        "size_multiplier":  0.85,    # higher option prices, hold less
+        "conviction_multiplier":  0.85,    # higher option prices, lower conviction
     },
     "CRISIS": {
         "orb":              True,
@@ -99,7 +104,7 @@ REGIME_STRATEGY_RULES = {
         "vwap_mr":          False,
         "ib_extension":     True,
         "swing_breakout":   False,   # gaps gap; swings get blown up
-        "size_multiplier":  0.5,     # half size, wider stops
+        "conviction_multiplier":  0.5,     # lowest conviction, wider stops
     },
 }
 
@@ -443,7 +448,7 @@ def apply_expansion_override(regime_data, gap_pct_abs=None, symbol="SPY"):
     Mutates and returns regime_data. If today qualifies as EXPANSION_WATCH:
       - Replace strategy rules with LOW_VOL rules (trend strats fully on)
       - Drop the COMPRESSED score penalty
-      - Bump size_multiplier from 0.5 -> 0.85
+      - Bump conviction_multiplier from 0.5 -> 0.85
       - Attach expansion_watch=True + diagnostics for the brief
     """
     regime_data.setdefault("expansion_watch", False)
@@ -661,13 +666,3 @@ def is_strategy_allowed(strategy_name, regime_data=None):
     if regime_data is None:
         regime_data = classify_regime()
     return regime_data["rules"].get(strategy_name, True)
-
-
-def adjust_position_size(base_contracts, regime_data=None):
-    """
-    Apply regime-based size multiplier. Always returns at least 1 contract.
-    """
-    if regime_data is None:
-        regime_data = classify_regime()
-    mult = regime_data["rules"].get("size_multiplier", 1.0)
-    return max(1, int(round(base_contracts * mult)))

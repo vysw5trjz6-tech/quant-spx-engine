@@ -327,34 +327,3 @@ def detect_opening_drive(intraday_5min, vwap, premarket_brief,
         "rationale":     "Overnight inventory aligned with gap direction; volume confirms",
         "expected_win_rate": 0.62,
     }
-
-
-# =============================================
-# VOL-TARGETING POSITION SIZER
-# =============================================
-#
-# Reduce drawdowns ~30% with negligible return cost. The single biggest
-# improvement to a strategy portfolio after picking the strategies.
-
-def vol_target_size(account_size, target_annual_vol, current_realized_vol,
-                      base_position_size, max_leverage=2.0):
-    """
-    Scale position size so portfolio realized vol = target.
-
-    Example: target 12% annual vol, current realized 18% → scale down to 67%.
-              target 12% annual vol, current realized 8%  → scale up to 150%.
-
-    Args:
-      account_size: total account in dollars
-      target_annual_vol: e.g. 0.12 for 12% annualized
-      current_realized_vol: e.g. 0.18 for 18% (output of regime_filter)
-      base_position_size: dollars or contracts at "normal" sizing
-      max_leverage: cap to prevent over-sizing in calm regimes
-
-    Returns scaled size.
-    """
-    if current_realized_vol is None or current_realized_vol <= 0:
-        return base_position_size
-    scale = target_annual_vol / current_realized_vol
-    scale = min(max_leverage, max(0.25, scale))
-    return base_position_size * scale
