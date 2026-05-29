@@ -517,7 +517,13 @@ def init_db():
     for col, coltype in [("grade","TEXT"), ("grade_pts","INTEGER"),
                           ("gap_pct","REAL"), ("gap_dir","TEXT"),
                           ("rs","REAL"), ("entry_hour","REAL"),
-                          ("entry_under","REAL"), ("signal_type","TEXT")]:
+                          ("entry_under","REAL"), ("signal_type","TEXT"),
+                          # Auto position-tracking: underlying targets the live
+                          # monitor resolves against, the tier (horizon) the
+                          # position occupies, and how it was opened.
+                          ("und_stop","REAL"), ("und_target_t1","REAL"),
+                          ("und_target_t2","REAL"), ("horizon","TEXT"),
+                          ("mode","TEXT")]:
         try:
             conn.execute("ALTER TABLE trades ADD COLUMN {} {}".format(col, coltype))
         except:
@@ -877,7 +883,9 @@ def db_log_signal(sig):
 def db_log_trade(symbol, direction, premium, contracts=None, stop=None, target=None,
                   grade=None, grade_pts=None, gap_pct=None,
                   gap_dir=None, rs=None, entry_hour=None,
-                  entry_under=None, signal_type=None):
+                  entry_under=None, signal_type=None,
+                  und_stop=None, und_target_t1=None, und_target_t2=None,
+                  horizon=None, mode=None):
     try:
         conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
@@ -889,13 +897,15 @@ def db_log_trade(symbol, direction, premium, contracts=None, stop=None, target=N
             INSERT INTO trades
             (ts,symbol,direction,premium,contracts,stop,target,outcome,
              grade,grade_pts,gap_pct,gap_dir,rs,entry_hour,
-             entry_under,signal_type)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             entry_under,signal_type,
+             und_stop,und_target_t1,und_target_t2,horizon,mode)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
             symbol, direction, premium, contracts, stop, target, "OPEN",
             grade, grade_pts, gap_pct, gap_dir, rs, entry_hour,
-            entry_under, signal_type
+            entry_under, signal_type,
+            und_stop, und_target_t1, und_target_t2, horizon, mode
         ))
         trade_id = c.lastrowid
         conn.commit()
@@ -918,16 +928,21 @@ def db_close_trade(trade_id, exit_price, outcome):
         premium, contracts = row
         # Per-contract P&L. Position size is no longer part of the model, so
         # P&L is always expressed on a single-contract basis (contracts may be
-        # NULL on new rows). r_mult is already size-independent.
-        pnl    = (exit_price - premium) * 100
-        r_mult = (exit_price - premium) / (premium * 0.45)
+        # NULL on new rows). r_mult is already size-independent. Both are NULL
+        # when we have no entry premium (e.g. an auto position with no live
+        # option) -- the outcome (WIN/LOSS) still stands on underlying targets.
+        if premium and exit_price is not None:
+            pnl    = round((exit_price - premium) * 100, 2)
+            r_mult = round((exit_price - premium) / (premium * 0.45), 2)
+        else:
+            pnl = r_mult = None
         c.execute("""
             UPDATE trades SET outcome=?, exit_price=?, pnl=?, r_mult=?
             WHERE id=?
-        """, (outcome, exit_price, round(pnl, 2), round(r_mult, 2), trade_id))
+        """, (outcome, exit_price, pnl, r_mult, trade_id))
         conn.commit()
         conn.close()
-        log("Trade {} closed: {} pnl={}".format(trade_id, outcome, round(pnl,2)))
+        log("Trade {} closed: {} pnl={}".format(trade_id, outcome, pnl))
     except Exception as e:
         log("DB close trade error: {}".format(e))
 
@@ -972,6 +987,184 @@ def db_get_open_trades():
     except Exception as e:
         log("DB open trades error: {}".format(e))
         return []
+
+
+# =============================================
+# ACTIVE POSITION GATE  (one live trade per tier; auto-tracked on alert)
+# =============================================
+#
+# When a setup is alerted it auto-opens a tracked position (mode='auto') that
+# occupies its tier (WEEKLY or INTRADAY). While a tier holds a live position
+# the scanner emits no new alerts in that tier -- the two tiers are independent,
+# so one weekly and one intraday position can be live at once. The live monitor
+# resolves auto positions against the UNDERLYING targets (T1 = win, stop = loss)
+# each scan, then frees the tier. Manually-taken trades (mode != 'auto') also
+# occupy a tier so they mute alerts, but are only closed by the user.
+
+_OPEN_POS_COLS = ["id", "symbol", "direction", "premium", "stop", "target",
+                  "ts", "entry_under", "signal_type", "und_stop",
+                  "und_target_t1", "und_target_t2", "horizon", "mode"]
+
+
+def db_get_open_positions(horizon=None):
+    """Open trades (optionally filtered to a tier) with underlying-target cols."""
+    try:
+        conn = db_utils.connect(DB_FILE)
+        c    = conn.cursor()
+        sql = ("SELECT id,symbol,direction,premium,stop,target,ts,entry_under,"
+               "signal_type,und_stop,und_target_t1,und_target_t2,horizon,mode "
+               "FROM trades WHERE outcome='OPEN'")
+        params = ()
+        if horizon:
+            sql += " AND horizon=?"
+            params = (horizon,)
+        sql += " ORDER BY ts DESC"
+        c.execute(sql, params)
+        rows = c.fetchall()
+        conn.close()
+        return [dict(zip(_OPEN_POS_COLS, r)) for r in rows]
+    except Exception as e:
+        log("DB open positions error: {}".format(e))
+        return []
+
+
+def tier_has_open_position(horizon):
+    """True if the given tier (WEEKLY/INTRADAY) already holds a live position."""
+    return bool(db_get_open_positions(horizon))
+
+
+def open_auto_position(sig):
+    """Auto-open a tracked position for an alerted signal. Returns trade_id.
+
+    Stores the option premium stop/target (size-free, per-contract) and the
+    UNDERLYING stop/T1/T2 the live monitor resolves against.
+    """
+    direction = sig.get("direction")
+    if direction == "CALL":
+        und_stop = sig.get("und_call_stop")
+        und_t1   = sig.get("und_call_t1")
+        und_t2   = sig.get("und_call_t2")
+    elif direction == "PUT":
+        und_stop = sig.get("und_put_stop")
+        und_t1   = sig.get("und_put_t1")
+        und_t2   = sig.get("und_put_t2")
+    else:
+        und_stop = und_t1 = und_t2 = None
+    # Weekly signals carry direction-agnostic t1/t2/stop too -- fall back to them.
+    und_stop = und_stop if und_stop is not None else sig.get("stop")
+    und_t1   = und_t1   if und_t1   is not None else sig.get("t1")
+    und_t2   = und_t2   if und_t2   is not None else sig.get("t2")
+
+    return db_log_trade(
+        sig.get("symbol"), direction, sig.get("premium"),
+        stop=sig.get("stop"), target=sig.get("target"),
+        grade=sig.get("grade"), grade_pts=sig.get("grade_pts"),
+        gap_pct=sig.get("gap_pct"), gap_dir=sig.get("gap_dir"),
+        rs=sig.get("rs", sig.get("spy_rs")),
+        entry_under=sig.get("price"), signal_type=sig.get("signal_type"),
+        und_stop=und_stop, und_target_t1=und_t1, und_target_t2=und_t2,
+        horizon=sig.get("horizon", "INTRADAY"), mode="auto")
+
+
+def _underlying_extent(pos):
+    """High/low of the underlying since entry, for touch detection.
+
+    INTRADAY: today's 5-min bars at/after the entry timestamp.
+    WEEKLY:   daily bars since the entry date, plus today's intraday range.
+    Falls back to the current price when bars are unavailable.
+    """
+    symbol = pos["symbol"]
+    hi = lo = None
+    try:
+        entry_ts = pos.get("ts") or ""
+        if pos.get("horizon") == "WEEKLY":
+            daily = get_daily(symbol) or []
+            entry_day = entry_ts[:10]
+            rel = [b for b in daily if (b.get("t") or "")[:10] >= entry_day]
+            for b in rel:
+                hi = b["h"] if hi is None else max(hi, b["h"])
+                lo = b["l"] if lo is None else min(lo, b["l"])
+            intra = get_intraday(symbol) or []
+            for b in intra:
+                hi = b["h"] if hi is None else max(hi, b["h"])
+                lo = b["l"] if lo is None else min(lo, b["l"])
+        else:
+            intra = get_intraday(symbol) or []
+            rel = [b for b in intra if (b.get("t") or "") >= entry_ts] or intra
+            for b in rel:
+                hi = b["h"] if hi is None else max(hi, b["h"])
+                lo = b["l"] if lo is None else min(lo, b["l"])
+    except Exception:
+        pass
+    if hi is None or lo is None:
+        px = get_current_price(symbol)
+        if px:
+            hi = lo = px
+    return hi, lo
+
+
+def monitor_active_positions():
+    """Resolve auto-tracked positions against underlying targets each scan.
+
+    T1 touched -> WIN, stop touched -> LOSS (stop-first if both in the same
+    window, conservatively). Weekly positions past their Friday expiry are
+    force-closed so the tier frees up. Only mode='auto' rows are auto-resolved;
+    manual trades are left for the user to close.
+    """
+    et = pytz.timezone("America/New_York")
+    today = datetime.now(et).strftime("%Y-%m-%d")
+    for pos in db_get_open_positions():
+        if pos.get("mode") != "auto":
+            continue
+        direction = pos.get("direction")
+        und_stop = pos.get("und_stop")
+        und_t1   = pos.get("und_target_t1")
+        premium  = pos.get("premium")
+        # Option exit-premium proxies (our fixed stop/target levels), used so
+        # P&L stays consistent for auto positions we don't price live.
+        opt_target = pos.get("target") or (round(premium * 1.4, 2) if premium else None)
+        opt_stop   = pos.get("stop")   or (round(premium * 0.55, 2) if premium else None)
+
+        hi, lo = _underlying_extent(pos)
+
+        outcome = exit_price = None
+        if hi is not None and lo is not None and und_stop is not None:
+            if direction == "CALL":
+                stop_hit   = lo <= und_stop
+                target_hit = und_t1 is not None and hi >= und_t1
+            else:
+                stop_hit   = hi >= und_stop
+                target_hit = und_t1 is not None and lo <= und_t1
+            if stop_hit:                       # stop-first if both touched
+                outcome, exit_price = "LOSS", opt_stop
+            elif target_hit:
+                outcome, exit_price = "WIN", opt_target
+
+        # Weekly expiry reached without resolution -> force close to free tier.
+        if outcome is None and pos.get("horizon") == "WEEKLY":
+            wk = (pos.get("signal_type") or "")
+            try:
+                _exp, _dte = current_week_expiry(
+                    zero_dte_cutoff=get_config().get("zero_dte_cutoff_hour", 14.5))
+            except Exception:
+                _exp = None
+            # If the entry was for a prior week's settlement, it has expired.
+            entry_day = (pos.get("ts") or "")[:10]
+            if entry_day and entry_day < today:
+                px = get_current_price(pos["symbol"])
+                eu = pos.get("entry_under")
+                if px and eu:
+                    favorable = (px >= eu) if direction == "CALL" else (px <= eu)
+                    # Only force-close a multi-day weekly the day it expires; a
+                    # mid-week unresolved position keeps riding.
+                    if _exp and today >= _exp:
+                        outcome = "WIN" if favorable else "LOSS"
+                        exit_price = opt_target if favorable else opt_stop
+
+        if outcome:
+            db_close_trade(pos["id"], exit_price, outcome)
+            log("Auto position {} {} {} resolved {} (underlying targets)".format(
+                pos["id"], pos["symbol"], direction, outcome))
 
 
 # =============================================
@@ -3390,6 +3583,13 @@ def run_signal_scan():
     log("=== Running signal scan ===")
     _log_auth_state_if_changed()
 
+    # Resolve any live auto positions against underlying targets first; this
+    # may free the INTRADAY tier so a fresh alert can fire this scan.
+    try:
+        monitor_active_positions()
+    except Exception as _e:
+        log("monitor_active_positions error: {}".format(_e))
+
     results = scan_all_symbols()
 
     with state_lock:
@@ -3399,8 +3599,14 @@ def run_signal_scan():
     signals  = [r for r in results if r["status"] == "SIGNAL"]
     watching = [r for r in results if r["status"] == "WATCHING"]
 
+    # One live INTRADAY position at a time: if the tier is occupied, emit no new
+    # intraday alerts until it closes (win/loss on underlying targets).
+    intraday_locked = tier_has_open_position("INTRADAY")
+    if intraday_locked:
+        log("INTRADAY tier locked -- live position open, suppressing alerts")
+
     # Telegram: alert on confirmed signals
-    for sig in signals:
+    for sig in (signals if not intraday_locked else []):
         if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
             if HAS_SCANNER_CORE and "rationale" not in sig:
                 try:
@@ -3456,6 +3662,12 @@ def run_signal_scan():
                 ew         = earn_warning,
             )
             send_telegram(msg)
+            # Auto-open the tracked position so this tier is now locked until
+            # the underlying hits T1 (win) or stop (loss).
+            try:
+                open_auto_position(sig)
+            except Exception as _e:
+                log("open_auto_position error: {}".format(_e))
             break  # Only alert best signal
 
     # Telegram: send watching list if no signals
@@ -5353,26 +5565,41 @@ def run_swing_scan():
         all_swing_signals  = results
         swing_next_scan_at = next_swing_scan
 
-    # Weekly alerts: one per (symbol, direction, week_expiry). Tier-1 only.
-    # Pinned to the current-week settlement so we never re-fire a setup until
-    # the expiry rolls to next Friday (then it re-arms automatically).
-    for sig in results:
-        if sig.get("tier") != 1:
-            continue
-        key = (sig.get("symbol"), sig.get("direction"), sig.get("week_expiry"))
-        with _weekly_alert_lock:
-            if key in _weekly_alerted:
+    # Resolve live auto positions first (may free the WEEKLY tier).
+    try:
+        monitor_active_positions()
+    except Exception as e:
+        log("monitor_active_positions (weekly) error: {}".format(e))
+
+    # Weekly alerts: ONE live WEEKLY position at a time (tier lock), and within
+    # that, one alert per (symbol, direction, week_expiry) so a setup never
+    # re-fires until its Friday settlement rolls. Alert only the single best
+    # not-yet-alerted tier-1 setup, then lock the tier until it closes.
+    if tier_has_open_position("WEEKLY"):
+        log("WEEKLY tier locked -- live position open, suppressing alerts")
+    else:
+        for sig in results:                         # results sorted by prob desc
+            if sig.get("tier") != 1:
                 continue
-            _weekly_alerted.add(key)
-        try:
-            db_log_signal(sig)
-        except Exception as e:
-            log("weekly db_log_signal error: {}".format(e))
-        if bot_enabled:
+            key = (sig.get("symbol"), sig.get("direction"), sig.get("week_expiry"))
+            with _weekly_alert_lock:
+                if key in _weekly_alerted:
+                    continue
+                _weekly_alerted.add(key)
             try:
-                _send_weekly_alert(sig)
+                db_log_signal(sig)
             except Exception as e:
-                log("weekly alert error: {}".format(e))
+                log("weekly db_log_signal error: {}".format(e))
+            try:
+                open_auto_position(sig)
+            except Exception as e:
+                log("weekly open_auto_position error: {}".format(e))
+            if bot_enabled:
+                try:
+                    _send_weekly_alert(sig)
+                except Exception as e:
+                    log("weekly alert error: {}".format(e))
+            break  # one weekly position at a time
 
     # Compact filter-stage breakdown -- tells you WHY a 0-setups scan
     # was 0 (no_data vs earnings_blocked vs no_signal) and which tier-1
@@ -7115,7 +7342,8 @@ def render_dashboard(toast=""):
             stp_opt  = s.get("stop", "-")
             tgt_opt  = s.get("target", "-")
             take_url = ("/take?sym={}&dir={}&prem={}&stp={}&tgt={}"
-                        "&grade={}&gpts={}&gap={:.2f}&gdir={}&rs={:.2f}").format(
+                        "&grade={}&gpts={}&gap={:.2f}&gdir={}&rs={:.2f}"
+                        "&horizon=INTRADAY").format(
                 sym, d, prem, stp_opt, tgt_opt,
                 grade, grade_pts, gap_pct, gap_dir, rs)
             option_section = """
@@ -7653,6 +7881,7 @@ def take_trade():
     gdir  = request.args.get("gdir", None)
     rs    = request.args.get("rs", None)
     stype = request.args.get("stype", None)
+    horizon = request.args.get("horizon", "INTRADAY")
     try:
         # Capture underlying spot at trade entry — used for delta-based
         # unrealized P&L estimate on the dashboard.
@@ -7662,6 +7891,8 @@ def take_trade():
         except Exception:
             pass
 
+        # Manual trades occupy their tier too (so they mute new alerts), but are
+        # only closed by the user (mode='manual', not auto-resolved).
         db_log_trade(
             sym, dir_, float(prem), None, float(stp), float(tgt),
             grade=grade,
@@ -7671,6 +7902,7 @@ def take_trade():
             rs=float(rs) if rs else None,
             entry_under=entry_under,
             signal_type=stype,
+            horizon=horizon, mode="manual",
         )
         log("Trade taken: {} {} {} grade={} prem={} under={}".format(
             sym, dir_, grade, gpts, prem, entry_under))
