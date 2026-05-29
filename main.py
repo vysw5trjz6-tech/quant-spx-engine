@@ -110,7 +110,6 @@ _market_state_lock = threading.Lock()
 
 app = Flask(__name__)
 
-ACCOUNT_SIZE  = int(os.getenv("ACCOUNT_SIZE", "30000"))
 SCAN_INTERVAL = 300
 ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
@@ -488,6 +487,22 @@ def init_db():
         except:
             pass
 
+    # Migrate signals table. The original CREATE only declared a handful of
+    # columns, but db_log_signal inserts several more (entry_under, und_stop,
+    # und_target_t1/t2, signal_type, grade, grade_pts) -- without these the
+    # insert silently failed. Also add the unified-scanner redesign columns
+    # (horizon, tier, product_class, conviction, rationale_json).
+    for col, coltype in [("entry_under","REAL"), ("und_stop","REAL"),
+                          ("und_target_t1","REAL"), ("und_target_t2","REAL"),
+                          ("signal_type","TEXT"), ("grade","TEXT"),
+                          ("grade_pts","INTEGER"), ("horizon","TEXT"),
+                          ("tier","INTEGER"), ("product_class","TEXT"),
+                          ("conviction","REAL"), ("rationale_json","TEXT")]:
+        try:
+            conn.execute("ALTER TABLE signals ADD COLUMN {} {}".format(col, coltype))
+        except:
+            pass
+
     # AI config history
     c.execute("""
         CREATE TABLE IF NOT EXISTS ai_config (
@@ -786,6 +801,14 @@ def db_log_signal(sig):
         else:
             und_stop = und_t1 = und_t2 = None
 
+        rationale = sig.get("rationale")
+        rationale_json = None
+        if rationale is not None:
+            try:
+                rationale_json = json.dumps(rationale)
+            except Exception:
+                rationale_json = None
+
         conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
@@ -793,17 +816,21 @@ def db_log_signal(sig):
             (ts, symbol, direction, price, score, premium, strike, contracts,
              stop, target,
              entry_under, und_stop, und_target_t1, und_target_t2,
-             signal_type, grade, grade_pts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             signal_type, grade, grade_pts,
+             horizon, tier, product_class, conviction, rationale_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(pytz.utc).isoformat(),
             sig.get("symbol"), direction,
             sig.get("price"),  sig.get("score"),
             sig.get("premium"), str(sig.get("strike","")),
-            sig.get("contracts"), sig.get("stop"), sig.get("target"),
+            None,               # contracts: position size no longer modeled
+            sig.get("stop"), sig.get("target"),
             sig.get("price"),   # entry_under = underlying price at signal time
             und_stop, und_t1, und_t2,
             sig.get("signal_type"), sig.get("grade"), sig.get("grade_pts"),
+            sig.get("horizon"), sig.get("tier"), sig.get("product_class"),
+            sig.get("conviction"), rationale_json,
         ))
         conn.commit()
         conn.close()
@@ -853,7 +880,10 @@ def db_close_trade(trade_id, exit_price, outcome):
             conn.close()
             return
         premium, contracts = row
-        pnl    = (exit_price - premium) * 100 * contracts
+        # Per-contract P&L. Position size is no longer part of the model, so
+        # P&L is always expressed on a single-contract basis (contracts may be
+        # NULL on new rows). r_mult is already size-independent.
+        pnl    = (exit_price - premium) * 100
         r_mult = (exit_price - premium) / (premium * 0.45)
         c.execute("""
             UPDATE trades SET outcome=?, exit_price=?, pnl=?, r_mult=?
@@ -1571,7 +1601,7 @@ def relative_strength(symbol_change, spy_change):
 
 def confluence_grade(breakout_strength, vol_ratio, vol_mult,
                      gap_pct, gap_direction, rs, direction,
-                     et_hour, symbol=None, spot_price=None):
+                     et_hour, symbol=None, spot_price=None, conviction=1.0):
     """
     Scores 0-100 across 5 factors using AI-tunable weights from SCANNER_CONFIG.
 
@@ -1774,6 +1804,13 @@ def confluence_grade(breakout_strength, vol_ratio, vol_mult,
 
     breakdown["edge_total"] = edge_pts
     pts += edge_pts
+
+    # Conviction weight (regime x GEX). A score weight, not a position size:
+    # favorable backdrops (>1) lift the grade, hostile ones (<1) damp it.
+    if conviction and conviction != 1.0:
+        pts = int(pts * conviction)
+    breakdown["conviction"] = conviction
+
     pts = max(0, min(pts, 100))
     breakdown["final_pts"] = pts
 
@@ -2462,27 +2499,34 @@ def nearest_fib(price, levels):
 # RISK ENGINE
 # =============================================
 
-def calculate_contracts(premium, score=80):
-    risk_pct  = 0.05 if score >= 85 else 0.03 if score >= 75 else 0.02
-    risk      = ACCOUNT_SIZE * risk_pct
-    max_loss  = premium * 100 * 0.45
-    if max_loss <= 0:
-        return 0, 0, 0
-    contracts = max(1, int(risk // max_loss))
+def option_risk_levels(premium):
+    """Option-premium stop / target for a single contract.
 
-    # --- Apply regime / GEX size multiplier ---
+    Position size is no longer part of the model, so this only returns the
+    premium-based exit levels (stop ~45% below, target ~40% above) the scanner
+    previously bundled into calculate_contracts. Returns (stop, target).
+    """
+    if not premium or premium <= 0:
+        return None, None
+    return round(premium * 0.55, 2), round(premium * 1.4, 2)
+
+
+def current_conviction():
+    """Regime x GEX conviction weight (replaces the old size multiplier).
+
+    This is a *score weight*, not a position size: a value >1 means the active
+    regime / gamma backdrop favors the setup, <1 means it's hostile. Computed
+    from the shared market state so every signal in a scan shares one value.
+    """
     with _market_state_lock:
         regime   = _market_state.get("regime")
         gex_bias = _market_state.get("gex_bias")
-    mult = 1.0
+    conv = 1.0
     if regime and regime.get("rules"):
-        mult *= regime["rules"].get("size_multiplier", 1.0)
+        conv *= regime["rules"].get("conviction_multiplier", 1.0)
     if gex_bias:
-        mult *= gex_bias.get("size_mult", 1.0)
-    if mult != 1.0:
-        contracts = max(1, int(round(contracts * mult)))
-
-    return contracts, round(premium * 0.55, 2), round(premium * 1.4, 2)
+        conv *= gex_bias.get("conviction_mult", 1.0)
+    return conv
 
 
 # =============================================
@@ -2502,7 +2546,7 @@ def scan_all_symbols():
     # Strategy enable/disable matrix (defaults to all-on if regime missing)
     strat_rules = {
         "orb": True, "vwap_trend": True, "vwap_mr": True, "ib_extension": True,
-        "size_multiplier": 1.0,
+        "conviction_multiplier": 1.0,
     }
     if regime and "rules" in regime:
         strat_rules.update(regime["rules"])
@@ -2513,13 +2557,17 @@ def scan_all_symbols():
             strat_rules["vwap_trend"] = False
         elif gex_bias.get("tape_bias") == "STRONG_TREND":
             strat_rules["vwap_mr"]    = False
-        # Size multiplier compounds with regime
-        strat_rules["size_multiplier"] *= gex_bias.get("size_mult", 1.0)
+        # Conviction weight compounds with regime
+        strat_rules["conviction_multiplier"] *= gex_bias.get("conviction_mult", 1.0)
+
+    # One conviction weight shared by every signal in this scan (score weight,
+    # not position size).
+    scan_conviction = strat_rules.get("conviction_multiplier", 1.0)
 
     if regime:
-        _regime_line = "Regime: {} (VIX {}) | size x{:.2f} | {}".format(
+        _regime_line = "Regime: {} (VIX {}) | conviction x{:.2f} | {}".format(
             regime.get("regime"), regime.get("vix"),
-            strat_rules["size_multiplier"], regime.get("note", ""))
+            strat_rules["conviction_multiplier"], regime.get("note", ""))
         if regime.get("vix") is None:
             # Throttle: only log on transition into / out of "VIX unavailable"
             # so the warn doesn't repeat every 5-min scan.
@@ -2565,8 +2613,10 @@ def scan_all_symbols():
             strat_rules[k] = True
         # Drop the regime penalty -- the unlock IS our expansion confirmation.
         strat_rules.pop("score_penalty_trend", None)
-        # Bump size back to LOW_VOL baseline once expansion is confirmed.
-        strat_rules["size_multiplier"] = max(strat_rules.get("size_multiplier", 1.0), 0.85)
+        # Bump conviction back to LOW_VOL baseline once expansion is confirmed.
+        strat_rules["conviction_multiplier"] = max(
+            strat_rules.get("conviction_multiplier", 1.0), 0.85)
+        scan_conviction = strat_rules["conviction_multiplier"]
 
     # Broad market alignment
     spy_chg_global = get_spy_change()
@@ -2596,6 +2646,8 @@ def scan_all_symbols():
             "market_bias": market_bias, "aligned": True,
             "key_levels": [], "clear_air": None, "rec_contract": None,
             "t1_prob": 50, "t2_prob": 25, "signal_type": "ORB",
+            "horizon": "INTRADAY", "tier": 0, "product_class": "ETF",
+            "conviction": scan_conviction,
         }
 
         intraday = get_intraday(symbol)
@@ -2814,7 +2866,7 @@ def scan_all_symbols():
                 grade, grade_pts, grade_color, _grade_bd = confluence_grade(
                     breakout_strength, vol_ratio, vol_mult,
                     gap_pct, gap_dir, rs, direction, et_hour,
-                    symbol=symbol, spot_price=price)
+                    symbol=symbol, spot_price=price, conviction=scan_conviction)
 
                 # Alt strategies get a slight grade bump for passing their own filters
                 grade_pts = min(grade_pts + 5, 100)
@@ -2867,10 +2919,9 @@ def scan_all_symbols():
                     zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
 
                 if premium and is_live:
-                    contracts, stp, tgt = calculate_contracts(premium, score)
+                    stp, tgt = option_risk_levels(premium)
                     result["premium"]   = round(premium, 2)
                     result["strike"]    = strike
-                    result["contracts"] = contracts
                     result["stop"]      = stp
                     result["target"]    = tgt
                     result["dte_label"] = dte_label or "0DTE"
@@ -2952,7 +3003,7 @@ def scan_all_symbols():
         grade, grade_pts, grade_color, _grade_bd = confluence_grade(
             breakout_strength, vol_ratio, vol_mult,
             gap_pct, gap_dir, rs, direction, et_hour,
-            symbol=symbol, spot_price=price)
+            symbol=symbol, spot_price=price, conviction=scan_conviction)
 
         # Regime penalty on ORB during COMPRESSED -- enabled but harder to fire.
         # IB-extension breakout override (set earlier in scan_all_symbols) waives
@@ -3045,10 +3096,9 @@ def scan_all_symbols():
             zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
 
         if premium and is_live:
-            contracts, stp, tgt = calculate_contracts(premium, score)
+            stp, tgt = option_risk_levels(premium)
             result["premium"]   = round(premium, 2)
             result["strike"]    = strike
-            result["contracts"] = contracts
             result["stop"]      = stp
             result["target"]    = tgt
             result["dte_label"] = dte_label or "0DTE"
@@ -3156,14 +3206,15 @@ def run_signal_scan():
                 earn_warning = "\n\n⚠️ {}".format(sig["earnings_warning"])
 
             msg = (
-                "{sig_type} SIGNAL — {grade} ({gpts}pts)\n\n"
+                "{sig_type} {horizon} SIGNAL — {grade} ({gpts}pts)\n\n"
                 "{sym} {dirn}  •  ${price}\n"
                 "Strike: {strike}  •  Premium: ${prem}\n"
-                "{con}x  •  Stop ${stop}  •  Target ${target}\n\n"
+                "Stop ${stop}  •  Target ${target}  •  conv x{conv:.2f}\n\n"
                 "Gap: {gap}%  •  RS vs SPY: {rs}%\n"
                 "Vol: {vol_lbl}{ctx}{ew}"
             ).format(
                 sig_type   = sig.get("signal_type", "ORB"),
+                horizon    = sig.get("horizon", "INTRADAY"),
                 grade      = sig.get("grade", "?"),
                 gpts       = sig.get("grade_pts", "?"),
                 sym        = sig["symbol"],
@@ -3171,9 +3222,9 @@ def run_signal_scan():
                 price      = sig["price"],
                 strike     = sig["strike"],
                 prem       = sig["premium"],
-                con        = sig["contracts"],
                 stop       = sig["stop"],
                 target     = sig["target"],
+                conv       = sig.get("conviction", 1.0) or 1.0,
                 gap        = sig.get("gap_pct", "?"),
                 rs         = sig.get("rs", "?"),
                 vol_lbl    = sig.get("vol_ratio") or "?",
@@ -5955,7 +6006,7 @@ def run_premarket_brief():
             msg_lines.append("  ✓ " + ", ".join(enabled))
         if disabled:
             msg_lines.append("  ✗ " + ", ".join(disabled))
-        msg_lines.append("  Size mult: x{:.2f}".format(rules.get("size_multiplier", 1.0)))
+        msg_lines.append("  Conviction: x{:.2f}".format(rules.get("conviction_multiplier", 1.0)))
         msg_lines.append("")
 
     # Top IVR for earnings IV crush. Tag with VRP ratio so we can see at a
@@ -6625,10 +6676,9 @@ def render_dashboard(toast=""):
             prem     = s.get("premium", "-")
             stp_opt  = s.get("stop", "-")
             tgt_opt  = s.get("target", "-")
-            con      = s.get("contracts", 1)
-            take_url = ("/take?sym={}&dir={}&prem={}&con={}&stp={}&tgt={}"
+            take_url = ("/take?sym={}&dir={}&prem={}&stp={}&tgt={}"
                         "&grade={}&gpts={}&gap={:.2f}&gdir={}&rs={:.2f}").format(
-                sym, d, prem, con, stp_opt, tgt_opt,
+                sym, d, prem, stp_opt, tgt_opt,
                 grade, grade_pts, gap_pct, gap_dir, rs)
             option_section = """
       <div style='display:flex;align-items:center;justify-content:space-between;
@@ -6642,14 +6692,14 @@ def render_dashboard(toast=""):
           </div>
           <div style='font-size:18px;font-weight:700;font-family:monospace'>${prem}</div>
           <div style='font-size:10px;color:#8b949e;margin-top:2px'>
-            Stop ${sopt} &nbsp;|&nbsp; Target ${topt} &nbsp;|&nbsp; {con}x contracts
+            Stop ${sopt} &nbsp;|&nbsp; Target ${topt}
           </div>
         </div>
         <a href='{url}' style='background:#238636;color:#fff;padding:10px 20px;
            border-radius:6px;text-decoration:none;font-size:13px;font-weight:700;
            letter-spacing:.3px;white-space:nowrap'>LOG TRADE</a>
       </div>""".format(
-                prem=prem, sopt=stp_opt, topt=tgt_opt, con=con,
+                prem=prem, sopt=stp_opt, topt=tgt_opt,
                 url=take_url, dte_lbl=dte_lbl, dte_color=dte_color)
         else:
             option_section = """
@@ -6844,7 +6894,8 @@ def render_dashboard(toast=""):
                 move = -move
             # Assumed delta ~0.50 for ATM at entry; gamma scaling ignored.
             est_opt_change = move * 0.50
-            unreal = round(est_opt_change * 100 * t["contracts"], 2)
+            # Per-contract basis (position size no longer modeled).
+            unreal = round(est_opt_change * 100, 2)
         elif cp and t.get("premium"):
             # No entry_under stored (older trade) — display dash
             pass
@@ -6860,7 +6911,6 @@ def render_dashboard(toast=""):
             "<td style='padding:9px 10px;font-weight:700'>{sym}</td>"
             "<td style='padding:9px 6px;color:{dc}'>{dir}</td>"
             "<td style='padding:9px 6px;font-family:monospace'>${prem}</td>"
-            "<td style='padding:9px 6px'>{con}x</td>"
             "<td style='padding:9px 6px'>{unreal}</td>"
             "<td style='padding:9px 6px'>"
             "<a href='/close?id={id}&outcome=WIN&exit={cp}' "
@@ -6873,7 +6923,7 @@ def render_dashboard(toast=""):
             "font-weight:600'>LOSS</a>"
             "</td></tr>"
         ).format(sym=t["symbol"], dc=dc, dir=t["direction"],
-                 prem=t["premium"], con=t["contracts"],
+                 prem=t["premium"],
                  unreal=us, id=t["id"], cp=cp or 0)
 
     # - Closed trades rows -
@@ -7117,7 +7167,7 @@ def render_dashboard(toast=""):
         open_content=(
             "<table class='trade-table'>"
             "<tr><th>Symbol</th><th>Dir</th><th>Entry</th>"
-            "<th>Size</th><th>Unreal P&amp;L</th><th>Close</th></tr>"
+            "<th>Unreal P&amp;L</th><th>Close</th></tr>"
             + open_rows + "</table>"
             if not no_open else
             "<div class='empty'>No open trades</div>"
@@ -7153,7 +7203,6 @@ def take_trade():
     sym   = request.args.get("sym", "")
     dir_  = request.args.get("dir", "")
     prem  = request.args.get("prem", "0")
-    con   = request.args.get("con", "1")
     stp   = request.args.get("stp", "0")
     tgt   = request.args.get("tgt", "0")
     grade = request.args.get("grade", None)
@@ -7172,7 +7221,7 @@ def take_trade():
             pass
 
         db_log_trade(
-            sym, dir_, float(prem), int(con), float(stp), float(tgt),
+            sym, dir_, float(prem), None, float(stp), float(tgt),
             grade=grade,
             grade_pts=int(float(gpts)) if gpts else None,
             gap_pct=float(gap) if gap else None,
@@ -7185,10 +7234,10 @@ def take_trade():
             sym, dir_, grade, gpts, prem, entry_under))
         send_telegram(
             "TRADE TAKEN\n{} {} | Grade: {} ({}pts)\n"
-            "Entry: ${} | {}x | Stop: ${} | Target: ${}\n"
+            "Entry: ${} | Stop: ${} | Target: ${}\n"
             "Gap: {}% {} | RS vs SPY: {}%".format(
                 sym, dir_, grade or "?", gpts or "?",
-                prem, con, stp, tgt,
+                prem, stp, tgt,
                 gap or "?", gdir or "?", rs or "?"))
     except Exception as e:
         log("Take trade error: {}".format(e))
@@ -7751,9 +7800,9 @@ def _build_scanner_context():
     open_lines = []
     for t in open_t:
         open_lines.append(
-            "  #{id} {sym} {d} | Entry:${e} x{c} | Stop:${stp} Target:${tgt}".format(
+            "  #{id} {sym} {d} | Entry:${e} | Stop:${stp} Target:${tgt}".format(
                 id=t["id"], sym=t["symbol"], d=t["direction"],
-                e=t["premium"], c=t["contracts"],
+                e=t["premium"],
                 stp=t["stop"], tgt=t["target"]))
 
     # Market

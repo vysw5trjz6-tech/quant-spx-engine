@@ -50,8 +50,10 @@ ORB_BARS = 6
 
 # Strategy parameters
 RISK_MULTIPLIER      = 2.0    # profit target in R
-RISK_PERCENT         = 0.01   # 1% account risk per trade
-ACCOUNT_SIZE         = int(os.getenv("ACCOUNT_SIZE", "30000"))
+# Fixed nominal share count for cost/slippage modeling only. Position sizing
+# is no longer part of the model (no account size), so the backtest measures
+# per-trade R-multiples and cost drag on a constant nominal size.
+NOMINAL_SHARES       = 100
 VOL_CONFIRM_MULT     = 1.5    # breakout bar volume must be > 1.5x recent avg
 GAP_FILTER_PCT       = 0.015  # skip days with opening gap > 1.5%
 LATE_ENTRY_CUTOFF    = "11:30"  # no new entries after this ET time
@@ -183,14 +185,6 @@ def calculate_atr(daily_bars, period=14):
     return statistics.mean(trs[-period:])
 
 
-def position_size_atr(account_size, risk_percent, atr):
-    """Size position so 1 ATR move = risk_percent of account."""
-    if not atr or atr <= 0:
-        return 0
-    risk_amount = account_size * risk_percent
-    return round(risk_amount / atr, 2)
-
-
 # =============================================
 # CORE ORB BACKTEST ENGINE
 # =============================================
@@ -226,10 +220,10 @@ def backtest_symbol(symbol, all_bars_5min, all_bars_daily):
             prev_close = daily_closes.get(date_str, prev_close)
             continue
 
-        # ATR-based sizing: use daily bars up to this date
+        # ATR (still used for diagnostics); fixed nominal size for cost modeling.
         past_daily = [b for b in daily_list if b["t"][:10] < date_str]
         atr        = calculate_atr(past_daily) if len(past_daily) >= 15 else None
-        size       = position_size_atr(ACCOUNT_SIZE, RISK_PERCENT, atr) if atr else 100
+        size       = NOMINAL_SHARES
 
         # Define ORB using first 30 min
         orb        = day_bars[:ORB_BARS]

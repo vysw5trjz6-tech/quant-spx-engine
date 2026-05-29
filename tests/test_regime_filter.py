@@ -13,8 +13,8 @@ def test_compressed_no_longer_hard_disables_trend_strats():
     assert rules["vwap_trend"]     is True
     assert rules["vwap_mr"]        is True
     assert rules["ib_extension"]   is True
-    # Half size still applies; bleed in low IV is real
-    assert rules["size_multiplier"] == 0.5
+    # Low conviction still applies; bleed in low IV is real
+    assert rules["conviction_multiplier"] == 0.5
     # New: raises the bar for trend signals to fire
     assert rules.get("score_penalty_trend", 0) >= 10
 
@@ -62,10 +62,10 @@ def test_apply_expansion_override_only_acts_on_compressed(monkeypatch):
     }
     out = rf.apply_expansion_override(regime, gap_pct_abs=0.25, symbol="SPY")
     assert out["expansion_watch"] is True
-    # Rules now match LOW_VOL (trend strats fully on, size 0.85)
+    # Rules now match LOW_VOL (trend strats fully on, conviction 0.85)
     assert out["rules"]["orb"]              is True
     assert out["rules"]["vwap_trend"]       is True
-    assert out["rules"]["size_multiplier"]  == rf.REGIME_STRATEGY_RULES["LOW_VOL"]["size_multiplier"]
+    assert out["rules"]["conviction_multiplier"]  == rf.REGIME_STRATEGY_RULES["LOW_VOL"]["conviction_multiplier"]
     # Score penalty should not survive into LOW_VOL rules
     assert "score_penalty_trend" not in out["rules"]
     assert "EXPANSION_WATCH" in out["note"]
