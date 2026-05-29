@@ -86,6 +86,27 @@ except ImportError as _e:
     HAS_OPT_FLOW = False
     print("[init] options_flow unavailable: {}".format(_e))
 
+try:
+    import targets as targets_mod
+    HAS_TARGETS = True
+except ImportError as _e:
+    HAS_TARGETS = False
+    print("[init] targets unavailable: {}".format(_e))
+
+try:
+    import key_levels as key_levels_mod
+    HAS_KEY_LEVELS = True
+except ImportError as _e:
+    HAS_KEY_LEVELS = False
+    print("[init] key_levels unavailable: {}".format(_e))
+
+try:
+    import scanner_core
+    HAS_SCANNER_CORE = True
+except ImportError as _e:
+    HAS_SCANNER_CORE = False
+    print("[init] scanner_core unavailable: {}".format(_e))
+
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
 # Default is premarket since most users only need a morning brief.
@@ -113,18 +134,26 @@ app = Flask(__name__)
 SCAN_INTERVAL = 300
 ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
-SYMBOLS = [
-    # Index ETFs
-    "SPY", "QQQ",
-    # Leveraged ETFs (3x) -- 0DTE only, never swing (decay + gappy IV)
-    "TQQQ", "SOXL",
-    # Mega-cap tech
-    "AAPL", "NVDA", "TSLA", "AMD", "META", "MSFT", "AMZN",
-    # AI infrastructure (datacenter compute, power, cooling, networking)
-    "AVGO", "INTC", "LRCX", "CRWV", "GEV", "VRT", "ANET",
-]
+# =============================================
+# PRODUCT TIERING (see scanner redesign)
+#   INDEX (SPX/NDX)  -> context only, no signal cards (no cash-index options)
+#   ETF   (SPY/QQQ)  -> BOTH weekly and intraday/0DTE
+#   STOCK (~70 names) -> weekly only
+# =============================================
+ETF_PRODUCTS   = ["SPY", "QQQ"]            # weekly + intraday/0DTE
+INDEX_PRODUCTS = ["SPX", "NDX"]            # context only (display level + RS)
 
-# Broader universe for swing scanner - liquid, optionable stocks
+# Intraday / 0DTE tradeable universe = ETFs only. Leveraged ETFs and mega-caps
+# that used to live here now appear only in the weekly stock tier.
+INTRADAY_SYMBOLS = list(ETF_PRODUCTS)
+
+# Back-compat alias for the several aux paths (earnings prefetch, digests) that
+# iterate SYMBOLS + SWING_SYMBOLS over the full coverage set.
+SYMBOLS = list(ETF_PRODUCTS)
+
+# Broader universe for the WEEKLY scanner - liquid, optionable stocks.
+# SPY/QQQ are intentionally NOT here (they are ETF_PRODUCTS); leveraged ETFs
+# (TQQQ/SOXL) are excluded from weekly due to decay.
 SWING_UNIVERSE = [
     # Mega-cap tech
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD", "AVGO", "CRM",
@@ -140,12 +169,13 @@ SWING_UNIVERSE = [
     "XOM", "CVX", "OXY", "SLB", "CAT", "DE", "HON", "RTX", "LMT", "GE",
     # Consumer & retail
     "COST", "WMT", "HD", "NKE", "SBUX", "MCD", "TGT", "LULU", "DECK", "RH",
-    # ETFs with strong options
-    "SPY", "QQQ", "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
+    # Non-index ETFs with strong options
+    "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
 ]
 
+# The weekly tier scans the ETF products PLUS the stock universe.
 # Alias used by run_swing_scan  [FIX 1: confirmed -- ensures symbol list is found]
-SWING_SYMBOLS = SWING_UNIVERSE
+SWING_SYMBOLS = ETF_PRODUCTS + SWING_UNIVERSE
 
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
@@ -1169,6 +1199,49 @@ def get_4hr_bars(symbol):
 
 def get_current_price(symbol):
     return data_fetcher.get_current_price(symbol)
+
+
+# SPX/NDX have no tradable feed here (Alpaca carries ETF options only), so we
+# derive their levels from the ETF proxies for trend / RS context only.
+INDEX_PROXY = {
+    "SPX": ("SPY", 10.0),    # SPX ~= SPY x 10
+    "NDX": ("QQQ", 41.0),    # NDX ~= QQQ x ~41 (approx; labeled as proxy)
+}
+
+
+def index_context():
+    """Display-only SPX/NDX context: derived level + intraday % change + RS.
+
+    Never produces a tradable signal. The numbers come from the SPY/QQQ proxies
+    so the dashboard / chat can frame index direction without an index feed.
+    Returns a list of dicts, one per index product.
+    """
+    out = []
+    try:
+        spy_chg = get_spy_change()
+    except Exception:
+        spy_chg = 0.0
+    for idx in INDEX_PRODUCTS:
+        proxy, factor = INDEX_PROXY.get(idx, (None, None))
+        if not proxy:
+            continue
+        try:
+            px = get_current_price(proxy)
+            bars = get_intraday(proxy)
+            chg = get_symbol_change(bars)
+            level = round(px * factor, 2) if px else None
+            out.append({
+                "symbol":   idx,
+                "proxy":    proxy,
+                "level":    level,
+                "pct":      chg,
+                "rs":       relative_strength(chg, spy_chg),
+                "is_proxy": True,
+            })
+        except Exception:
+            out.append({"symbol": idx, "proxy": proxy, "level": None,
+                        "pct": None, "rs": None, "is_proxy": True})
+    return out
 
 
 # =============================================
@@ -2366,6 +2439,111 @@ def get_liquid_option(symbol, direction, underlying_price=None,
     return None, None, False, None
 
 
+def current_week_expiry(now_et=None, zero_dte_cutoff=None):
+    """The weekly tier's expiry: THIS week's Friday settlement, ridden all week.
+
+    Returns (date_str, dte). Monday -> this Friday (~4 DTE), counting down to
+    0DTE on Friday itself, then rolls to next Friday. This keeps weekly alerts
+    pinned to one settlement for the whole week instead of emitting a fresh
+    7-days-out contract every day. On Friday past the 0DTE cutoff (or over the
+    weekend) it rolls forward to next Friday.
+    """
+    import datetime as _dt
+    et = pytz.timezone("America/New_York")
+    now = now_et or datetime.now(et)
+    today = now.date()
+    wd = today.weekday()                 # Mon=0 .. Sun=6
+    days_ahead = (4 - wd) % 7            # this week's Friday (0 if today is Fri)
+    friday = today + _dt.timedelta(days=days_ahead)
+
+    cutoff = zero_dte_cutoff if zero_dte_cutoff is not None else 14.5
+    et_hour = now.hour + now.minute / 60.0
+    # Friday after the cutoff: this week's settlement is effectively done --
+    # roll to next Friday so we don't keep firing a dead 0DTE.
+    if wd == 4 and et_hour >= cutoff:
+        friday = friday + _dt.timedelta(days=7)
+
+    dte = (friday - today).days
+    return friday.strftime("%Y-%m-%d"), dte
+
+
+def get_swing_option(symbol, direction, underlying_price=None):
+    """ATM-ish (~0.40 delta) option on the current-week Friday settlement.
+
+    The weekly tier's option picker. Mirrors get_liquid_option's Alpaca
+    snapshot machinery but targets a single fixed expiry (current_week_expiry)
+    so a weekly signal rides one contract through the week.
+
+    Returns (premium, strike, is_live, dte_label).
+    """
+    import datetime as _dt
+
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return None, None, False, None
+
+    cfg = get_config()
+    expiry_str, dte = current_week_expiry(
+        zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
+    dte_label = "{}DTE".format(dte) if dte > 0 else "0DTE"
+
+    option_type = "call" if direction == "CALL" else "put"
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
+
+    params = {
+        "feed":            "indicative",
+        "expiration_date": expiry_str,
+        "type":            option_type,
+        "limit":           50,
+    }
+    if underlying_price:
+        params["strike_price_gte"] = round(underlying_price * 0.94, 2)
+        params["strike_price_lte"] = round(underlying_price * 1.06, 2)
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        if r.status_code != 200:
+            return None, None, False, None
+        snapshots = r.json().get("snapshots", {}) or {}
+
+        candidates = []
+        for contract_sym, snap in snapshots.items():
+            try:
+                strike = int(contract_sym[-8:]) / 1000.0
+            except Exception:
+                continue
+            quote = snap.get("latestQuote") or {}
+            bid   = float(quote.get("bp") or 0)
+            ask   = float(quote.get("ap") or 0)
+            if bid > 0 and ask > 0:
+                mid = round((bid + ask) / 2, 2)
+            elif ask > 0:
+                mid = round(ask, 2)
+            else:
+                continue
+            if not (0.05 <= mid <= 50.00):
+                continue
+            greeks = snap.get("greeks") or {}
+            delta  = abs(float(greeks.get("delta") or 0))
+            candidates.append({"strike": strike, "price": mid, "delta": delta})
+
+        if not candidates:
+            return None, None, False, dte_label
+
+        if any(c["delta"] > 0 for c in candidates):
+            candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
+        elif underlying_price:
+            candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
+        best = candidates[0]
+        return best["price"], best["strike"], True, dte_label
+    except Exception as e:
+        log("Swing option exception {} {}: {}".format(symbol, expiry_str, e))
+        return None, None, False, None
+
+
 # =============================================
 # SWING ENGINE -- DATA FETCHERS
 # =============================================
@@ -2600,8 +2778,8 @@ def scan_all_symbols():
             log(_gex_line)
 
     # Warm all bar caches in parallel before the per-symbol loop.
-    # SYMBOLS + SPY/QQQ for the market-alignment block below.
-    data_fetcher.prefetch_symbols(list(set(SYMBOLS) | {"SPY", "QQQ"}))
+    # Intraday ETF universe + SPY/QQQ for the market-alignment block below.
+    data_fetcher.prefetch_symbols(list(set(INTRADAY_SYMBOLS) | {"SPY", "QQQ"}))
 
     # IB-extension unlock: if SPY has cleanly broken its 30-min initial balance
     # with volume confirmation, re-enable ORB/vwap_trend/ib_extension at full
@@ -2632,7 +2810,7 @@ def scan_all_symbols():
         market_bias = "MIXED"
     log("Market bias: {} | SPY {:.2f}% QQQ {:.2f}%".format(market_bias, spy_chg_global, qqq_chg))
 
-    for symbol in SYMBOLS:
+    for symbol in INTRADAY_SYMBOLS:
         result = {
             "symbol": symbol, "direction": None, "score": 0,
             "grade": None, "grade_pts": 0, "grade_color": "#8b949e",
@@ -4712,7 +4890,7 @@ def scan_swing_symbol(symbol):
 
         direction = best["direction"]
         tier      = best["tier"]
-        opt = get_swing_option(symbol, direction, current, days_out=14) if tier == 1 else None
+        opt = get_swing_option(symbol, direction, current) if tier == 1 else None
 
         exts = best.get("extend", {})
         if direction == "CALL":
@@ -4721,28 +4899,86 @@ def scan_swing_symbol(symbol):
             above = sorted([(r, v) for r, v in exts.items() if v < current],
                            key=lambda x: x[1], reverse=True)
 
+        # Fib-extension targets (the legacy basis, also fed to the blend below).
         t1 = above[0][1] if len(above) >= 1 else None
         t2 = above[1][1] if len(above) >= 2 else None
         t3 = above[2][1] if len(above) >= 3 else None
 
         stop = (best.get("retrace", {}).get(0.618)
                 or round(current * (0.96 if direction == "CALL" else 1.04), 2))
+
+        # --- Weekly expected-move / Fibonacci blend (current-week settlement) ---
+        week_expiry, dte = current_week_expiry(
+            zero_dte_cutoff=get_config().get("zero_dte_cutoff_hour", 14.5))
+        atm_iv = expected_move = None
+        target_basis = "FIB"
+        t1_prob = t2_prob = None
+        if HAS_KEY_LEVELS:
+            try:
+                kl = key_levels_mod.get_key_levels(
+                    symbol, daily_bars=daily, spot=current,
+                    direction=direction, week_expiry=week_expiry, dte=dte)
+                atm_iv        = kl.atm_iv
+                expected_move = kl.expected_move_1sd
+            except Exception:
+                pass
+        if HAS_TARGETS:
+            try:
+                tg = targets_mod.compute_price_targets(
+                    current, direction, "WEEKLY", iv=atm_iv, dte=dte,
+                    fib_extend=best.get("extend", {}),
+                    fib_retrace=best.get("retrace", {}))
+                if tg:
+                    if tg.get("t1") is not None:
+                        t1 = tg["t1"]
+                    if tg.get("t2") is not None:
+                        t2 = tg["t2"]
+                    if tg.get("stop") is not None:
+                        stop = tg["stop"]
+                    t1_prob       = tg.get("t1_prob")
+                    t2_prob       = tg.get("t2_prob")
+                    target_basis  = tg.get("basis", target_basis)
+                    expected_move = tg.get("expected_move_1sd", expected_move)
+            except Exception:
+                pass
+
         rr1  = round(abs(t1 - current) / abs(current - stop), 2) if (
             t1 and stop and abs(current - stop) > 0) else 0
 
-        return {
+        product_class = "ETF" if symbol in ETF_PRODUCTS else "STOCK"
+
+        # Map directional targets onto the und_call_*/und_put_* keys so
+        # db_log_signal and the paper trader can persist them.
+        und_keys = {}
+        if direction == "CALL":
+            und_keys = {"und_call_t1": t1, "und_call_t2": t2, "und_call_stop": stop}
+        else:
+            und_keys = {"und_put_t1": t1, "und_put_t2": t2, "und_put_stop": stop}
+
+        sig = {
             "symbol":         symbol,
             "price":          round(current, 2),
             "direction":      direction,
             "tier":           tier,
+            "horizon":        "WEEKLY",
+            "product_class":  product_class,
+            "conviction":     current_conviction(),
             "signal_type":    best["signal_type"],
             "signal_label":   best["signal_label"],
             "prob":           best["prob"],
             "spy_rs":         spy_rs,
+            "rs":             spy_rs,
             "t1":             t1,
             "t2":             t2,
             "t3":             t3,
-            "stop":           round(stop, 2),
+            "stop":           round(stop, 2) if stop is not None else None,
+            "t1_prob":        t1_prob,
+            "t2_prob":        t2_prob,
+            "target_basis":   target_basis,
+            "expected_move":  expected_move,
+            "atm_iv":         atm_iv,
+            "week_expiry":    week_expiry,
+            "dte":            dte,
             "rr1":            rr1,
             "swing_low":      best.get("swing_low"),
             "swing_high":     best.get("swing_high"),
@@ -4760,6 +4996,13 @@ def scan_swing_symbol(symbol):
             "all_types":      [s["signal_type"] for s in all_sigs],
             "option":         opt,
         }
+        sig.update(und_keys)
+        if HAS_SCANNER_CORE:
+            try:
+                sig["rationale"] = scanner_core.build_rationale(sig)
+            except Exception:
+                pass
+        return sig
     except Exception as e:
         log("Swing {} error: {}".format(symbol, e))
         return None
@@ -4965,8 +5208,6 @@ def run_swing_scan():
     results_lock = threading.Lock()
 
     def worker(sym):
-        if sym in ("SPY",):
-            return
         sig = scan_swing_symbol(sym)
         if sig:
             with results_lock:
