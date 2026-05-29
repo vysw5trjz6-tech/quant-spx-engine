@@ -208,6 +208,12 @@ all_swing_signals  = []
 swing_next_scan_at = 0
 swing_lock         = threading.Lock()
 SWING_SCAN_INTERVAL = 900   # 15 min between swing scans
+# Weekly alert dedup: fire one telegram alert per (symbol, direction,
+# week_expiry) so a setup alerts once for the week's settlement and re-arms
+# automatically when the expiry rolls to next Friday. In-memory is fine -- a
+# container restart simply re-alerts the still-active setups once.
+_weekly_alerted     = set()
+_weekly_alert_lock  = threading.Lock()
 
 
 # =============================================
@@ -5243,6 +5249,39 @@ def _log_swing_fetch_err(symbol, kind, detail):
     log("  swing fetch fail [{}] {}: {}".format(kind, symbol, detail))
 
 
+def _send_weekly_alert(sig):
+    """Telegram alert for a weekly tier-1 setup (current-week settlement)."""
+    opt = sig.get("option") or {}
+    rationale = sig.get("rationale") or {}
+    t1, t2 = sig.get("t1"), sig.get("t2")
+    t1p = sig.get("t1_prob")
+    msg = (
+        "{stype} WEEKLY — {sym} {dirn}  •  ${price}\n"
+        "Exp {exp} ({dte}DTE)  •  conv x{conv:.2f}\n"
+        "T1 {t1}{t1p}  •  T2 {t2}  •  Stop {stop}  •  basis {basis}\n"
+        "RS {rs} vs SPY  •  prob {prob}%{prem}{summ}"
+    ).format(
+        stype = sig.get("signal_type", "SWING"),
+        sym   = sig.get("symbol"),
+        dirn  = sig.get("direction"),
+        price = sig.get("price"),
+        exp   = sig.get("week_expiry", "?"),
+        dte   = sig.get("dte", "?"),
+        conv  = sig.get("conviction", 1.0) or 1.0,
+        t1    = t1 if t1 is not None else "-",
+        t1p   = " ({}%)".format(t1p) if t1p is not None else "",
+        t2    = t2 if t2 is not None else "-",
+        stop  = sig.get("stop", "-"),
+        basis = sig.get("target_basis", "FIB"),
+        rs    = sig.get("rs", sig.get("spy_rs", "?")),
+        prob  = sig.get("prob", "?"),
+        prem  = ("\nPremium ${} strike {}".format(opt["premium"], opt.get("strike"))
+                 if opt.get("premium") else ""),
+        summ  = ("\n" + rationale["summary"]) if rationale.get("summary") else "",
+    )
+    send_telegram(msg)
+
+
 def run_unified_scan(do_intraday=False, do_weekly=False):
     """Assemble the unified tiered payload from current scanner state.
 
@@ -5313,6 +5352,27 @@ def run_swing_scan():
         next_swing_scan    = time.time() + SWING_SCAN_INTERVAL
         all_swing_signals  = results
         swing_next_scan_at = next_swing_scan
+
+    # Weekly alerts: one per (symbol, direction, week_expiry). Tier-1 only.
+    # Pinned to the current-week settlement so we never re-fire a setup until
+    # the expiry rolls to next Friday (then it re-arms automatically).
+    for sig in results:
+        if sig.get("tier") != 1:
+            continue
+        key = (sig.get("symbol"), sig.get("direction"), sig.get("week_expiry"))
+        with _weekly_alert_lock:
+            if key in _weekly_alerted:
+                continue
+            _weekly_alerted.add(key)
+        try:
+            db_log_signal(sig)
+        except Exception as e:
+            log("weekly db_log_signal error: {}".format(e))
+        if bot_enabled:
+            try:
+                _send_weekly_alert(sig)
+            except Exception as e:
+                log("weekly alert error: {}".format(e))
 
     # Compact filter-stage breakdown -- tells you WHY a 0-setups scan
     # was 0 (no_data vs earnings_blocked vs no_signal) and which tier-1
