@@ -304,8 +304,22 @@ DEFAULT_CONFIG = {
     "ib_ext_vol_min":           1.2,
 
     # --- Filter strictness ---
-    "counter_trend_allowed":    True,
-    "min_grade":                "C",
+    # Trade WITH the tape: counter-trend setups are suppressed at detection,
+    # and only A/B-grade signals are alerted (C-grade is near-random
+    # confluence -- still scanned/shown on the dashboard, just not alerted).
+    "counter_trend_allowed":    False,
+    "min_grade":                "C",      # dashboard floor (D is suppressed)
+    "alert_min_grade":          "B",      # only A/B grades fire alerts
+    # Anti-chase: skip an intraday breakout once price has already run more
+    # than this fraction of the ORB range past the trigger -- entering
+    # extended is the dominant intraday loss source. Demotes to WATCHING.
+    "max_breakout_extension":   0.6,
+    # Weekly long setups require the broad tape to agree: positive RS vs SPY
+    # and SPY itself in an uptrend (above its 50DMA). Avoids firing CALL-only
+    # weeklies into a falling market.
+    "weekly_require_uptrend":   True,
+    "weekly_min_rs":            0.0,
+    "weekly_max_breakout_age":  3,        # skip breakouts older than N sessions
 
     # --- Clear-air (resistance/support proximity) cap ---
     # Levels within this % of current price are treated as already tested /
@@ -318,12 +332,20 @@ DEFAULT_CONFIG = {
 
     # --- AI state ---
     "ai_insight": "Baseline config -- collecting trade data to begin optimization.",
-    "ai_focus":   "Trade all A/B/C grade signals and log outcomes to build the dataset.",
+    "ai_focus":   "Alert only trend-aligned A/B grade signals; log every scanned setup to build the dataset.",
     "ai_version": 0,
     # ISO-UTC cutoff. Trades logged before this are excluded from AI
     # tuning (set whenever the config is reset to baseline).
     "learning_epoch": "",
 }
+
+# Hard code-level floor for AI training data. The learning_epoch lives in the
+# DB config on the persistent volume and survives redeploys, so a manual reset
+# isn't guaranteed to stick across a deploy. This floor is enforced in addition
+# to learning_epoch (the later of the two wins), guaranteeing the loop never
+# trains on pre-redesign trades whose entry logic no longer exists. Bump this
+# when the signal logic changes materially.
+AI_TRAINING_FLOOR = "2026-05-29T00:00:00+00:00"
 
 # Minimum post-epoch closed trades before the AI may tune anything.
 AI_MIN_TOTAL_SAMPLES = 30
@@ -811,7 +833,10 @@ def db_get_all_closed_trades():
     trustworthy VIX/GEX context and must not influence tuning.
     """
     try:
-        epoch = get_config().get("learning_epoch") or ""
+        # The later of the configured learning_epoch and the hard code-level
+        # training floor wins -- so a stale DB epoch can never reintroduce
+        # pre-floor trades after a redeploy.
+        epoch = max(get_config().get("learning_epoch") or "", AI_TRAINING_FLOOR)
         conn = db_utils.connect(DB_FILE)
         c    = conn.cursor()
         c.execute("""
@@ -3209,7 +3234,26 @@ def scan_all_symbols():
             breakout_strength = (orb_low - price) / orb_low
             result["vs_orb"]  = "-{:.3f}%".format(abs(vs_orb_low))
             result["vs_vwap"] = "-{:.3f}%".format(abs(vs_vwap))
-        else:
+
+        # Anti-chase: an ORB breakout that has already run more than
+        # max_breakout_extension * ORB range past the trigger is a late,
+        # extended entry -- the stop/target geometry no longer holds and these
+        # are a dominant loss source. Demote to WATCHING rather than signal it.
+        if direction and orb_range > 0:
+            _ext = cfg.get("max_breakout_extension", 0.6)
+            if direction == "CALL":
+                _run = price - orb_high
+            else:
+                _run = orb_low - price
+            if _run > orb_range * _ext:
+                result["status"]     = "extended (anti-chase)"
+                result["vs_orb_run"] = round(_run / orb_range, 2)
+                results.append(result)
+                log("{}: SKIP {} extended {:.2f}x ORB past trigger (anti-chase)".format(
+                    symbol, direction, _run / orb_range))
+                continue
+
+        if direction is None:
             # --- No ORB breakout: try alternative strategies ---
             alt_signal = None
 
@@ -3612,6 +3656,20 @@ def run_signal_scan():
     signals  = [r for r in results if r["status"] == "SIGNAL"]
     watching = [r for r in results if r["status"] == "WATCHING"]
 
+    # Alert quality gate: only A/B grades fire (C is near-random confluence --
+    # still scanned and shown on the dashboard, just not alerted). Counter-trend
+    # setups are already suppressed at detection when counter_trend_allowed is
+    # off, but guard on the aligned flag here too as a belt-and-suspenders.
+    _cfg          = get_config()
+    _alert_floor  = _cfg.get("alert_min_grade", "B")
+    _allowed_gr   = {"A": {"A"}, "B": {"A", "B"}, "C": {"A", "B", "C"}}.get(
+        _alert_floor, {"A", "B"})
+    alertable = [s for s in signals
+                 if s.get("grade") in _allowed_gr and s.get("aligned", True)]
+    if signals and not alertable:
+        log("Intraday: {} signal(s) below alert floor {} or counter-trend; "
+            "no alert".format(len(signals), _alert_floor))
+
     # One live INTRADAY position at a time: if the tier is occupied, emit no new
     # intraday alerts until it closes (win/loss on underlying targets).
     intraday_locked = tier_has_open_position("INTRADAY")
@@ -3619,7 +3677,7 @@ def run_signal_scan():
         log("INTRADAY tier locked -- live position open, suppressing alerts")
 
     # Telegram: alert on confirmed signals
-    for sig in (signals if not intraday_locked else []):
+    for sig in (alertable if not intraday_locked else []):
         if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
             if HAS_SCANNER_CORE and "rationale" not in sig:
                 try:
@@ -5071,6 +5129,38 @@ def _check_earnings_iv_crush(symbol):
         return None
 
 
+_market_trend_cache = {"ts": 0, "trend": None}
+
+
+def market_trend():
+    """Broad-tape trend for the weekly directional gate: 'UP'/'DOWN'/'FLAT'.
+
+    SPY close vs its 50-day SMA, with the SMA slope as a tie-breaker. Cached
+    for an hour so the per-symbol weekly sweep doesn't recompute it 70x.
+    """
+    now = time.time()
+    if _market_trend_cache["trend"] and now - _market_trend_cache["ts"] < 3600:
+        return _market_trend_cache["trend"]
+    trend = "FLAT"
+    try:
+        spy = get_daily_extended("SPY", limit=80) or []
+        if len(spy) >= 55:
+            closes = [b["c"] for b in spy]
+            sma50_now  = sum(closes[-50:]) / 50.0
+            sma50_prev = sum(closes[-55:-5]) / 50.0
+            price = closes[-1]
+            if price > sma50_now and sma50_now >= sma50_prev:
+                trend = "UP"
+            elif price < sma50_now and sma50_now <= sma50_prev:
+                trend = "DOWN"
+            else:
+                trend = "FLAT"
+    except Exception:
+        pass
+    _market_trend_cache.update({"ts": now, "trend": trend})
+    return trend
+
+
 def scan_swing_symbol(symbol):
     """
     Tier 1: fully-triggered signals (O'Neil, Wyckoff Spring, 52W, Earnings Cont.)
@@ -5161,6 +5251,47 @@ def scan_swing_symbol(symbol):
 
         direction = best["direction"]
         tier      = best["tier"]
+
+        # Weekly quality gates (tier-1 only). A failed gate downgrades the
+        # setup to tier-2 -- it stays visible on the dashboard as a watch, but
+        # won't alert or auto-open a position (both are tier-1 only).
+        if tier == 1:
+            wcfg        = get_config()
+            min_rs      = wcfg.get("weekly_min_rs", 0.0)
+            max_age     = wcfg.get("weekly_max_breakout_age", 3)
+            gate_reason = None
+
+            # 1) Trade with the broad tape: long setups need positive RS and a
+            #    non-falling market; PUT (earnings) setups need the inverse.
+            if wcfg.get("weekly_require_uptrend", True):
+                mt = market_trend()
+                if direction == "CALL" and (spy_rs < min_rs or mt == "DOWN"):
+                    gate_reason = "counter-trend CALL (RS {:.1f}, tape {})".format(
+                        spy_rs, mt)
+                elif direction == "PUT" and (spy_rs > -min_rs or mt == "UP"):
+                    gate_reason = "counter-trend PUT (RS {:.1f}, tape {})".format(
+                        spy_rs, mt)
+
+            # 2) Don't chase a breakout that already ran days ago (breakout
+            #    detectors only -- earnings 'days_since' means days-since-report).
+            if gate_reason is None and best.get("signal_type") in (
+                    "ONEIL_PIVOT", "WYCKOFF_SPRING", "HI52_BREAKOUT"):
+                age = best.get("days_since")
+                if age is not None and age > max_age:
+                    gate_reason = "stale breakout ({}d old)".format(age)
+
+            # 3) Earnings continuation from a Stage-1 base is a weak entry.
+            if (gate_reason is None
+                    and best.get("signal_type") == "EARNINGS_CONT"
+                    and best.get("stage") == 1):
+                gate_reason = "stage-1 earnings continuation"
+
+            if gate_reason:
+                tier = 2
+                best["tier"] = 2
+                best["gate_reason"] = gate_reason
+                _swing_stats_bump("tier1_gated")
+                log("{}: tier-1 downgraded -> {}".format(symbol, gate_reason))
 
         exts = best.get("extend", {})
         if direction == "CALL":
