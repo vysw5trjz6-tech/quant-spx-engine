@@ -107,6 +107,13 @@ except ImportError as _e:
     HAS_SCANNER_CORE = False
     print("[init] scanner_core unavailable: {}".format(_e))
 
+try:
+    import vol_oi as vol_oi_mod
+    HAS_VOL_OI = True
+except ImportError as _e:
+    HAS_VOL_OI = False
+    print("[init] vol_oi unavailable: {}".format(_e))
+
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
 # Default is premarket since most users only need a morning brief.
@@ -2708,12 +2715,13 @@ def get_swing_option(symbol, direction, underlying_price=None):
     snapshot machinery but targets a single fixed expiry (current_week_expiry)
     so a weekly signal rides one contract through the week.
 
-    Returns (premium, strike, is_live, dte_label).
+    Returns (premium, strike, is_live, dte_label, volume) where volume is the
+    contract's Alpaca daily option volume (None if unavailable).
     """
     import datetime as _dt
 
     if not ALPACA_KEY or not ALPACA_SECRET:
-        return None, None, False, None
+        return None, None, False, None, None
 
     cfg = get_config()
     expiry_str, dte = current_week_expiry(
@@ -2740,7 +2748,7 @@ def get_swing_option(symbol, direction, underlying_price=None):
     try:
         r = requests.get(url, headers=headers, params=params, timeout=10)
         if r.status_code != 200:
-            return None, None, False, None
+            return None, None, False, None, None
         snapshots = r.json().get("snapshots", {}) or {}
 
         candidates = []
@@ -2762,20 +2770,25 @@ def get_swing_option(symbol, direction, underlying_price=None):
                 continue
             greeks = snap.get("greeks") or {}
             delta  = abs(float(greeks.get("delta") or 0))
-            candidates.append({"strike": strike, "price": mid, "delta": delta})
+            # Alpaca daily option volume (the field the quote-only picker used
+            # to ignore) -- the volume side of the vol/OI confluence check.
+            day    = snap.get("dailyBar") or {}
+            vol    = day.get("v")
+            candidates.append({"strike": strike, "price": mid, "delta": delta,
+                               "volume": int(vol) if vol is not None else None})
 
         if not candidates:
-            return None, None, False, dte_label
+            return None, None, False, dte_label, None
 
         if any(c["delta"] > 0 for c in candidates):
             candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
         elif underlying_price:
             candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
         best = candidates[0]
-        return best["price"], best["strike"], True, dte_label
+        return best["price"], best["strike"], True, dte_label, best.get("volume")
     except Exception as e:
         log("Swing option exception {} {}: {}".format(symbol, expiry_str, e))
-        return None, None, False, None
+        return None, None, False, None, None
 
 
 # =============================================
@@ -5206,22 +5219,39 @@ def scan_swing_symbol(symbol):
         # dict the dashboard/renderers expect; premium-stop/target are
         # size-free per-contract levels.
         opt = None
+        opt_volume = None
+        opt_strike = None
         if tier == 1:
-            prem, strike, is_live, dte_label = get_swing_option(
+            prem, opt_strike, is_live, dte_label, opt_volume = get_swing_option(
                 symbol, direction, current)
             if prem and is_live:
                 opt = {
                     "premium": prem,
-                    "strike":  strike,
+                    "strike":  opt_strike,
                     "expiry":  week_expiry,
                     "dte":     dte,
                     "delta":   0.40,
                     "iv":      round(atm_iv * 100, 1) if atm_iv else 0,
+                    "volume":  opt_volume,
                     "bid":     "-",
                     "ask":     "-",
                 }
 
         product_class = "ETF" if symbol in ETF_PRODUCTS else "STOCK"
+
+        # Volume-vs-OI confluence on the weekly contract (Alpaca volume x
+        # Databento OI). SPY/QQQ already have OI from the daily GEX pipeline;
+        # for tier-1 stock setups allow an on-demand cached OI sweep.
+        vol_oi = None
+        if HAS_VOL_OI and tier == 1 and opt_strike is not None:
+            try:
+                vol_oi = vol_oi_mod.compute_vol_oi(
+                    symbol, opt_strike, week_expiry,
+                    "call" if direction == "CALL" else "put",
+                    alpaca_volume=opt_volume,
+                    allow_fetch=(product_class == "STOCK"))
+            except Exception as e:
+                log("vol_oi error {}: {}".format(symbol, e))
 
         # Map directional targets onto the und_call_*/und_put_* keys so
         # db_log_signal and the paper trader can persist them.
@@ -5230,6 +5260,12 @@ def scan_swing_symbol(symbol):
             und_keys = {"und_call_t1": t1, "und_call_t2": t2, "und_call_stop": stop}
         else:
             und_keys = {"und_put_t1": t1, "und_put_t2": t2, "und_put_stop": stop}
+
+        # Higher-than-expected volume vs OI lifts continuation probability as an
+        # added confluence factor (only when both feeds confirmed it).
+        prob = best["prob"]
+        if vol_oi and vol_oi.get("points"):
+            prob = min(95, prob + vol_oi["points"])
 
         sig = {
             "symbol":         symbol,
@@ -5241,7 +5277,9 @@ def scan_swing_symbol(symbol):
             "conviction":     current_conviction(),
             "signal_type":    best["signal_type"],
             "signal_label":   best["signal_label"],
-            "prob":           best["prob"],
+            "prob":           prob,
+            "base_prob":      best["prob"],
+            "vol_oi":         vol_oi,
             "spy_rs":         spy_rs,
             "rs":             spy_rs,
             "t1":             t1,
@@ -5730,6 +5768,14 @@ def render_swing_dashboard():
                             "font-weight:700;padding:2px 7px;border-radius:3px;"
                             "border:1px solid #2d1b69;margin-right:4px'>{}</span>"
                             ).format(_basis)
+        _vo = s.get("vol_oi")
+        if _vo and _vo.get("flag") in ("ELEVATED", "UNUSUAL"):
+            _voc = "#f0883e" if _vo["flag"] == "UNUSUAL" else "#e3b341"
+            stage_badge += ("<span style='background:#0d1117;color:{c};font-size:9px;"
+                            "font-weight:700;padding:2px 7px;border-radius:3px;"
+                            "border:1px solid {c};margin-right:4px' "
+                            "title='Alpaca volume vs Databento OI'>VOL/OI {r} {f}</span>"
+                            ).format(c=_voc, r=_vo.get("ratio"), f=_vo["flag"])
 
         # Fib extensions block
         extend = s.get("extend", {})
@@ -5978,6 +6024,14 @@ def render_swing_dashboard():
                             "font-weight:700;padding:2px 7px;border-radius:3px;"
                             "border:1px solid #2d1b69;margin-right:4px'>{}</span>"
                             ).format(_basis)
+        _vo = s.get("vol_oi")
+        if _vo and _vo.get("flag") in ("ELEVATED", "UNUSUAL"):
+            _voc = "#f0883e" if _vo["flag"] == "UNUSUAL" else "#e3b341"
+            stage_badge += ("<span style='background:#0d1117;color:{c};font-size:9px;"
+                            "font-weight:700;padding:2px 7px;border-radius:3px;"
+                            "border:1px solid {c};margin-right:4px' "
+                            "title='Alpaca volume vs Databento OI'>VOL/OI {r} {f}</span>"
+                            ).format(c=_voc, r=_vo.get("ratio"), f=_vo["flag"])
 
         # Fib extensions block
         extend = s.get("extend", {})
@@ -6466,7 +6520,13 @@ def _refresh_oi_snapshots():
     error_count = 0
     for sym in all_syms:
         try:
-            chain = databento_adapter.get_options_chain_snapshot(sym)
+            # ETFs pull with_price so the snapshot also carries per-contract
+            # volume (the ohlcv-1d pull), giving a Databento volume to
+            # cross-confirm Alpaca's on the vol/OI flag. Stocks stay on the
+            # cheap OI-only sweep (Alpaca supplies their volume side).
+            with_price = sym in ETF_PRODUCTS
+            chain = databento_adapter.get_options_chain_snapshot(
+                sym, with_price=with_price)
             if chain:
                 rows = oi_delta.save_snapshot(sym, chain)
                 if rows > 0:

@@ -43,6 +43,12 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_oi_lookup
         ON oi_snapshots (symbol, snap_date)
     """)
+    # Per-contract option volume (when the chain pull carries it) so we can
+    # compute a same-day volume/OI ratio. Added via migration for old DBs.
+    try:
+        c.execute("ALTER TABLE oi_snapshots ADD COLUMN volume INTEGER")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -85,11 +91,13 @@ def save_snapshot(symbol, chain_data, snap_date=None):
             oi       = int(contract.get("open_interest", 0))
             if oi <= 0:
                 continue
+            vol = contract.get("volume")
+            vol = int(vol) if vol is not None else None
             c.execute("""
                 INSERT OR REPLACE INTO oi_snapshots
-                (symbol, snap_date, strike, expiry, opt_type, oi, stored_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, snap_date, strike, expiry, opt_type, oi, now_iso))
+                (symbol, snap_date, strike, expiry, opt_type, oi, volume, stored_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, snap_date, strike, expiry, opt_type, oi, vol, now_iso))
             rows += 1
         except Exception:
             continue
@@ -318,3 +326,32 @@ def get_top_strike_levels(symbol, spot_price=None, max_levels=5):
                               "BELOW" if (spot_price and s["strike"] < spot_price) else None,
         })
     return out
+
+
+def get_contract_oi_vol(symbol, strike, expiry, opt_type):
+    """Latest stored OI (and volume, if captured) for one contract.
+
+    Returns {"oi": int|None, "volume": int|None, "snap_date": str|None} using
+    the most recent snapshot for the symbol. Pure DB read -- no network.
+    """
+    try:
+        conn = db_utils.connect(OI_DB)
+        c    = conn.cursor()
+        c.execute("SELECT MAX(snap_date) FROM oi_snapshots WHERE symbol=?",
+                  (symbol,))
+        row = c.fetchone()
+        snap_date = row[0] if row else None
+        if not snap_date:
+            conn.close()
+            return {"oi": None, "volume": None, "snap_date": None}
+        c.execute("""
+            SELECT oi, volume FROM oi_snapshots
+            WHERE symbol=? AND snap_date=? AND strike=? AND expiry=? AND opt_type=?
+        """, (symbol, snap_date, float(strike), str(expiry)[:10], opt_type))
+        r = c.fetchone()
+        conn.close()
+        if not r:
+            return {"oi": None, "volume": None, "snap_date": snap_date}
+        return {"oi": r[0], "volume": r[1], "snap_date": snap_date}
+    except Exception:
+        return {"oi": None, "volume": None, "snap_date": None}

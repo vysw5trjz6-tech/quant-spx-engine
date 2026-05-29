@@ -64,6 +64,9 @@ def build_rationale(sig):
         notes = sig.get("notes")
         if notes:
             confluence.append(notes)
+        vo = sig.get("vol_oi")
+        if vo and vo.get("flag") in ("ELEVATED", "UNUSUAL"):
+            confluence.append("vol/OI {} ({})".format(vo["flag"], vo.get("ratio")))
         # Intraday confluence: pull itemized factors out of the grade breakdown.
         bd = sig.get("grade_breakdown") or {}
         for k, v in (bd.get("base_components") or {}).items():
@@ -125,6 +128,7 @@ def build_rationale(sig):
             "targets":      targets,
             "probability":  prob,
             "conviction":   sig.get("conviction"),
+            "vol_oi":       sig.get("vol_oi"),
             "summary":      summary,
         }
     except Exception:

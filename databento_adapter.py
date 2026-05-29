@@ -750,6 +750,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     # 1b) Per-contract daily price from the SAME statistics pull (free).
     #     Keep the highest-priority price stat seen per instrument.
     px_by_inst = {}
+    vol_by_inst = {}   # per-contract daily option volume (from ohlcv-1d pull)
     if with_price and has_stat_type:
         px_df = stats_df[stats_df["stat_type"].isin(_STAT_PRICE_PRIORITY.keys())]
         best_rank = {}
@@ -818,13 +819,16 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                 end      = end_iso,
             ).to_df())
             if ohlcv_df is not None and not ohlcv_df.empty:
-                # Latest close per instrument (df is time-ordered).
+                # Latest close + volume per instrument (df is time-ordered).
                 for _, row in ohlcv_df.iterrows():
                     try:
                         iid = int(row.get("instrument_id"))
                         px  = _scale_dbn_price(row.get("close"))
                         if px is not None:
                             px_by_inst[iid] = px
+                        vol = row.get("volume")
+                        if vol is not None:
+                            vol_by_inst[iid] = int(vol)
                     except Exception:
                         continue
         except Exception as e:
@@ -851,6 +855,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             "expiry":              parsed["expiry"],
             "type":                parsed["type"],
             "open_interest":       oi,
+            "volume":              vol_by_inst.get(iid),
             "price":               px_by_inst.get(iid),
             "implied_volatility":  None,
         })
