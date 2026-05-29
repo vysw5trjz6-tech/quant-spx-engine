@@ -82,3 +82,5 @@ def test_policy_defaults():
     assert cfg["alert_min_grade"] == "B"
     assert cfg["weekly_require_uptrend"] is True
     assert 0 < cfg["max_breakout_extension"] <= 1.0
+    # ORB stop widened to a full ORB range (was 0.5x).
+    assert cfg["orb_stop_mult"] == 1.0

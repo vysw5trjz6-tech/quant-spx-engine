@@ -314,6 +314,10 @@ DEFAULT_CONFIG = {
     # than this fraction of the ORB range past the trigger -- entering
     # extended is the dominant intraday loss source. Demotes to WATCHING.
     "max_breakout_extension":   0.6,
+    # ORB underlying stop = this multiple of the ORB range beyond entry. 1.0x
+    # (a full range, ~1:1 vs the 1.0x T1) gives breakouts room to retest the
+    # trigger without stopping out on noise; raised from the old 0.5x.
+    "orb_stop_mult":            1.0,
     # Weekly long setups require the broad tape to agree: positive RS vs SPY
     # and SPY itself in an uptrend (above its 50DMA). Avoids firing CALL-only
     # weeklies into a falling market.
@@ -3208,12 +3212,13 @@ def scan_all_symbols():
         result["time_vol_lbl"]   = tv_lbl
 
         if orb_range > 0:
+            stop_mult = cfg.get("orb_stop_mult", 1.0)
             result["und_call_t1"]   = round(price + orb_range, 2)
             result["und_call_t2"]   = round(price + orb_range * 2, 2)
-            result["und_call_stop"] = round(price - orb_range * 0.5, 2)
+            result["und_call_stop"] = round(price - orb_range * stop_mult, 2)
             result["und_put_t1"]    = round(price - orb_range, 2)
             result["und_put_t2"]    = round(price - orb_range * 2, 2)
-            result["und_put_stop"]  = round(price + orb_range * 0.5, 2)
+            result["und_put_stop"]  = round(price + orb_range * stop_mult, 2)
             avg_range = statistics.mean([b["h"] - b["l"] for b in daily[-10:]])
             if avg_range > 0:
                 result["t1_prob"] = round(max(20, min(85, 100 - (orb_range / avg_range * 100))), 0)
