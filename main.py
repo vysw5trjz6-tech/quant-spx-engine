@@ -314,6 +314,16 @@ DEFAULT_CONFIG = {
     # than this fraction of the ORB range past the trigger -- entering
     # extended is the dominant intraday loss source. Demotes to WATCHING.
     "max_breakout_extension":   0.6,
+    # Trend-day pullback re-entry. On a clean trend day every breakout is
+    # "extended" by the time the 5-min scan sees it, so anti-chase suppresses
+    # 100% of signals -- the engine goes dark exactly when the trend is best.
+    # Instead of only demoting, look for a continuation entry: price ran
+    # extended (trend confirmed), pulled back toward the trigger but held it as
+    # support (higher low), and is now resuming on volume. This is the high-
+    # probability re-entry, with a tight stop under the held trigger.
+    "pullback_reentry_enabled": True,
+    "pullback_min_depth":       0.25,   # min dip off the swing, in ORB ranges
+    "pullback_vol_min":         1.1,    # resumption time-adjusted volume floor
     # ORB underlying stop = this multiple of the ORB range beyond entry. 1.0x
     # (a full range, ~1:1 vs the 1.0x T1) gives breakouts room to retest the
     # trigger without stopping out on noise; raised from the old 0.5x.
@@ -2863,18 +2873,44 @@ def _fetch_bars(symbol, timeframe, limit, kind):
     if fresh is not None:
         return fresh
 
+    # Be explicit about feed + window. On the free Alpaca plan the bars
+    # endpoint defaults to the SIP feed, which a free key isn't entitled to --
+    # the request still returns HTTP 200 but with an empty `bars` array, so a
+    # whole-universe sweep silently reports data:0/N with no error status. Pin
+    # feed=iex (the free entitlement) and pass an explicit start date wide
+    # enough to cover `limit` bars so Alpaca never short-changes the window.
+    if timeframe == "1Week":
+        _lookback_days = int(limit * 7 * 1.4) + 14
+    elif timeframe == "1Day":
+        _lookback_days = int(limit * 1.6) + 10      # trading->calendar slack
+    else:
+        _lookback_days = 7
+    _start_iso = (datetime.now(pytz.utc)
+                  - timedelta(days=_lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {"timeframe": timeframe, "limit": limit,
+              "feed": "iex", "start": _start_iso}
+
     attempts = 3
     backoff  = 0.5
     for attempt in range(attempts):
         try:
             r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                             params={"timeframe": timeframe, "limit": limit},
+                             params=params,
                              timeout=10)
             if r.status_code == 200:
                 bars = r.json().get("bars", []) or []
                 if bars:
                     _bars_cache_set(cache_key, bars)
-                return bars
+                    return bars
+                # 200 OK but no bars. This is the silent-outage signature
+                # (feed/entitlement or a too-narrow window). Record it
+                # distinctly so the universe-OUTAGE line names the real cause
+                # instead of "no HTTP status captured", then drop to the
+                # stale-cache fallback below (retrying an empty 200 is futile).
+                _swing_stats_bump("http_200_empty")
+                _log_swing_fetch_err(symbol, kind + "/empty",
+                                     "200 OK but bars=[] (feed=iex/subscription/window?)")
+                break
             _swing_stats_bump("http_{}".format(r.status_code))
             # 429 = rate limited: back off and retry before giving up.
             if r.status_code == 429 and attempt < attempts - 1:
@@ -2981,6 +3017,80 @@ def current_conviction():
     if gex_bias:
         conv *= gex_bias.get("conviction_mult", 1.0)
     return conv
+
+
+def detect_orb_pullback_continuation(intraday, vwap, orb_high, orb_low,
+                                     direction, orb_range, cfg,
+                                     time_vol_ratio, vol_data_ok, orb_bars):
+    """Trend-day continuation entry for an ORB breakout that has run extended.
+
+    Anti-chase correctly refuses to buy a bar that is already extended past the
+    trigger. But on a trend day that suppresses *every* signal. This detects the
+    one high-probability way back in: the breakout ran, then pulled back toward
+    the trigger and *held* it (a higher low), and the current bar is resuming in
+    the trend direction on real volume. Returns a dict with the continuation
+    stop (just under the held level) or None if it's still ripping / has failed.
+    """
+    post_orb = intraday[orb_bars:]
+    if len(post_orb) < 4:
+        return None
+    recent = post_orb[-8:]
+    last, prev = intraday[-1], intraday[-2]
+    price      = last["c"]
+    min_depth  = orb_range * cfg.get("pullback_min_depth", 0.25)
+    ext_thresh = orb_range * cfg.get("max_breakout_extension", 0.6)
+    vol_min    = cfg.get("pullback_vol_min", 1.1)
+
+    if not (vol_data_ok and time_vol_ratio >= vol_min):
+        return None
+
+    if direction == "CALL":
+        # Locate the extension peak, then measure the dip in the bars *after*
+        # it -- a resuming bar recovers toward the peak, so dip depth must be
+        # read from the peak-to-trough, not peak-to-current-price.
+        highs       = [b["h"] for b in recent]
+        hi_idx      = max(range(len(recent)), key=lambda i: highs[i])
+        recent_high = highs[hi_idx]
+        after       = recent[hi_idx + 1:]
+        if not after:                       # peak is the latest bar = still ripping
+            return None
+        dip_low = min(b["l"] for b in after)
+        # 1) the move actually extended (trend day, not a fresh poke)
+        if recent_high - orb_high < ext_thresh:
+            return None
+        # 2) a genuine pullback off the peak (not a one-tick wobble)
+        if recent_high - dip_low < min_depth:
+            return None
+        # 3) the trigger held as support -- higher low above the breakout level
+        if dip_low < orb_high:
+            return None
+        # 4) current bar resuming up, back above VWAP
+        if not (last["c"] > last["o"] and last["c"] >= prev["c"] and price > vwap):
+            return None
+        stop = round(dip_low - orb_range * 0.15, 2)
+        return {"ok": True, "stop": stop,
+                "note": "pullback to {:.2f} held > ORB-high {:.2f}, resuming on {:.1f}x vol".format(
+                    dip_low, orb_high, time_vol_ratio)}
+    else:
+        lows       = [b["l"] for b in recent]
+        lo_idx     = min(range(len(recent)), key=lambda i: lows[i])
+        recent_low = lows[lo_idx]
+        after      = recent[lo_idx + 1:]
+        if not after:
+            return None
+        dip_high = max(b["h"] for b in after)
+        if orb_low - recent_low < ext_thresh:
+            return None
+        if dip_high - recent_low < min_depth:
+            return None
+        if dip_high > orb_low:
+            return None
+        if not (last["c"] < last["o"] and last["c"] <= prev["c"] and price < vwap):
+            return None
+        stop = round(dip_high + orb_range * 0.15, 2)
+        return {"ok": True, "stop": stop,
+                "note": "pullback to {:.2f} held < ORB-low {:.2f}, resuming on {:.1f}x vol".format(
+                    dip_high, orb_low, time_vol_ratio)}
 
 
 # =============================================
@@ -3251,12 +3361,32 @@ def scan_all_symbols():
             else:
                 _run = orb_low - price
             if _run > orb_range * _ext:
-                result["status"]     = "extended (anti-chase)"
-                result["vs_orb_run"] = round(_run / orb_range, 2)
-                results.append(result)
-                log("{}: SKIP {} extended {:.2f}x ORB past trigger (anti-chase)".format(
-                    symbol, direction, _run / orb_range))
-                continue
+                # Before giving up, check for a trend-day pullback continuation:
+                # extended move + held trigger + resuming on volume = the high-
+                # probability re-entry anti-chase would otherwise mask.
+                cont = None
+                if cfg.get("pullback_reentry_enabled", True):
+                    cont = detect_orb_pullback_continuation(
+                        intraday, vwap, orb_high, orb_low, direction,
+                        orb_range, cfg, time_vol_ratio, vol_data_ok, ORB_BARS)
+                if cont and cont.get("ok"):
+                    result["signal_type"] = "ORB_PULLBACK"
+                    result["entry_style"] = "pullback"
+                    result["vs_orb_run"]  = round(_run / orb_range, 2)
+                    if direction == "CALL":
+                        result["und_call_stop"] = cont["stop"]
+                    else:
+                        result["und_put_stop"]  = cont["stop"]
+                    log("{}: {} ORB-PULLBACK continuation — {}".format(
+                        symbol, direction, cont["note"]))
+                    # Fall through to the normal ORB grading path below.
+                else:
+                    result["status"]     = "extended (anti-chase)"
+                    result["vs_orb_run"] = round(_run / orb_range, 2)
+                    results.append(result)
+                    log("{}: SKIP {} extended {:.2f}x ORB past trigger (anti-chase)".format(
+                        symbol, direction, _run / orb_range))
+                    continue
 
         if direction is None:
             # --- No ORB breakout: try alternative strategies ---
