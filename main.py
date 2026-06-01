@@ -150,9 +150,17 @@ ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 ETF_PRODUCTS   = ["SPY", "QQQ"]            # weekly + intraday/0DTE
 INDEX_PRODUCTS = ["SPX", "NDX"]            # context only (display level + RS)
 
-# Intraday / 0DTE tradeable universe = ETFs only. Leveraged ETFs and mega-caps
-# that used to live here now appear only in the weekly stock tier.
-INTRADAY_SYMBOLS = list(ETF_PRODUCTS)
+# Intraday / 0DTE tradeable universe. ETFs carry daily 0DTE options; the
+# liquid single-stock momentum names below trade the same ORB / VWAP / pullback
+# logic but resolve to the nearest weekly (Fri) contract via get_liquid_option.
+# Kept to a focused, high-liquidity set so the 5-min sweep stays cheap and the
+# IEX volume ratios stay meaningful. These are exactly the names that trend
+# cleanly intraday -- the case where the engine previously had nothing to show.
+INTRADAY_STOCKS = [
+    "NVDA", "TSLA", "AMD", "AAPL", "META", "AMZN", "MSFT", "GOOGL",
+    "NFLX", "AVGO", "MU", "PLTR", "COIN", "SMCI",
+]
+INTRADAY_SYMBOLS = ETF_PRODUCTS + INTRADAY_STOCKS
 
 # Back-compat alias for the several aux paths (earnings prefetch, digests) that
 # iterate SYMBOLS + SWING_SYMBOLS over the full coverage set.
@@ -3210,7 +3218,8 @@ def scan_all_symbols():
             "market_bias": market_bias, "aligned": True,
             "key_levels": [], "clear_air": None, "rec_contract": None,
             "t1_prob": 50, "t2_prob": 25, "signal_type": "ORB",
-            "horizon": "INTRADAY", "tier": 0, "product_class": "ETF",
+            "horizon": "INTRADAY", "tier": 0,
+            "product_class": "ETF" if symbol in ETF_PRODUCTS else "STOCK",
             "conviction": scan_conviction,
         }
 
@@ -3414,7 +3423,10 @@ def scan_all_symbols():
                     vol_data_ok=vol_data_ok)
 
             # 4. Opening Drive (overnight inventory + gap alignment) — NEW
-            if not alt_signal and HAS_NEW_STRATS and premarket:
+            # ETF-only: the premarket brief is an SPY/index overnight-inventory
+            # read, so it must not be applied to single-stock symbols.
+            if (not alt_signal and HAS_NEW_STRATS and premarket
+                    and symbol in ETF_PRODUCTS):
                 try:
                     od = new_strategies.detect_opening_drive(
                         intraday_5min   = intraday,
@@ -8077,7 +8089,7 @@ def render_dashboard(toast=""):
 <div style="padding:12px 14px 0">
   <div style="font-size:10px;font-weight:700;color:#8b949e;
               text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">
-    SECONDARY &mdash; INTRADAY / 0DTE (SPY/QQQ) &mdash; {nsig} setup{pl_s} found
+    SECONDARY &mdash; INTRADAY (SPY/QQQ 0DTE + liquid stock weeklies) &mdash; {nsig} setup{pl_s} found
   </div>
   {signal_cards}
   {no_sig_msg}
