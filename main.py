@@ -5945,8 +5945,13 @@ def run_swing_scan():
                     len(SWING_SYMBOLS)))
 
 
-def render_swing_dashboard():
-    """Render the swing trade scanner page."""
+def _build_weekly_section():
+    """Build the WEEKLY/PRIMARY tier as an embeddable HTML section.
+
+    Returns just the inner section (header + legend + cards), no page wrapper,
+    so it can be dropped into the single unified dashboard alongside the
+    intraday/0DTE tier. (Formerly render_swing_dashboard, a standalone page.)
+    """
     with state_lock:
         sigs = list(swing_signals)
         secs = max(0, int(next_swing_scan - time.time()))
@@ -6494,66 +6499,33 @@ def render_swing_dashboard():
     cards_html = t1_cards + t2_section
 
     if not cards_html:
-        cards_html = ("<div style='padding:40px;text-align:center;color:#8b949e;font-size:13px'>"
-                      "Swing scan running... check back in a moment.<br>"
-                      "<a href='/swing' style='color:#58a6ff;font-size:11px;margin-top:8px;"
+        cards_html = ("<div style='padding:28px;text-align:center;color:#8b949e;font-size:13px'>"
+                      "Weekly scan running... check back in a moment.<br>"
+                      "<a href='/' style='color:#58a6ff;font-size:11px;margin-top:8px;"
                       "display:block'>Refresh</a></div>")
 
     next_str = "{}s".format(secs) if secs > 0 else "running now"
 
-    return """<!DOCTYPE html><html><head>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<meta http-equiv='refresh' content='120'>
-<title>Swing Scanner</title>
-<style>
-body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-serif;
-     padding:0;margin:0;font-size:13px}}
-.topbar{{position:sticky;top:0;background:#161b22;border-bottom:1px solid #30363d;
-         padding:10px 14px;display:flex;justify-content:space-between;
-         align-items:center;z-index:100}}
-.nav-link{{color:#58a6ff;text-decoration:none;font-size:11px;font-weight:600;
-           padding:4px 10px;border-radius:5px;border:1px solid #30363d;margin-left:4px}}
-.nav-link.active{{background:#1f6feb;border-color:#1f6feb;color:#fff}}
-.content{{padding:12px 14px}}
-</style></head><body>
-<div class='topbar'>
-  <div style='font-size:14px;font-weight:800;color:#58a6ff;letter-spacing:-.3px'>
-    SWING ENGINE
-    <span style='font-size:10px;color:#8b949e;font-weight:400;margin-left:6px'>
-      {nsig} setups &nbsp;|&nbsp; next scan {next}
-    </span>
-  </div>
-  <div>
-    <a class='nav-link' href='/'>0DTE</a>
-    <a class='nav-link active' href='/swing'>Swing</a>
-    <a class='nav-link' href='/chat'>Chat</a>
-    <a class='nav-link' href='/ai'>AI</a>
-    <a class='nav-link' href='/stats'>Stats</a>
-  </div>
+    return """
+<div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
+            letter-spacing:.8px;margin-bottom:4px;margin-top:4px'>
+  PRIMARY &mdash; WEEKLY ({nsig} SETUP{pl}, SPY/QQQ + RS-RANKED STOCKS)
+  <span style='color:#6e7681;font-weight:400;text-transform:none'>
+    &nbsp;|&nbsp; next scan {next}</span>
 </div>
-
-<div class='content'>
-  {index_strip}
-  <div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
-              letter-spacing:.8px;margin-bottom:4px;margin-top:4px'>
-    PRIMARY &mdash; WEEKLY ({nsig} SETUP{pl}, SPY/QQQ + RS-RANKED STOCKS)
-  </div>
-  <div style='font-size:10px;color:#8b949e;margin-bottom:10px'>
-    <span style='color:#a371f7'>&#9632; O'Neil Pivot</span> &nbsp;
-    <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
-    <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
-    <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
-    &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
-    Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Current-week Friday settlement (rides to 0DTE)
-  </div>
-  {cards}
+<div style='font-size:10px;color:#8b949e;margin-bottom:10px'>
+  <span style='color:#a371f7'>&#9632; O'Neil Pivot</span> &nbsp;
+  <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
+  <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
+  <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
+  &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
+  Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Current-week Friday settlement (rides to 0DTE)
 </div>
-</body></html>""".format(
+{cards}""".format(
         nsig  = len(sigs),
         next  = next_str,
         pl    = "S" if len(sigs) != 1 else "",
         cards = cards_html,
-        index_strip = render_index_context_strip(),
     )
 
 
@@ -8016,7 +7988,7 @@ def render_dashboard(toast=""):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
-<title>0DTE Engine</title>
+<title>SPX Engine</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#0d1117;color:#e6edf3;
@@ -8063,7 +8035,7 @@ def render_dashboard(toast=""):
 <!-- TOP BAR -->
 <div class="topbar">
   <div class="topbar-left">
-    <span class="brand">0DTE ENGINE</span>
+    <span class="brand">SPX ENGINE</span>
     <span class="stat-chip">
       <span class="dot" style="background:{mc}"></span>
       <span class="val" style="color:{mc}">{ml}</span>
@@ -8084,7 +8056,6 @@ def render_dashboard(toast=""):
     </span>
   </div>
   <div class="topbar-right">
-    <a class="nav-link" href="/swing">Swing</a>
     <a class="nav-link" href="/chat">Chat</a>
     <a class="nav-link" href="/ai">AI</a>
     <a class="nav-link" href="/stats">Stats</a>
@@ -8098,6 +8069,9 @@ def render_dashboard(toast=""):
 
 <!-- INDEX CONTEXT -->
 <div style="padding:12px 14px 0">{index_strip}</div>
+
+<!-- WEEKLY / PRIMARY TIER (merged from the former Swing page) -->
+<div style="padding:12px 14px 0">{weekly_section}</div>
 
 <!-- SIGNAL CARDS -->
 <div style="padding:12px 14px 0">
@@ -8176,7 +8150,8 @@ def render_dashboard(toast=""):
             if not no_closed else
             "<div class='empty'>No closed trades today</div>"
         ),
-        log_lines="<br>".join(logs) if logs else "No log entries yet"
+        log_lines="<br>".join(logs) if logs else "No log entries yet",
+        weekly_section=_build_weekly_section(),
     )
     return html
 
@@ -8724,12 +8699,9 @@ def ai_dismiss_proposal():
 
 @app.route("/swing")
 def swing_page():
-    try:
-        return render_swing_dashboard()
-    except Exception as e:
-        import traceback
-        return ("<pre style='background:#0d1117;color:#f85149;padding:20px;"
-                "font-size:12px;white-space:pre-wrap'>" + traceback.format_exc() + "</pre>"), 500
+    # The swing/weekly tier is now merged into the single unified dashboard at
+    # "/". Keep the route as a redirect so old bookmarks / links still land.
+    return redirect("/")
 
 
 @app.route("/swing/scan")
@@ -8737,7 +8709,7 @@ def swing_scan_now():
     """Manually trigger the weekly pass of the unified scan."""
     threading.Thread(target=run_unified_scan, kwargs={"do_weekly": True},
                      daemon=True).start()
-    return redirect("/swing")
+    return redirect("/")
 
 
 @app.route("/scan/unified")
@@ -8925,8 +8897,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
 <div class='topbar'>
   <span class='brand'>Scanner Chat</span>
   <div>
-    <a class='nav-link' href='/'>0DTE</a>
-    <a class='nav-link' href='/swing'>Swing</a>
+    <a class='nav-link' href='/'>Engine</a>
     <a class='nav-link nav-active' href='/chat'>Chat</a>
     <a class='nav-link' href='/ai'>AI</a>
     <a class='nav-link' href='/stats'>Stats</a>
