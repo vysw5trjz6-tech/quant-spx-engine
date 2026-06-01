@@ -150,9 +150,17 @@ ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 ETF_PRODUCTS   = ["SPY", "QQQ"]            # weekly + intraday/0DTE
 INDEX_PRODUCTS = ["SPX", "NDX"]            # context only (display level + RS)
 
-# Intraday / 0DTE tradeable universe = ETFs only. Leveraged ETFs and mega-caps
-# that used to live here now appear only in the weekly stock tier.
-INTRADAY_SYMBOLS = list(ETF_PRODUCTS)
+# Intraday / 0DTE tradeable universe. ETFs carry daily 0DTE options; the
+# liquid single-stock momentum names below trade the same ORB / VWAP / pullback
+# logic but resolve to the nearest weekly (Fri) contract via get_liquid_option.
+# Kept to a focused, high-liquidity set so the 5-min sweep stays cheap and the
+# IEX volume ratios stay meaningful. These are exactly the names that trend
+# cleanly intraday -- the case where the engine previously had nothing to show.
+INTRADAY_STOCKS = [
+    "NVDA", "TSLA", "AMD", "AAPL", "META", "AMZN", "MSFT", "GOOGL",
+    "NFLX", "AVGO", "MU", "PLTR", "COIN", "SMCI",
+]
+INTRADAY_SYMBOLS = ETF_PRODUCTS + INTRADAY_STOCKS
 
 # Back-compat alias for the several aux paths (earnings prefetch, digests) that
 # iterate SYMBOLS + SWING_SYMBOLS over the full coverage set.
@@ -314,6 +322,16 @@ DEFAULT_CONFIG = {
     # than this fraction of the ORB range past the trigger -- entering
     # extended is the dominant intraday loss source. Demotes to WATCHING.
     "max_breakout_extension":   0.6,
+    # Trend-day pullback re-entry. On a clean trend day every breakout is
+    # "extended" by the time the 5-min scan sees it, so anti-chase suppresses
+    # 100% of signals -- the engine goes dark exactly when the trend is best.
+    # Instead of only demoting, look for a continuation entry: price ran
+    # extended (trend confirmed), pulled back toward the trigger but held it as
+    # support (higher low), and is now resuming on volume. This is the high-
+    # probability re-entry, with a tight stop under the held trigger.
+    "pullback_reentry_enabled": True,
+    "pullback_min_depth":       0.25,   # min dip off the swing, in ORB ranges
+    "pullback_vol_min":         1.1,    # resumption time-adjusted volume floor
     # ORB underlying stop = this multiple of the ORB range beyond entry. 1.0x
     # (a full range, ~1:1 vs the 1.0x T1) gives breakouts room to retest the
     # trigger without stopping out on noise; raised from the old 0.5x.
@@ -2863,18 +2881,44 @@ def _fetch_bars(symbol, timeframe, limit, kind):
     if fresh is not None:
         return fresh
 
+    # Be explicit about feed + window. On the free Alpaca plan the bars
+    # endpoint defaults to the SIP feed, which a free key isn't entitled to --
+    # the request still returns HTTP 200 but with an empty `bars` array, so a
+    # whole-universe sweep silently reports data:0/N with no error status. Pin
+    # feed=iex (the free entitlement) and pass an explicit start date wide
+    # enough to cover `limit` bars so Alpaca never short-changes the window.
+    if timeframe == "1Week":
+        _lookback_days = int(limit * 7 * 1.4) + 14
+    elif timeframe == "1Day":
+        _lookback_days = int(limit * 1.6) + 10      # trading->calendar slack
+    else:
+        _lookback_days = 7
+    _start_iso = (datetime.now(pytz.utc)
+                  - timedelta(days=_lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {"timeframe": timeframe, "limit": limit,
+              "feed": "iex", "start": _start_iso}
+
     attempts = 3
     backoff  = 0.5
     for attempt in range(attempts):
         try:
             r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                             params={"timeframe": timeframe, "limit": limit},
+                             params=params,
                              timeout=10)
             if r.status_code == 200:
                 bars = r.json().get("bars", []) or []
                 if bars:
                     _bars_cache_set(cache_key, bars)
-                return bars
+                    return bars
+                # 200 OK but no bars. This is the silent-outage signature
+                # (feed/entitlement or a too-narrow window). Record it
+                # distinctly so the universe-OUTAGE line names the real cause
+                # instead of "no HTTP status captured", then drop to the
+                # stale-cache fallback below (retrying an empty 200 is futile).
+                _swing_stats_bump("http_200_empty")
+                _log_swing_fetch_err(symbol, kind + "/empty",
+                                     "200 OK but bars=[] (feed=iex/subscription/window?)")
+                break
             _swing_stats_bump("http_{}".format(r.status_code))
             # 429 = rate limited: back off and retry before giving up.
             if r.status_code == 429 and attempt < attempts - 1:
@@ -2981,6 +3025,80 @@ def current_conviction():
     if gex_bias:
         conv *= gex_bias.get("conviction_mult", 1.0)
     return conv
+
+
+def detect_orb_pullback_continuation(intraday, vwap, orb_high, orb_low,
+                                     direction, orb_range, cfg,
+                                     time_vol_ratio, vol_data_ok, orb_bars):
+    """Trend-day continuation entry for an ORB breakout that has run extended.
+
+    Anti-chase correctly refuses to buy a bar that is already extended past the
+    trigger. But on a trend day that suppresses *every* signal. This detects the
+    one high-probability way back in: the breakout ran, then pulled back toward
+    the trigger and *held* it (a higher low), and the current bar is resuming in
+    the trend direction on real volume. Returns a dict with the continuation
+    stop (just under the held level) or None if it's still ripping / has failed.
+    """
+    post_orb = intraday[orb_bars:]
+    if len(post_orb) < 4:
+        return None
+    recent = post_orb[-8:]
+    last, prev = intraday[-1], intraday[-2]
+    price      = last["c"]
+    min_depth  = orb_range * cfg.get("pullback_min_depth", 0.25)
+    ext_thresh = orb_range * cfg.get("max_breakout_extension", 0.6)
+    vol_min    = cfg.get("pullback_vol_min", 1.1)
+
+    if not (vol_data_ok and time_vol_ratio >= vol_min):
+        return None
+
+    if direction == "CALL":
+        # Locate the extension peak, then measure the dip in the bars *after*
+        # it -- a resuming bar recovers toward the peak, so dip depth must be
+        # read from the peak-to-trough, not peak-to-current-price.
+        highs       = [b["h"] for b in recent]
+        hi_idx      = max(range(len(recent)), key=lambda i: highs[i])
+        recent_high = highs[hi_idx]
+        after       = recent[hi_idx + 1:]
+        if not after:                       # peak is the latest bar = still ripping
+            return None
+        dip_low = min(b["l"] for b in after)
+        # 1) the move actually extended (trend day, not a fresh poke)
+        if recent_high - orb_high < ext_thresh:
+            return None
+        # 2) a genuine pullback off the peak (not a one-tick wobble)
+        if recent_high - dip_low < min_depth:
+            return None
+        # 3) the trigger held as support -- higher low above the breakout level
+        if dip_low < orb_high:
+            return None
+        # 4) current bar resuming up, back above VWAP
+        if not (last["c"] > last["o"] and last["c"] >= prev["c"] and price > vwap):
+            return None
+        stop = round(dip_low - orb_range * 0.15, 2)
+        return {"ok": True, "stop": stop,
+                "note": "pullback to {:.2f} held > ORB-high {:.2f}, resuming on {:.1f}x vol".format(
+                    dip_low, orb_high, time_vol_ratio)}
+    else:
+        lows       = [b["l"] for b in recent]
+        lo_idx     = min(range(len(recent)), key=lambda i: lows[i])
+        recent_low = lows[lo_idx]
+        after      = recent[lo_idx + 1:]
+        if not after:
+            return None
+        dip_high = max(b["h"] for b in after)
+        if orb_low - recent_low < ext_thresh:
+            return None
+        if dip_high - recent_low < min_depth:
+            return None
+        if dip_high > orb_low:
+            return None
+        if not (last["c"] < last["o"] and last["c"] <= prev["c"] and price < vwap):
+            return None
+        stop = round(dip_high + orb_range * 0.15, 2)
+        return {"ok": True, "stop": stop,
+                "note": "pullback to {:.2f} held < ORB-low {:.2f}, resuming on {:.1f}x vol".format(
+                    dip_high, orb_low, time_vol_ratio)}
 
 
 # =============================================
@@ -3100,7 +3218,8 @@ def scan_all_symbols():
             "market_bias": market_bias, "aligned": True,
             "key_levels": [], "clear_air": None, "rec_contract": None,
             "t1_prob": 50, "t2_prob": 25, "signal_type": "ORB",
-            "horizon": "INTRADAY", "tier": 0, "product_class": "ETF",
+            "horizon": "INTRADAY", "tier": 0,
+            "product_class": "ETF" if symbol in ETF_PRODUCTS else "STOCK",
             "conviction": scan_conviction,
         }
 
@@ -3251,12 +3370,32 @@ def scan_all_symbols():
             else:
                 _run = orb_low - price
             if _run > orb_range * _ext:
-                result["status"]     = "extended (anti-chase)"
-                result["vs_orb_run"] = round(_run / orb_range, 2)
-                results.append(result)
-                log("{}: SKIP {} extended {:.2f}x ORB past trigger (anti-chase)".format(
-                    symbol, direction, _run / orb_range))
-                continue
+                # Before giving up, check for a trend-day pullback continuation:
+                # extended move + held trigger + resuming on volume = the high-
+                # probability re-entry anti-chase would otherwise mask.
+                cont = None
+                if cfg.get("pullback_reentry_enabled", True):
+                    cont = detect_orb_pullback_continuation(
+                        intraday, vwap, orb_high, orb_low, direction,
+                        orb_range, cfg, time_vol_ratio, vol_data_ok, ORB_BARS)
+                if cont and cont.get("ok"):
+                    result["signal_type"] = "ORB_PULLBACK"
+                    result["entry_style"] = "pullback"
+                    result["vs_orb_run"]  = round(_run / orb_range, 2)
+                    if direction == "CALL":
+                        result["und_call_stop"] = cont["stop"]
+                    else:
+                        result["und_put_stop"]  = cont["stop"]
+                    log("{}: {} ORB-PULLBACK continuation — {}".format(
+                        symbol, direction, cont["note"]))
+                    # Fall through to the normal ORB grading path below.
+                else:
+                    result["status"]     = "extended (anti-chase)"
+                    result["vs_orb_run"] = round(_run / orb_range, 2)
+                    results.append(result)
+                    log("{}: SKIP {} extended {:.2f}x ORB past trigger (anti-chase)".format(
+                        symbol, direction, _run / orb_range))
+                    continue
 
         if direction is None:
             # --- No ORB breakout: try alternative strategies ---
@@ -3284,7 +3423,10 @@ def scan_all_symbols():
                     vol_data_ok=vol_data_ok)
 
             # 4. Opening Drive (overnight inventory + gap alignment) — NEW
-            if not alt_signal and HAS_NEW_STRATS and premarket:
+            # ETF-only: the premarket brief is an SPY/index overnight-inventory
+            # read, so it must not be applied to single-stock symbols.
+            if (not alt_signal and HAS_NEW_STRATS and premarket
+                    and symbol in ETF_PRODUCTS):
                 try:
                     od = new_strategies.detect_opening_drive(
                         intraday_5min   = intraday,
@@ -5815,8 +5957,13 @@ def run_swing_scan():
                     len(SWING_SYMBOLS)))
 
 
-def render_swing_dashboard():
-    """Render the swing trade scanner page."""
+def _build_weekly_section():
+    """Build the WEEKLY/PRIMARY tier as an embeddable HTML section.
+
+    Returns just the inner section (header + legend + cards), no page wrapper,
+    so it can be dropped into the single unified dashboard alongside the
+    intraday/0DTE tier. (Formerly render_swing_dashboard, a standalone page.)
+    """
     with state_lock:
         sigs = list(swing_signals)
         secs = max(0, int(next_swing_scan - time.time()))
@@ -6364,66 +6511,33 @@ def render_swing_dashboard():
     cards_html = t1_cards + t2_section
 
     if not cards_html:
-        cards_html = ("<div style='padding:40px;text-align:center;color:#8b949e;font-size:13px'>"
-                      "Swing scan running... check back in a moment.<br>"
-                      "<a href='/swing' style='color:#58a6ff;font-size:11px;margin-top:8px;"
+        cards_html = ("<div style='padding:28px;text-align:center;color:#8b949e;font-size:13px'>"
+                      "Weekly scan running... check back in a moment.<br>"
+                      "<a href='/' style='color:#58a6ff;font-size:11px;margin-top:8px;"
                       "display:block'>Refresh</a></div>")
 
     next_str = "{}s".format(secs) if secs > 0 else "running now"
 
-    return """<!DOCTYPE html><html><head>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<meta http-equiv='refresh' content='120'>
-<title>Swing Scanner</title>
-<style>
-body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-serif;
-     padding:0;margin:0;font-size:13px}}
-.topbar{{position:sticky;top:0;background:#161b22;border-bottom:1px solid #30363d;
-         padding:10px 14px;display:flex;justify-content:space-between;
-         align-items:center;z-index:100}}
-.nav-link{{color:#58a6ff;text-decoration:none;font-size:11px;font-weight:600;
-           padding:4px 10px;border-radius:5px;border:1px solid #30363d;margin-left:4px}}
-.nav-link.active{{background:#1f6feb;border-color:#1f6feb;color:#fff}}
-.content{{padding:12px 14px}}
-</style></head><body>
-<div class='topbar'>
-  <div style='font-size:14px;font-weight:800;color:#58a6ff;letter-spacing:-.3px'>
-    SWING ENGINE
-    <span style='font-size:10px;color:#8b949e;font-weight:400;margin-left:6px'>
-      {nsig} setups &nbsp;|&nbsp; next scan {next}
-    </span>
-  </div>
-  <div>
-    <a class='nav-link' href='/'>0DTE</a>
-    <a class='nav-link active' href='/swing'>Swing</a>
-    <a class='nav-link' href='/chat'>Chat</a>
-    <a class='nav-link' href='/ai'>AI</a>
-    <a class='nav-link' href='/stats'>Stats</a>
-  </div>
+    return """
+<div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
+            letter-spacing:.8px;margin-bottom:4px;margin-top:4px'>
+  PRIMARY &mdash; WEEKLY ({nsig} SETUP{pl}, SPY/QQQ + RS-RANKED STOCKS)
+  <span style='color:#6e7681;font-weight:400;text-transform:none'>
+    &nbsp;|&nbsp; next scan {next}</span>
 </div>
-
-<div class='content'>
-  {index_strip}
-  <div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
-              letter-spacing:.8px;margin-bottom:4px;margin-top:4px'>
-    PRIMARY &mdash; WEEKLY ({nsig} SETUP{pl}, SPY/QQQ + RS-RANKED STOCKS)
-  </div>
-  <div style='font-size:10px;color:#8b949e;margin-bottom:10px'>
-    <span style='color:#a371f7'>&#9632; O'Neil Pivot</span> &nbsp;
-    <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
-    <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
-    <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
-    &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
-    Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Current-week Friday settlement (rides to 0DTE)
-  </div>
-  {cards}
+<div style='font-size:10px;color:#8b949e;margin-bottom:10px'>
+  <span style='color:#a371f7'>&#9632; O'Neil Pivot</span> &nbsp;
+  <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
+  <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
+  <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
+  &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
+  Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Current-week Friday settlement (rides to 0DTE)
 </div>
-</body></html>""".format(
+{cards}""".format(
         nsig  = len(sigs),
         next  = next_str,
         pl    = "S" if len(sigs) != 1 else "",
         cards = cards_html,
-        index_strip = render_index_context_strip(),
     )
 
 
@@ -7886,7 +8000,7 @@ def render_dashboard(toast=""):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
-<title>0DTE Engine</title>
+<title>SPX Engine</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#0d1117;color:#e6edf3;
@@ -7933,7 +8047,7 @@ def render_dashboard(toast=""):
 <!-- TOP BAR -->
 <div class="topbar">
   <div class="topbar-left">
-    <span class="brand">0DTE ENGINE</span>
+    <span class="brand">SPX ENGINE</span>
     <span class="stat-chip">
       <span class="dot" style="background:{mc}"></span>
       <span class="val" style="color:{mc}">{ml}</span>
@@ -7954,7 +8068,6 @@ def render_dashboard(toast=""):
     </span>
   </div>
   <div class="topbar-right">
-    <a class="nav-link" href="/swing">Swing</a>
     <a class="nav-link" href="/chat">Chat</a>
     <a class="nav-link" href="/ai">AI</a>
     <a class="nav-link" href="/stats">Stats</a>
@@ -7969,11 +8082,14 @@ def render_dashboard(toast=""):
 <!-- INDEX CONTEXT -->
 <div style="padding:12px 14px 0">{index_strip}</div>
 
+<!-- WEEKLY / PRIMARY TIER (merged from the former Swing page) -->
+<div style="padding:12px 14px 0">{weekly_section}</div>
+
 <!-- SIGNAL CARDS -->
 <div style="padding:12px 14px 0">
   <div style="font-size:10px;font-weight:700;color:#8b949e;
               text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">
-    SECONDARY &mdash; INTRADAY / 0DTE (SPY/QQQ) &mdash; {nsig} setup{pl_s} found
+    SECONDARY &mdash; INTRADAY (SPY/QQQ 0DTE + liquid stock weeklies) &mdash; {nsig} setup{pl_s} found
   </div>
   {signal_cards}
   {no_sig_msg}
@@ -8046,7 +8162,8 @@ def render_dashboard(toast=""):
             if not no_closed else
             "<div class='empty'>No closed trades today</div>"
         ),
-        log_lines="<br>".join(logs) if logs else "No log entries yet"
+        log_lines="<br>".join(logs) if logs else "No log entries yet",
+        weekly_section=_build_weekly_section(),
     )
     return html
 
@@ -8594,12 +8711,9 @@ def ai_dismiss_proposal():
 
 @app.route("/swing")
 def swing_page():
-    try:
-        return render_swing_dashboard()
-    except Exception as e:
-        import traceback
-        return ("<pre style='background:#0d1117;color:#f85149;padding:20px;"
-                "font-size:12px;white-space:pre-wrap'>" + traceback.format_exc() + "</pre>"), 500
+    # The swing/weekly tier is now merged into the single unified dashboard at
+    # "/". Keep the route as a redirect so old bookmarks / links still land.
+    return redirect("/")
 
 
 @app.route("/swing/scan")
@@ -8607,7 +8721,7 @@ def swing_scan_now():
     """Manually trigger the weekly pass of the unified scan."""
     threading.Thread(target=run_unified_scan, kwargs={"do_weekly": True},
                      daemon=True).start()
-    return redirect("/swing")
+    return redirect("/")
 
 
 @app.route("/scan/unified")
@@ -8795,8 +8909,7 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
 <div class='topbar'>
   <span class='brand'>Scanner Chat</span>
   <div>
-    <a class='nav-link' href='/'>0DTE</a>
-    <a class='nav-link' href='/swing'>Swing</a>
+    <a class='nav-link' href='/'>Engine</a>
     <a class='nav-link nav-active' href='/chat'>Chat</a>
     <a class='nav-link' href='/ai'>AI</a>
     <a class='nav-link' href='/stats'>Stats</a>
