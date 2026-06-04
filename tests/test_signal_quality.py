@@ -116,6 +116,88 @@ def test_clear_air_tol_default_configured(main_src):
 
 
 # ---------------------------------------------------------------------------
+# #4 -- chase-into-resistance demotion (behavioral + structural)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def blocker_chase_frac(main_src, main_tree):
+    """Compile just _blocker_chase_frac into an isolated namespace."""
+    fn = _find_func(main_tree, "_blocker_chase_frac")
+    assert fn is not None, "_blocker_chase_frac missing"
+    ns = {}
+    exec(compile(ast.get_source_segment(main_src, fn), MAIN_PATH, "exec"), ns)
+    return ns["_blocker_chase_frac"]
+
+
+def _ca(blk_price, clear_to_t1=False):
+    return {"clear_to_t1": clear_to_t1,
+            "blocking_level": {"price": blk_price, "label": "1H-R"}}
+
+
+def test_chase_frac_blocker_on_top_of_entry(blocker_chase_frac):
+    # AMD from the logs: entry 525.79, blocker 526.47, T1 541.28 -> ~4% of path.
+    frac = blocker_chase_frac(525.79, 541.28, _ca(526.47))
+    assert frac is not None and frac < 0.34, "immediate-overhead blocker must trip the guard"
+
+
+def test_chase_frac_blocker_far_along_path(blocker_chase_frac):
+    # MU from the logs: entry 1021.65, blocker 1036.37, T1 1053.9 -> ~46% of path.
+    frac = blocker_chase_frac(1021.65, 1053.9, _ca(1036.37))
+    assert frac is not None and frac > 0.34, "a blocker near T1 must NOT trip the guard"
+
+
+def test_chase_frac_none_when_clear(blocker_chase_frac):
+    assert blocker_chase_frac(100.0, 105.0, _ca(101.0, clear_to_t1=True)) is None
+    assert blocker_chase_frac(100.0, None, _ca(101.0)) is None
+    assert blocker_chase_frac(100.0, 105.0, None) is None
+
+
+def test_chase_demotion_wired_into_both_paths(main_src):
+    # Both the ORB and alt-strategy assembly paths must demote on a near blocker.
+    assert main_src.count("chase-into-resistance -> D") == 2, \
+        "chase guard must demote to D in both signal-assembly paths"
+    assert "\"chase_resist_frac\"" in main_src
+
+
+# ---------------------------------------------------------------------------
+# #5 -- score normalized to a common 0-100 scale
+# ---------------------------------------------------------------------------
+
+def test_scores_clamped_to_0_100(main_src):
+    # Every intraday generator must clamp onto the shared 0-100 band so the
+    # `score` field is comparable across signal types.
+    assert main_src.count("min(100.0, score * vol_mult)") >= 4, \
+        "ORB + alt-strategy scores must all clamp to a common 0-100 scale"
+    # The old raw ORB formula (~2 scale) must be gone.
+    assert "(breakout_strength * 100 + vol_ratio) * vol_mult" not in main_src
+
+
+# ---------------------------------------------------------------------------
+# #6 -- overpriced-option (IV) guardrail
+# ---------------------------------------------------------------------------
+
+def test_iv_cap_configured(main_src):
+    assert "\"max_option_iv\"" in main_src
+
+
+def test_option_picker_accepts_and_enforces_iv_cap(main_src, main_tree):
+    fn = _find_func(main_tree, "get_liquid_option")
+    assert fn is not None, "get_liquid_option missing"
+    assert "max_iv" in [a.arg for a in fn.args.args], \
+        "get_liquid_option must accept a max_iv cap"
+    body = ast.get_source_segment(main_src, fn)
+    assert "IV_HIGH" in body and "best[\"iv\"] > max_iv" in body, \
+        "picker must reject the selected contract when its IV tops the cap"
+
+
+def test_iv_cap_passed_by_intraday_callers(main_src):
+    assert main_src.count("max_iv=cfg.get(\"max_option_iv\")") == 2, \
+        "both intraday callers must pass the configured IV cap"
+    assert main_src.count("IV>{:.0f}% (overpriced)") == 2, \
+        "both callers must surface the overpriced-IV skip reason"
+
+
+# ---------------------------------------------------------------------------
 # #2 -- VWAP volume N/A guard (structural)
 # ---------------------------------------------------------------------------
 
