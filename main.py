@@ -351,6 +351,16 @@ DEFAULT_CONFIG = {
     # penalty rather than the hard C cap reserved for 4hr/daily levels.
     "clear_air_tol_pct":        0.12,
     "clear_air_weak_strength":  1,
+    # Chase-into-resistance guard: when a level blocks the path to T1 and sits
+    # within this fraction of the distance to T1 (i.e. right on top of entry),
+    # the trade has to punch through overhead supply immediately. Demote such
+    # setups to D so they're dropped from the board rather than shown/alerted.
+    "chase_resist_frac":        0.34,
+    # Overpriced-option guardrail: skip a setup when the selected (~0.40 delta)
+    # contract's implied vol exceeds this. Rich IV means paying up for a move
+    # the market has already priced in. Earnings/IV-crush swings are exempt
+    # (they intentionally want high IV and don't pass this cap).
+    "max_option_iv":            0.70,
 
     # --- AI state ---
     "ai_insight": "Baseline config -- collecting trade data to begin optimization.",
@@ -1664,7 +1674,7 @@ def detect_vwap_trend(intraday, daily, vwap, cfg, et_hour,
 
     # Score: base 50 + adjustments
     score = 50 + (trend_pct * 20) + min(vwap_dist_pct * 10, 15)
-    score = score * vol_mult
+    score = max(0.0, min(100.0, score * vol_mult))
 
     log("{}: VWAP_TREND {} | dist={:.2f}% | trend={:.0f}% | vol={:.1f}x".format(
         symbol, direction, vwap_dist_pct, trend_pct * 100, time_vol_ratio))
@@ -1736,7 +1746,7 @@ def detect_vwap_mean_reversion(intraday, daily, vwap, cfg, et_hour,
     # Score: distance from band matters, volume matters
     band_dist = abs(price - vwap_val) / vwap_val * 100 if vwap_val else 0
     score = 45 + min(band_dist * 8, 20) + min(time_vol_ratio * 5, 15)
-    score = score * vol_mult
+    score = max(0.0, min(100.0, score * vol_mult))
 
     log("{}: VWAP_MR {} from {} band | dist={:.2f}% | vol={:.1f}x".format(
         "?", direction, band_tag, band_dist, time_vol_ratio))
@@ -1836,7 +1846,7 @@ def detect_ib_extension(intraday, daily, vwap, cfg, et_hour,
 
     # Score: extension magnitude + volume
     score = 55 + min(extension * 15, 25) + min(time_vol_ratio * 5, 15)
-    score = score * vol_mult
+    score = max(0.0, min(100.0, score * vol_mult))
 
     log("{}: IB_EXT {} | ext={:.1f}x IB | vol={:.1f}x".format(
         "?", direction, extension, time_vol_ratio))
@@ -2308,6 +2318,23 @@ def check_clear_air(price, direction, t1, t2, key_levels, tol_pct=0.0):
     }
 
 
+def _blocker_chase_frac(price, t1, clear_air):
+    """Fraction of the path from entry to T1 that the nearest blocking level
+    sits at: ~0 means the blocker is right on top of entry (worst -- the trade
+    must punch through overhead supply immediately), ~1 means it's just shy of
+    T1. Returns None when nothing blocks T1 or the inputs are missing."""
+    if not clear_air or clear_air.get("clear_to_t1") or not t1 or not price:
+        return None
+    blk = (clear_air.get("blocking_level") or {})
+    blk_px = blk.get("price")
+    if not blk_px:
+        return None
+    path = abs(t1 - price)
+    if path <= 0:
+        return None
+    return abs(blk_px - price) / path
+
+
 def recommend_contract(symbol, direction, price, orb_range):
     """
     Recommends the best 0DTE contract targeting delta ~0.40 (ATM/slightly OTM).
@@ -2548,7 +2575,7 @@ def _next_expiry_dates(n=4):
 
 
 def get_liquid_option(symbol, direction, underlying_price=None,
-                      et_hour=None, zero_dte_cutoff=None):
+                      et_hour=None, zero_dte_cutoff=None, max_iv=None):
     """
     Fetch the nearest available ATM option via Alpaca options snapshot API.
 
@@ -2697,6 +2724,15 @@ def get_liquid_option(symbol, direction, underlying_price=None,
                 candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
 
             best = candidates[0]
+
+            # Overpriced-option guardrail: the selected (~0.40 delta) contract
+            # is representative of the chain's vol. If its IV tops the cap, the
+            # move is already priced in -- skip rather than pay up. The "IV_HIGH"
+            # sentinel lets the caller keep the row on the board as WATCHING.
+            if max_iv and best.get("iv") and best["iv"] > max_iv:
+                log("  {} {} skipped: IV {:.0f}% > {:.0f}% cap (overpriced)".format(
+                    symbol, option_type, best["iv"] * 100, max_iv * 100))
+                return None, None, False, "IV_HIGH"
 
             exp_date  = _dt.datetime.strptime(expiry_str, "%Y-%m-%d").date()
             dte       = (exp_date - today_date).days
@@ -3508,15 +3544,25 @@ def scan_all_symbols():
 
                 if not clear_air["clear_to_t1"]:
                     blk = clear_air.get("blocking_level") or {}
-                    weak = blk.get("strength", 3) <= cfg.get("clear_air_weak_strength", 1)
-                    if weak:
-                        grade_pts = min(grade_pts, 62)
-                        if grade == "A":
-                            grade = "B"; grade_color = "#3fb950"
+                    chase_frac = _blocker_chase_frac(price, result.get(t1_key), clear_air)
+                    if (chase_frac is not None
+                            and chase_frac <= cfg.get("chase_resist_frac", 0.34)):
+                        # Chasing into immediate resistance -- hard-demote to D.
+                        grade = "D"; grade_color = "#8b949e"
+                        grade_pts = min(grade_pts, cfg["grade_c_min"] - 1)
+                        log("  {} chase-into-resistance -> D ({} {:.2f}, {:.0f}% of path to T1)".format(
+                            symbol, blk.get("label", "level"), blk.get("price", 0),
+                            chase_frac * 100))
                     else:
-                        grade_pts = min(grade_pts, 52)
-                        if grade in ("A", "B"):
-                            grade = "C"; grade_color = "#f0883e"
+                        weak = blk.get("strength", 3) <= cfg.get("clear_air_weak_strength", 1)
+                        if weak:
+                            grade_pts = min(grade_pts, 62)
+                            if grade == "A":
+                                grade = "B"; grade_color = "#3fb950"
+                        else:
+                            grade_pts = min(grade_pts, 52)
+                            if grade in ("A", "B"):
+                                grade = "C"; grade_color = "#f0883e"
 
                 result["rec_contract"] = recommend_contract(symbol, direction, price, orb_range)
 
@@ -3532,7 +3578,8 @@ def scan_all_symbols():
 
                 premium, strike, is_live, dte_label = get_liquid_option(
                     symbol, direction, price, et_hour=et_hour,
-                    zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
+                    zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5),
+                    max_iv=cfg.get("max_option_iv"))
 
                 if premium and is_live:
                     stp, tgt = option_risk_levels(premium)
@@ -3542,6 +3589,11 @@ def scan_all_symbols():
                     result["target"]    = tgt
                     result["dte_label"] = dte_label or "0DTE"
                     result["status"]    = "SIGNAL"
+                elif dte_label == "IV_HIGH":
+                    # Valid setup, but the option is too richly priced to trade.
+                    result["status"]      = "WATCHING"
+                    result["skip_reason"] = "IV>{:.0f}% (overpriced)".format(
+                        (cfg.get("max_option_iv") or 0.70) * 100)
                 else:
                     result["status"] = "SIGNAL (no options)"
                     # Only the suppressed-0DTE sentinel returns a label here;
@@ -3602,7 +3654,14 @@ def scan_all_symbols():
 
         vol_ratio = current["v"] / intraday[-2]["v"] if intraday[-2]["v"] > 0 else 1
         result["vol_ratio"] = round(vol_ratio, 2)
-        score     = (breakout_strength * 100 + vol_ratio) * vol_mult
+        # Quality score on a 0-100 scale, consistent with the alt-strategy
+        # signals (VWAP_TREND / Keltner / IB-extension) so `score` is
+        # comparable across signal types. Built from breakout extension +
+        # relative volume; the old raw formula produced ~2 here vs ~70 there.
+        score = (50.0
+                 + min(breakout_strength * 100.0 * 6.0, 30.0)
+                 + min(vol_ratio * 12.0, 20.0))
+        score = max(0.0, min(100.0, score * vol_mult))
 
         result["aligned"] = not (
             (direction == "CALL" and market_bias == "BEAR") or
@@ -3643,20 +3702,31 @@ def scan_all_symbols():
 
         if not clear_air["clear_to_t1"]:
             blk = clear_air.get("blocking_level") or {}
-            weak = blk.get("strength", 3) <= cfg.get("clear_air_weak_strength", 1)
-            if weak:
-                # A lone 1H swing-high is not strong enough for the hard C cap.
-                # Apply a softer one-grade penalty and a higher points ceiling.
-                grade_pts = min(grade_pts, 62)
-                if grade == "A":
-                    grade = "B"; grade_color = "#3fb950"
-                    log("  {} grade A->B (weak {} blocks T1): {}".format(
-                        symbol, blk.get("label", "level"), clear_air["context"]))
+            chase_frac = _blocker_chase_frac(price, result.get(t1_key), clear_air)
+            if (chase_frac is not None
+                    and chase_frac <= cfg.get("chase_resist_frac", 0.34)):
+                # Blocker sits right on top of entry -- chasing into immediate
+                # resistance. Hard-demote to D so it drops off the board.
+                grade = "D"; grade_color = "#8b949e"
+                grade_pts = min(grade_pts, cfg["grade_c_min"] - 1)
+                log("  {} chase-into-resistance -> D ({} {:.2f}, {:.0f}% of path to T1)".format(
+                    symbol, blk.get("label", "level"), blk.get("price", 0),
+                    chase_frac * 100))
             else:
-                grade_pts = min(grade_pts, 52)
-                if grade in ("A", "B"):
-                    grade = "C"; grade_color = "#f0883e"
-                    log("  {} grade capped C: {}".format(symbol, clear_air["context"]))
+                weak = blk.get("strength", 3) <= cfg.get("clear_air_weak_strength", 1)
+                if weak:
+                    # A lone 1H swing-high is not strong enough for the hard C
+                    # cap. Apply a softer one-grade penalty and higher ceiling.
+                    grade_pts = min(grade_pts, 62)
+                    if grade == "A":
+                        grade = "B"; grade_color = "#3fb950"
+                        log("  {} grade A->B (weak {} blocks T1): {}".format(
+                            symbol, blk.get("label", "level"), clear_air["context"]))
+                else:
+                    grade_pts = min(grade_pts, 52)
+                    if grade in ("A", "B"):
+                        grade = "C"; grade_color = "#f0883e"
+                        log("  {} grade capped C: {}".format(symbol, clear_air["context"]))
         elif clear_air["clear_to_t2"] and grade_pts >= 70:
             grade_pts = min(grade_pts + 5, 100)
 
@@ -3709,7 +3779,8 @@ def scan_all_symbols():
 
         premium, strike, is_live, dte_label = get_liquid_option(
             symbol, direction, price, et_hour=et_hour,
-            zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
+            zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5),
+            max_iv=cfg.get("max_option_iv"))
 
         if premium and is_live:
             stp, tgt = option_risk_levels(premium)
@@ -3719,6 +3790,11 @@ def scan_all_symbols():
             result["target"]    = tgt
             result["dte_label"] = dte_label or "0DTE"
             result["status"]    = "SIGNAL"
+        elif dte_label == "IV_HIGH":
+            # Valid setup, but the option is too richly priced to trade.
+            result["status"]      = "WATCHING"
+            result["skip_reason"] = "IV>{:.0f}% (overpriced)".format(
+                (cfg.get("max_option_iv") or 0.70) * 100)
         else:
             result["status"] = "SIGNAL (no options)"
             # See alt-strategy path: only label the suppressed-0DTE sentinel.
@@ -6671,6 +6747,26 @@ def _sweep_already_done_today(key):
     return _sweep_marker_get(key) == datetime.now(et).date().isoformat()
 
 
+# Re-attempt throttle for the EOD Databento sweeps (GEX/OI). The persistent
+# success marker above governs "already done"; this only spaces out RETRIES of
+# a sweep that came back empty -- e.g. an OPRA EOD `statistics` batch that
+# isn't published yet -- so we recover the same evening without launching a
+# thread on every scheduler tick. Module-level so it survives across loop
+# iterations; naturally re-arms next day once the stored timestamp is in the
+# past and the (date-keyed) success marker no longer matches.
+_sweep_retry_at = {}
+
+
+def _sweep_retry_due(key, gap_min=30):
+    """Claim a retry slot for `key`. Returns True at most once per `gap_min`
+    minutes, recording the next-eligible time as it does so."""
+    now = time.time()
+    if now < _sweep_retry_at.get(key, 0.0):
+        return False
+    _sweep_retry_at[key] = now + gap_min * 60
+    return True
+
+
 def _refresh_gex_snapshots():
     """
     End-of-day chain snapshot: builds GEX, saves OI history for delta tracking.
@@ -7219,7 +7315,7 @@ def _check_overnight_gamma_reversal():
         log("overnight gamma check error: {}".format(e))
 
 
-_daily_refresh_done = {"date": None, "vol": False, "earnings": False, "gex": False}
+_daily_refresh_done = {"date": None, "vol": False, "earnings": False}
 _premarket_done     = {"date": None}
 _overnight_done     = {"date": None}
 
@@ -7272,9 +7368,15 @@ def background_scheduler():
         threading.Thread(target=_pull_opening_flow, daemon=True).start()
     if _is_session and boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
-    if _is_session and boot_hour >= 16.5:
-        threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
-        threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
+    # GEX/OI read OPRA's EOD statistics batch (published well after the close),
+    # so they start at 5:30 PM ET. On a late boot, kick them once here too --
+    # the persistent success marker and the retry throttle keep the recurring
+    # scheduler from launching a duplicate run on its first iteration.
+    if _is_session and boot_hour >= 17.5:
+        if not _sweep_already_done_today("gex") and _sweep_retry_due("gex"):
+            threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
+        if not _sweep_already_done_today("oi") and _sweep_retry_due("oi"):
+            threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
 
     # Mark today's refreshes as done so we don't double-run
     _daily_refresh_done["date"]       = today_str
@@ -7283,8 +7385,8 @@ def background_scheduler():
     _daily_refresh_done["mprofile"]   = boot_hour >= 8.0
     _daily_refresh_done["flow"]       = boot_hour >= 10.1
     _daily_refresh_done["premarket"]  = (boot_hour >= 8.5)
-    _daily_refresh_done["gex"]        = boot_hour >= 16.5
-    _daily_refresh_done["oi"]         = boot_hour >= 16.5
+    # gex/oi are governed by their own persistent success marker + retry
+    # throttle (see _sweep_retry_due), not this in-memory done-flag.
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
     _daily_refresh_done["paper"]      = boot_hour >= 16.05
     # Only relevant on Fridays; pre-mark on non-Fridays so it never fires.
@@ -7315,12 +7417,10 @@ def background_scheduler():
                 _daily_refresh_done["date"] = today
                 _daily_refresh_done["earnings"]  = False
                 _daily_refresh_done["vol"]       = False
-                _daily_refresh_done["gex"]       = False
                 _daily_refresh_done["iv"]        = False
                 _daily_refresh_done["premarket"] = False
                 _daily_refresh_done["mprofile"]  = False
                 _daily_refresh_done["flow"]      = False
-                _daily_refresh_done["oi"]        = False
                 _daily_refresh_done["paper"]     = False
                 # Pre-mark non-Fridays so the digest never fires on Mon-Thu.
                 _daily_refresh_done["friday_digest"] = (
@@ -7381,15 +7481,25 @@ def background_scheduler():
                     _overnight_done["date"] = today
                     threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
 
-            # 4:30 PM ET: post-close GEX snapshot (both modes — feeds tomorrow's brief)
-            if _session and et_hour >= 16.5 and not _daily_refresh_done.get("gex"):
+            # Post-close GEX + OI snapshots (feed tomorrow's brief / OI-delta
+            # tracking). Both read OPRA's EOD `statistics` schema, whose
+            # open-interest batch is not published until well after the close,
+            # so the old 4:30 PM sweep returned empty chains (chain_len=0) and
+            # the fire-and-forget done-flag then lost the data until the next
+            # process restart. Start at 5:30 PM ET and retry on a throttle
+            # through ~8 PM, gating on the persistent success marker so we stop
+            # the moment a pull lands (and never re-run a sweep already paid
+            # for). IV stays earlier -- it pulls live Alpaca snapshots, not the
+            # Databento EOD batch, so it is available right after the close.
+            if (_session and 17.5 <= et_hour < 20.0
+                    and not _sweep_already_done_today("gex")
+                    and _sweep_retry_due("gex")):
                 threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
-                _daily_refresh_done["gex"] = True
 
-            # 4:35 PM ET: OI snapshot for delta tracking (full universe)
-            if _session and et_hour >= 16.58 and not _daily_refresh_done.get("oi"):
+            if (_session and 17.58 <= et_hour < 20.0
+                    and not _sweep_already_done_today("oi")
+                    and _sweep_retry_due("oi")):
                 threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
-                _daily_refresh_done["oi"] = True
 
             # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
             if _session and et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
