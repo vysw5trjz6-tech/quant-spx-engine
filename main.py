@@ -6671,6 +6671,26 @@ def _sweep_already_done_today(key):
     return _sweep_marker_get(key) == datetime.now(et).date().isoformat()
 
 
+# Re-attempt throttle for the EOD Databento sweeps (GEX/OI). The persistent
+# success marker above governs "already done"; this only spaces out RETRIES of
+# a sweep that came back empty -- e.g. an OPRA EOD `statistics` batch that
+# isn't published yet -- so we recover the same evening without launching a
+# thread on every scheduler tick. Module-level so it survives across loop
+# iterations; naturally re-arms next day once the stored timestamp is in the
+# past and the (date-keyed) success marker no longer matches.
+_sweep_retry_at = {}
+
+
+def _sweep_retry_due(key, gap_min=30):
+    """Claim a retry slot for `key`. Returns True at most once per `gap_min`
+    minutes, recording the next-eligible time as it does so."""
+    now = time.time()
+    if now < _sweep_retry_at.get(key, 0.0):
+        return False
+    _sweep_retry_at[key] = now + gap_min * 60
+    return True
+
+
 def _refresh_gex_snapshots():
     """
     End-of-day chain snapshot: builds GEX, saves OI history for delta tracking.
@@ -7219,7 +7239,7 @@ def _check_overnight_gamma_reversal():
         log("overnight gamma check error: {}".format(e))
 
 
-_daily_refresh_done = {"date": None, "vol": False, "earnings": False, "gex": False}
+_daily_refresh_done = {"date": None, "vol": False, "earnings": False}
 _premarket_done     = {"date": None}
 _overnight_done     = {"date": None}
 
@@ -7272,9 +7292,15 @@ def background_scheduler():
         threading.Thread(target=_pull_opening_flow, daemon=True).start()
     if _is_session and boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
-    if _is_session and boot_hour >= 16.5:
-        threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
-        threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
+    # GEX/OI read OPRA's EOD statistics batch (published well after the close),
+    # so they start at 5:30 PM ET. On a late boot, kick them once here too --
+    # the persistent success marker and the retry throttle keep the recurring
+    # scheduler from launching a duplicate run on its first iteration.
+    if _is_session and boot_hour >= 17.5:
+        if not _sweep_already_done_today("gex") and _sweep_retry_due("gex"):
+            threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
+        if not _sweep_already_done_today("oi") and _sweep_retry_due("oi"):
+            threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
 
     # Mark today's refreshes as done so we don't double-run
     _daily_refresh_done["date"]       = today_str
@@ -7283,8 +7309,8 @@ def background_scheduler():
     _daily_refresh_done["mprofile"]   = boot_hour >= 8.0
     _daily_refresh_done["flow"]       = boot_hour >= 10.1
     _daily_refresh_done["premarket"]  = (boot_hour >= 8.5)
-    _daily_refresh_done["gex"]        = boot_hour >= 16.5
-    _daily_refresh_done["oi"]         = boot_hour >= 16.5
+    # gex/oi are governed by their own persistent success marker + retry
+    # throttle (see _sweep_retry_due), not this in-memory done-flag.
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
     _daily_refresh_done["paper"]      = boot_hour >= 16.05
     # Only relevant on Fridays; pre-mark on non-Fridays so it never fires.
@@ -7315,12 +7341,10 @@ def background_scheduler():
                 _daily_refresh_done["date"] = today
                 _daily_refresh_done["earnings"]  = False
                 _daily_refresh_done["vol"]       = False
-                _daily_refresh_done["gex"]       = False
                 _daily_refresh_done["iv"]        = False
                 _daily_refresh_done["premarket"] = False
                 _daily_refresh_done["mprofile"]  = False
                 _daily_refresh_done["flow"]      = False
-                _daily_refresh_done["oi"]        = False
                 _daily_refresh_done["paper"]     = False
                 # Pre-mark non-Fridays so the digest never fires on Mon-Thu.
                 _daily_refresh_done["friday_digest"] = (
@@ -7381,15 +7405,25 @@ def background_scheduler():
                     _overnight_done["date"] = today
                     threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
 
-            # 4:30 PM ET: post-close GEX snapshot (both modes — feeds tomorrow's brief)
-            if _session and et_hour >= 16.5 and not _daily_refresh_done.get("gex"):
+            # Post-close GEX + OI snapshots (feed tomorrow's brief / OI-delta
+            # tracking). Both read OPRA's EOD `statistics` schema, whose
+            # open-interest batch is not published until well after the close,
+            # so the old 4:30 PM sweep returned empty chains (chain_len=0) and
+            # the fire-and-forget done-flag then lost the data until the next
+            # process restart. Start at 5:30 PM ET and retry on a throttle
+            # through ~8 PM, gating on the persistent success marker so we stop
+            # the moment a pull lands (and never re-run a sweep already paid
+            # for). IV stays earlier -- it pulls live Alpaca snapshots, not the
+            # Databento EOD batch, so it is available right after the close.
+            if (_session and 17.5 <= et_hour < 20.0
+                    and not _sweep_already_done_today("gex")
+                    and _sweep_retry_due("gex")):
                 threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
-                _daily_refresh_done["gex"] = True
 
-            # 4:35 PM ET: OI snapshot for delta tracking (full universe)
-            if _session and et_hour >= 16.58 and not _daily_refresh_done.get("oi"):
+            if (_session and 17.58 <= et_hour < 20.0
+                    and not _sweep_already_done_today("oi")
+                    and _sweep_retry_due("oi")):
                 threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
-                _daily_refresh_done["oi"] = True
 
             # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
             if _session and et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
