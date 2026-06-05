@@ -2931,8 +2931,15 @@ def _fetch_bars(symbol, timeframe, limit, kind):
         _lookback_days = 7
     _start_iso = (datetime.now(pytz.utc)
                   - timedelta(days=_lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # sort=desc is critical: Alpaca defaults to ascending and, when the
+    # [start, now] window holds MORE than `limit` bars, returns the OLDEST
+    # `limit` bars plus a next_page_token. We don't paginate, so an ascending
+    # fetch silently drops the most recent bars -- for limit=90 over a ~154d
+    # window that's the latest ~3-4 weeks, leaving daily[-1] (the "current
+    # price") a month stale across the whole universe. Fetching newest-first
+    # and reversing back to ascending guarantees we keep the freshest `limit`.
     params = {"timeframe": timeframe, "limit": limit,
-              "feed": "iex", "start": _start_iso}
+              "feed": "iex", "start": _start_iso, "sort": "desc"}
 
     attempts = 3
     backoff  = 0.5
@@ -2944,6 +2951,10 @@ def _fetch_bars(symbol, timeframe, limit, kind):
             if r.status_code == 200:
                 bars = r.json().get("bars", []) or []
                 if bars:
+                    # We fetched newest-first (sort=desc); flip back to
+                    # ascending so every downstream detector's daily[-1] /
+                    # weekly[-1] is the most recent bar, as they all assume.
+                    bars.reverse()
                     _bars_cache_set(cache_key, bars)
                     return bars
                 # 200 OK but no bars. This is the silent-outage signature
@@ -5509,6 +5520,19 @@ def scan_swing_symbol(symbol):
                     and best.get("stage") == 1):
                 gate_reason = "stage-1 earnings continuation"
 
+            # 4) Don't enter against the stock's OWN current-day move. The
+            #    structural detectors (e.g. Wyckoff spring) score the pattern,
+            #    not today's tape -- so a name dumping -4% intraday could still
+            #    print a fresh CALL. A sharp adverse day invalidates the entry
+            #    until it stabilizes. Uses prior close so gaps count.
+            if gate_reason is None and len(daily) >= 2 and daily[-2]["c"]:
+                max_adverse = wcfg.get("swing_max_adverse_day_pct", 3.0)
+                day_chg = (current - daily[-2]["c"]) / daily[-2]["c"] * 100
+                if direction == "CALL" and day_chg <= -max_adverse:
+                    gate_reason = "adverse day for CALL ({:+.1f}%)".format(day_chg)
+                elif direction == "PUT" and day_chg >= max_adverse:
+                    gate_reason = "adverse day for PUT ({:+.1f}%)".format(day_chg)
+
             if gate_reason:
                 tier = 2
                 best["tier"] = 2
@@ -5568,6 +5592,20 @@ def scan_swing_symbol(symbol):
 
         rr1  = round(abs(t1 - current) / abs(current - stop), 2) if (
             t1 and stop and abs(current - stop) > 0) else 0
+
+        # R:R floor (tier-1 only). A near-zero R:R means the first target is
+        # already at/through the current price -- the move the detector found
+        # has already happened, so there's no reward left to justify the risk.
+        # This is the "0.0:1 R:R" card: downgrade it to a watch instead of
+        # surfacing it as an actionable 80% setup.
+        if tier == 1:
+            min_rr = get_config().get("swing_min_rr", 1.0)
+            if rr1 < min_rr:
+                tier = 2
+                best["tier"] = 2
+                best["gate_reason"] = "R:R {:.1f} below {:.1f} floor".format(rr1, min_rr)
+                _swing_stats_bump("tier1_gated_rr")
+                log("{}: tier-1 downgraded -> {}".format(symbol, best["gate_reason"]))
 
         # Weekly option on the current-week settlement (tier-1 only). Build a
         # dict the dashboard/renderers expect; premium-stop/target are

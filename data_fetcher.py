@@ -74,7 +74,11 @@ def _fetch_bars(symbol, timeframe, limit, start=None):
     Alpaca's default "latest N bars" silently bleeds yesterday's session
     in during the first hour of trading.
     """
-    params = {"timeframe": timeframe, "limit": limit}
+    # sort=desc + reverse keeps the freshest `limit` bars. Alpaca defaults to
+    # ascending and caps at `limit`, so when the window holds more than `limit`
+    # bars it returns the OLDEST `limit` and a (here unused) next_page_token --
+    # which would leave the latest bars (and the current price) silently stale.
+    params = {"timeframe": timeframe, "limit": limit, "sort": "desc"}
     if start:
         params["start"] = start
     try:
@@ -86,7 +90,11 @@ def _fetch_bars(symbol, timeframe, limit, start=None):
         )
         if r.status_code != 200:
             return None
-        return r.json().get("bars", [])
+        bars = r.json().get("bars", []) or []
+        # Flip back to ascending: callers index bars[-1] as the latest bar
+        # and walk forward (ORB uses bars[:N] as the opening range).
+        bars.reverse()
+        return bars
     except Exception as e:
         print("[data_fetcher] {} {} error: {}".format(symbol, timeframe, e))
         return None
