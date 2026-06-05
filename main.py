@@ -2931,8 +2931,15 @@ def _fetch_bars(symbol, timeframe, limit, kind):
         _lookback_days = 7
     _start_iso = (datetime.now(pytz.utc)
                   - timedelta(days=_lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # sort=desc is critical: Alpaca defaults to ascending and, when the
+    # [start, now] window holds MORE than `limit` bars, returns the OLDEST
+    # `limit` bars plus a next_page_token. We don't paginate, so an ascending
+    # fetch silently drops the most recent bars -- for limit=90 over a ~154d
+    # window that's the latest ~3-4 weeks, leaving daily[-1] (the "current
+    # price") a month stale across the whole universe. Fetching newest-first
+    # and reversing back to ascending guarantees we keep the freshest `limit`.
     params = {"timeframe": timeframe, "limit": limit,
-              "feed": "iex", "start": _start_iso}
+              "feed": "iex", "start": _start_iso, "sort": "desc"}
 
     attempts = 3
     backoff  = 0.5
@@ -2944,6 +2951,10 @@ def _fetch_bars(symbol, timeframe, limit, kind):
             if r.status_code == 200:
                 bars = r.json().get("bars", []) or []
                 if bars:
+                    # We fetched newest-first (sort=desc); flip back to
+                    # ascending so every downstream detector's daily[-1] /
+                    # weekly[-1] is the most recent bar, as they all assume.
+                    bars.reverse()
                     _bars_cache_set(cache_key, bars)
                     return bars
                 # 200 OK but no bars. This is the silent-outage signature
