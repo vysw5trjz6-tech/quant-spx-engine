@@ -5520,6 +5520,19 @@ def scan_swing_symbol(symbol):
                     and best.get("stage") == 1):
                 gate_reason = "stage-1 earnings continuation"
 
+            # 4) Don't enter against the stock's OWN current-day move. The
+            #    structural detectors (e.g. Wyckoff spring) score the pattern,
+            #    not today's tape -- so a name dumping -4% intraday could still
+            #    print a fresh CALL. A sharp adverse day invalidates the entry
+            #    until it stabilizes. Uses prior close so gaps count.
+            if gate_reason is None and len(daily) >= 2 and daily[-2]["c"]:
+                max_adverse = wcfg.get("swing_max_adverse_day_pct", 3.0)
+                day_chg = (current - daily[-2]["c"]) / daily[-2]["c"] * 100
+                if direction == "CALL" and day_chg <= -max_adverse:
+                    gate_reason = "adverse day for CALL ({:+.1f}%)".format(day_chg)
+                elif direction == "PUT" and day_chg >= max_adverse:
+                    gate_reason = "adverse day for PUT ({:+.1f}%)".format(day_chg)
+
             if gate_reason:
                 tier = 2
                 best["tier"] = 2
@@ -5579,6 +5592,20 @@ def scan_swing_symbol(symbol):
 
         rr1  = round(abs(t1 - current) / abs(current - stop), 2) if (
             t1 and stop and abs(current - stop) > 0) else 0
+
+        # R:R floor (tier-1 only). A near-zero R:R means the first target is
+        # already at/through the current price -- the move the detector found
+        # has already happened, so there's no reward left to justify the risk.
+        # This is the "0.0:1 R:R" card: downgrade it to a watch instead of
+        # surfacing it as an actionable 80% setup.
+        if tier == 1:
+            min_rr = get_config().get("swing_min_rr", 1.0)
+            if rr1 < min_rr:
+                tier = 2
+                best["tier"] = 2
+                best["gate_reason"] = "R:R {:.1f} below {:.1f} floor".format(rr1, min_rr)
+                _swing_stats_bump("tier1_gated_rr")
+                log("{}: tier-1 downgraded -> {}".format(symbol, best["gate_reason"]))
 
         # Weekly option on the current-week settlement (tier-1 only). Build a
         # dict the dashboard/renderers expect; premium-stop/target are
