@@ -52,6 +52,17 @@ _billing_blocked_until = None  # datetime in UTC, or None
 
 
 def _is_billing_error(exc):
+    """Hard account-state errors that mean "stop calling Databento entirely".
+
+    Two cases, both of which must trip the cooldown breaker rather than be
+    retried per-symbol:
+      * 402 account_insufficient_funds -- out of credit.
+      * 403 auth_account_locked -- account locked/suspended (e.g. a failed
+        payment). Databento charges for every request *even when rejected*,
+        so re-hitting a locked account across 72 symbols on every scan both
+        burns money and floods the logs with 403s. Classify it here so the
+        breaker opens on the first occurrence.
+    """
     s = "{} {}".format(type(exc).__name__, exc).lower()
     return (
         "account_insufficient_funds" in s
@@ -59,6 +70,13 @@ def _is_billing_error(exc):
         or "insufficient funds" in s
         or " 402" in s
         or s.startswith("402")
+        # Account locked / suspended / auth rejected -> stop calling.
+        or "auth_account_locked" in s
+        or "account_locked" in s
+        or "account has been locked" in s
+        or "locked for security" in s
+        or " 403" in s
+        or s.startswith("403")
     )
 
 
@@ -395,6 +413,27 @@ def _cache_set(key, value):
     conn.close()
 
 
+# ---- Negative-result cache --------------------------------------------------
+# Databento bills for EVERY request, including ones that come back empty or are
+# rejected. The positive cache only stores successful payloads, so a query that
+# returned nothing (OPRA batch not published yet, a name with no listed options,
+# a transient failure) used to be re-issued -- and re-charged -- on every
+# scheduler tick and by every caller. Remember "this query just came back empty"
+# for a short window so we don't pay for the same miss repeatedly. The TTL is
+# kept below the 30-minute EOD sweep retry gap so a legitimately-delayed batch
+# still recovers on the next scheduled retry.
+_NEG_CACHE_TTL = 20 * 60
+
+
+def _neg_cached(key):
+    """True if `key` recently returned empty/failed -- skip the paid re-pull."""
+    return _cache_get("neg_" + key, max_age_seconds=_NEG_CACHE_TTL) is not None
+
+
+def _neg_cache_set(key):
+    _cache_set("neg_" + key, {"empty": True})
+
+
 # =============================================
 # VIX SPOT PROXY (via VX front-month futures)
 # =============================================
@@ -451,6 +490,8 @@ def get_vix_proxy(target_date_et=None):
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("vix")
+    if _neg_cached(cache_key):
+        return None
 
     # 7-day window so weekends/holidays still yield a recent settlement.
     start_iso = (target_date_et - timedelta(days=7)).isoformat()
@@ -467,6 +508,7 @@ def get_vix_proxy(target_date_et=None):
         if df is None or df.empty:
             print("[databento] VX proxy empty. Window: {} -> {}".format(
                 start_iso, end_iso))
+            _neg_cache_set(cache_key)
             return None
 
         # Extract latest close per contract. Databento puts the resolved
@@ -508,6 +550,7 @@ def get_vix_proxy(target_date_et=None):
         else:
             _emit_error("databento.fetch_failed", source="vix_proxy",
                         exc=type(e).__name__)
+            _neg_cache_set(cache_key)
         return None
 
 
@@ -543,6 +586,8 @@ def get_overnight_bars(contract="ES", target_date_et=None):
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("bars", [])
+    if _neg_cached(cache_key):
+        return []
 
     symbol = CONTRACT_MAP.get(contract, "ES.n.0")
     try:
@@ -558,6 +603,7 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         if df is None or df.empty:
             print("[databento] {} overnight empty. Window: {} -> {}".format(
                 contract, start_iso, end_iso))
+            _neg_cache_set(cache_key)
             return []
 
         bars = []
@@ -580,6 +626,7 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         else:
             _emit_error("databento.fetch_failed", source="overnight",
                         symbol=contract, exc=type(e).__name__)
+            _neg_cache_set(cache_key)
         return []
 
 
@@ -688,6 +735,9 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("chain", [])
+    # Don't re-pay for a query that just came back empty/failed.
+    if _neg_cached(cache_key):
+        return []
 
     end_iso = target_date_et.isoformat()
     parent  = underlying + ".OPT"
@@ -719,10 +769,12 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             _emit_error("databento.fetch_failed", source="statistics",
                         symbol=underlying, exc=type(e).__name__,
                         msg=str(e)[:200])
+            _neg_cache_set(cache_key)
         return []
 
     if stats_df is None or stats_df.empty:
         print("[databento] {} statistics empty".format(underlying))
+        _neg_cache_set(cache_key)
         return []
 
     has_stat_type = "stat_type" in stats_df.columns
@@ -745,6 +797,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         print("[databento] {} no OI rows (stats_total={} stat9_rows={})".format(
             underlying, len(stats_df),
             len(oi_df) if oi_df is not None else 0))
+        _neg_cache_set(cache_key)
         return []
 
     # 1b) Per-contract daily price from the SAME statistics pull (free).
@@ -803,6 +856,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             _emit_error("databento.fetch_failed", source="resolve",
                         symbol=underlying, exc=type(e).__name__,
                         msg=str(e)[:200])
+            _neg_cache_set(cache_key)
         return []
 
     # 2b) Price fallback: if the statistics schema carried no usable price
