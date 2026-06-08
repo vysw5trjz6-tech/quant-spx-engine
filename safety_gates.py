@@ -266,6 +266,10 @@ def enforce_config_invariants(cfg):
 
 EARNINGS_CACHE_DB = "earnings_calendar.db"
 
+# Last error seen while fetching the earnings calendar, so the daily refresh
+# caller can report *why* a 0/N run happened instead of failing silently.
+LAST_EARNINGS_ERROR = None
+
 
 def _init_earnings_db():
     conn = db_utils.connect(EARNINGS_CACHE_DB)
@@ -297,9 +301,11 @@ def update_earnings_calendar(symbol, fmp_api_key=None):
     The fmp_api_key argument is accepted for backwards-compat but ignored.
     Returns True if any rows were written.
     """
+    global LAST_EARNINGS_ERROR
     try:
         import yfinance as yf
     except ImportError:
+        LAST_EARNINGS_ERROR = "yfinance not installed"
         return False
 
     et  = pytz.timezone("America/New_York")
@@ -308,7 +314,11 @@ def update_earnings_calendar(symbol, fmp_api_key=None):
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.earnings_dates
-    except Exception:
+    except Exception as e:
+        # Capture WHY so a 0/N refresh isn't a silent black box. A uniform
+        # failure across every symbol is almost always Yahoo rate-limiting /
+        # blocking the (datacenter) IP, not 72 individually-missing calendars.
+        LAST_EARNINGS_ERROR = "{}: {}".format(type(e).__name__, str(e)[:200])
         return False
 
     if df is None or len(df) == 0:

@@ -5,6 +5,7 @@ import statistics
 import math
 import threading
 import time
+import random
 import json
 import sqlite3
 import db_utils
@@ -2968,8 +2969,11 @@ def _fetch_bars(symbol, timeframe, limit, kind):
                 break
             _swing_stats_bump("http_{}".format(r.status_code))
             # 429 = rate limited: back off and retry before giving up.
+            # Add full jitter so the 8 concurrent batch threads that all got
+            # 429'd don't wake and retry in lockstep (which just re-triggers
+            # the limit). sleep ~ [backoff, 2*backoff).
             if r.status_code == 429 and attempt < attempts - 1:
-                time.sleep(backoff)
+                time.sleep(backoff + random.uniform(0, backoff))
                 backoff *= 2
                 continue
             _log_swing_fetch_err(symbol, kind + "/http",
@@ -6744,8 +6748,14 @@ def _refresh_earnings_calendar():
         for s in all_syms:
             if safety_gates.update_earnings_calendar(s):
                 ok_count += 1
-        log("Earnings calendar refreshed for {}/{} symbols".format(
-            ok_count, len(all_syms)))
+        msg = "Earnings calendar refreshed for {}/{} symbols".format(
+            ok_count, len(all_syms))
+        # A 0/N run means the provider (Yahoo/yfinance) is failing for every
+        # symbol -- surface the captured reason instead of a silent zero.
+        last_err = getattr(safety_gates, "LAST_EARNINGS_ERROR", None)
+        if ok_count == 0 and last_err:
+            msg += " | last_error={}".format(last_err)
+        log(msg)
     except Exception as e:
         log("earnings calendar refresh error: {}".format(e))
 
@@ -6850,10 +6860,13 @@ def _refresh_gex_snapshots():
             else:
                 # Diagnostic: probe the chain directly so the log says
                 # which leg was empty (chain itself, vs. compute step
-                # downstream). databento_adapter.get_options_chain_snapshot
-                # is cached so this is essentially free on the same scan.
+                # downstream). Pass with_price=True so this reuses the exact
+                # cache key refresh_gex just populated (the GEX path always
+                # pulls with prices); with_price=False would be a *different*
+                # cache key and re-issue a second, separately-billed pull.
                 import databento_adapter as _da
-                chain_probe = _da.get_options_chain_snapshot(sym) or []
+                chain_probe = _da.get_options_chain_snapshot(
+                    sym, with_price=True) or []
                 log_event("gex.snapshot_empty", level="warn", symbol=sym,
                           spot=spot,
                           chain_len=len(chain_probe),
