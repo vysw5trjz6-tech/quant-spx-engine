@@ -319,6 +319,12 @@ DEFAULT_CONFIG = {
     "counter_trend_allowed":    False,
     "min_grade":                "C",      # dashboard floor (D is suppressed)
     "alert_min_grade":          "B",      # only A/B grades fire alerts
+    # Expectancy floor on alerts: suppress signals whose modeled probability
+    # of reaching T1 is below this. ORB t1_prob falls as the opening range
+    # widens relative to the average daily range (T1 sits a full extra range
+    # away) -- ~1:1 R:R at a 20-30% modeled hit rate is negative EV even at
+    # grade B. Signals without a computed probability default to 50 (pass).
+    "alert_min_t1_prob":        40,
     # Anti-chase: skip an intraday breakout once price has already run more
     # than this fraction of the ORB range past the trigger -- entering
     # extended is the dominant intraday loss source. Demotes to WATCHING.
@@ -1154,8 +1160,16 @@ def _underlying_extent(pos):
     """High/low of the underlying since entry, for touch detection.
 
     INTRADAY: today's 5-min bars at/after the entry timestamp.
-    WEEKLY:   daily bars since the entry date, plus today's intraday range.
-    Falls back to the current price when bars are unavailable.
+    WEEKLY:   full daily bars for days AFTER the entry date, plus intraday
+              bars at/after the entry timestamp (covers the entry day's
+              post-entry tape and today's session).
+    Falls back to the current price when no post-entry bars exist yet.
+
+    Bars are stamped at bar START, so only bars beginning at/after entry
+    qualify. Never widen to pre-entry bars: an ORB breakout's stop sits
+    inside the morning's range by construction, so including the session
+    history reads the stop as already "touched" and force-closes every
+    position as a LOSS one scan after entry.
     """
     symbol = pos["symbol"]
     hi = lo = None
@@ -1164,20 +1178,15 @@ def _underlying_extent(pos):
         if pos.get("horizon") == "WEEKLY":
             daily = get_daily(symbol) or []
             entry_day = entry_ts[:10]
-            rel = [b for b in daily if (b.get("t") or "")[:10] >= entry_day]
-            for b in rel:
-                hi = b["h"] if hi is None else max(hi, b["h"])
-                lo = b["l"] if lo is None else min(lo, b["l"])
-            intra = get_intraday(symbol) or []
-            for b in intra:
-                hi = b["h"] if hi is None else max(hi, b["h"])
-                lo = b["l"] if lo is None else min(lo, b["l"])
+            rel = [b for b in daily if (b.get("t") or "")[:10] > entry_day]
+            rel += [b for b in (get_intraday(symbol) or [])
+                    if (b.get("t") or "") >= entry_ts]
         else:
             intra = get_intraday(symbol) or []
-            rel = [b for b in intra if (b.get("t") or "") >= entry_ts] or intra
-            for b in rel:
-                hi = b["h"] if hi is None else max(hi, b["h"])
-                lo = b["l"] if lo is None else min(lo, b["l"])
+            rel = [b for b in intra if (b.get("t") or "") >= entry_ts]
+        for b in rel:
+            hi = b["h"] if hi is None else max(hi, b["h"])
+            lo = b["l"] if lo is None else min(lo, b["l"])
     except Exception:
         pass
     if hi is None or lo is None:
@@ -1925,9 +1934,18 @@ def get_premarket_gap(daily_bars, intraday_bars):
     """
     if not daily_bars or not intraday_bars:
         return 0.0, "FLAT"
-    prev_close  = daily_bars[-1]["c"]
-    today_open  = intraday_bars[0]["o"]
-    if prev_close == 0:
+    # "Yesterday's close" must come from a bar dated BEFORE today's session:
+    # during RTH the daily series ends with today's still-forming bar, whose
+    # close is just the latest price -- using it made the "gap" the inverse of
+    # the intraday move (every selloff name showed a phantom gap UP).
+    today_key  = (intraday_bars[0].get("t") or "")[:10]
+    prev_close = None
+    for b in reversed(daily_bars):
+        if (b.get("t") or "")[:10] < today_key:
+            prev_close = b["c"]
+            break
+    today_open = intraday_bars[0]["o"]
+    if not prev_close:
         return 0.0, "FLAT"
     gap_pct = round((today_open - prev_close) / prev_close * 100, 3)
     if gap_pct > 0.3:
@@ -2288,7 +2306,11 @@ def check_clear_air(price, direction, t1, t2, key_levels, tol_pct=0.0):
     overhead doesn't spuriously block the path to T1.
     """
     if not key_levels or not t1 or not t2:
-        return {"clear_to_t1": True, "clear_to_t2": True,
+        # Unknown structure is NEUTRAL, not bullish: clear_to_t1/t2 stay True
+        # so the signal isn't demoted, but no_data tells the rank score and
+        # grade bump to skip the clear-air credit -- an empty level list
+        # (data gap) must not outrank a genuinely clear path.
+        return {"clear_to_t1": True, "clear_to_t2": True, "no_data": True,
                 "blocking_level": None, "context": "No levels identified"}
 
     tol_abs = price * (tol_pct / 100.0) if tol_pct else 0.0
@@ -2583,9 +2605,11 @@ def compute_rank_score(result):
     elif tv_ratio < 0.8:
         score += cfg["rank_vol_light"]
 
-    # Clear air
+    # Clear air (no_data = level lookup came back empty: neutral, no credit)
     ca = result.get("clear_air") or {}
-    if ca.get("clear_to_t2"):
+    if ca.get("no_data"):
+        pass
+    elif ca.get("clear_to_t2"):
         score += cfg["rank_clear_t2"]
     elif ca.get("clear_to_t1"):
         score += cfg["rank_clear_t1"]
@@ -3789,7 +3813,8 @@ def scan_all_symbols():
                     if grade in ("A", "B"):
                         grade = "C"; grade_color = "#f0883e"
                         log("  {} grade capped C: {}".format(symbol, clear_air["context"]))
-        elif clear_air["clear_to_t2"] and grade_pts >= 70:
+        elif (clear_air["clear_to_t2"] and not clear_air.get("no_data")
+                and grade_pts >= 70):
             grade_pts = min(grade_pts + 5, 100)
 
         result["rec_contract"] = recommend_contract(symbol, direction, price, orb_range)
@@ -3949,11 +3974,15 @@ def run_signal_scan():
     _alert_floor  = _cfg.get("alert_min_grade", "B")
     _allowed_gr   = {"A": {"A"}, "B": {"A", "B"}, "C": {"A", "B", "C"}}.get(
         _alert_floor, {"A", "B"})
+    _min_t1_prob  = _cfg.get("alert_min_t1_prob", 40)
     alertable = [s for s in signals
-                 if s.get("grade") in _allowed_gr and s.get("aligned", True)]
+                 if s.get("grade") in _allowed_gr and s.get("aligned", True)
+                 and (s.get("t1_prob") if s.get("t1_prob") is not None else 50)
+                 >= _min_t1_prob]
     if signals and not alertable:
-        log("Intraday: {} signal(s) below alert floor {} or counter-trend; "
-            "no alert".format(len(signals), _alert_floor))
+        log("Intraday: {} signal(s) below alert floor {}, t1_prob<{}%, or "
+            "counter-trend; no alert".format(
+                len(signals), _alert_floor, _min_t1_prob))
 
     # One live INTRADAY position at a time: if the tier is occupied, emit no new
     # intraday alerts until it closes (win/loss on underlying targets).
@@ -6002,7 +6031,7 @@ def run_unified_scan(do_intraday=False, do_weekly=False):
 
 def run_swing_scan():
     """
-    Scan SWING_SYMBOLS concurrently (batches of 8).
+    Scan SWING_SYMBOLS concurrently (batches of 4).
     Updates both swing_signals (used by renderer) and all_swing_signals (used by chat).
     """
     global swing_signals, next_swing_scan, all_swing_signals, swing_next_scan_at
@@ -6028,14 +6057,17 @@ def run_swing_scan():
             with results_lock:
                 results.append(sig)
 
-    for i in range(0, len(SWING_SYMBOLS), 8):
-        batch   = SWING_SYMBOLS[i:i + 8]
+    # Batches of 4 with a 1s pause: 8-wide bursts (2+ requests per symbol)
+    # stacked on top of the 5-min intraday scan were tripping Alpaca's
+    # 200 req/min limit (429s on WMT/HD/XLK/... every overlapping cycle).
+    for i in range(0, len(SWING_SYMBOLS), 4):
+        batch   = SWING_SYMBOLS[i:i + 4]
         threads = [threading.Thread(target=worker, args=(s,), daemon=True) for s in batch]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=25)
-        time.sleep(0.3)
+        time.sleep(1.0)
 
     type_pri = {"ONEIL_PIVOT": 4, "WYCKOFF_SPRING": 3, "HI52_BREAKOUT": 2, "EARNINGS_CONT": 1}
     results.sort(key=lambda x: (-x["prob"], -type_pri.get(x["signal_type"], 0)))
@@ -7049,10 +7081,15 @@ def _build_market_profile():
 def _pull_opening_flow():
     """
     Pull options flow in 8:00–10:00 ET window for SPY + QQQ.
-    Triggered at 10:05 AM ET so the full window is past.
+    First attempted at 10:05 AM ET; OPRA's historical availability often
+    lags hours behind real time, so a deferred/failed pull leaves the
+    daily "flow" flag unset and the scheduler retries every 30 min until
+    both symbols land (pull_opening_flow is idempotent per symbol/day).
     """
     if not HAS_OPT_FLOW:
+        _daily_refresh_done["flow"] = True   # nothing to retry for
         return
+    all_ok = True
     try:
         for sym in ("SPY", "QQQ"):
             try:
@@ -7061,10 +7098,16 @@ def _pull_opening_flow():
                     classification = options_flow.classify_flow(flow)
                     log("Opening flow {}: {} (imbalance {:+.2f})".format(
                         sym, classification["label"], classification["imbalance"]))
+                else:
+                    all_ok = False
             except Exception as e:
                 log("Flow pull {} error: {}".format(sym, e))
+                all_ok = False
     except Exception as e:
         log("Opening flow error: {}".format(e))
+        all_ok = False
+    if all_ok:
+        _daily_refresh_done["flow"] = True
 
 
 def _refresh_iv_snapshots():
@@ -7501,9 +7544,9 @@ def background_scheduler():
     # Brief on boot ONLY if we're in the pre-open window (9:00 AM – 10:30 AM ET)
     if _is_session and 9.0 <= boot_hour <= 10.5:
         threading.Thread(target=run_premarket_brief, daemon=True).start()
-    # Opening flow: pull at boot if we're past 10:05 AM today
-    if _is_session and 10.1 <= boot_hour <= 16.0:
-        threading.Thread(target=_pull_opening_flow, daemon=True).start()
+    # Opening flow: no boot-time spawn -- the scheduler's 10:05-16:00 retry
+    # loop fires on its first tick (the pull is idempotent per symbol/day,
+    # so a re-attempt after an earlier success costs one metadata call).
     if _is_session and boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
     # GEX/OI read OPRA's EOD statistics batch (published well after the close),
@@ -7521,7 +7564,9 @@ def background_scheduler():
     _daily_refresh_done["earnings"]   = boot_hour >= 6.0
     _daily_refresh_done["vol"]        = boot_hour >= 8.0
     _daily_refresh_done["mprofile"]   = boot_hour >= 8.0
-    _daily_refresh_done["flow"]       = boot_hour >= 10.1
+    # flow stays False on boot: _pull_opening_flow sets it on success and the
+    # scheduler retries through the session (OPRA availability lags intraday).
+    _daily_refresh_done["flow"]       = False
     _daily_refresh_done["premarket"]  = (boot_hour >= 8.5)
     # gex/oi are governed by their own persistent success marker + retry
     # throttle (see _sweep_retry_due), not this in-memory done-flag.
@@ -7591,10 +7636,15 @@ def background_scheduler():
                 _daily_refresh_done["premarket"] = True
                 threading.Thread(target=run_premarket_brief, daemon=True).start()
 
-            # 10:05 AM ET: pull SPY+QQQ options flow for the 8:00-10:00 window
-            if (_session and et_hour >= 10.08 and et_hour < 10.3
-                    and not _daily_refresh_done.get("flow")):
-                _daily_refresh_done["flow"] = True
+            # 10:05 AM ET: pull SPY+QQQ options flow for the 8:00-10:00 window.
+            # OPRA historical availability can lag hours behind real time, so
+            # the done-flag is only set on success (inside _pull_opening_flow)
+            # and a deferred pull retries every 30 min until the close.
+            if (_session and 10.08 <= et_hour < 16.0
+                    and not _daily_refresh_done.get("flow")
+                    and time.time() - _daily_refresh_done.get("flow_attempt", 0)
+                    > 1800):
+                _daily_refresh_done["flow_attempt"] = time.time()
                 threading.Thread(target=_pull_opening_flow, daemon=True).start()
 
             # 10:30 AM ET: re-classify regime against intraday RV.
