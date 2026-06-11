@@ -15,7 +15,7 @@ import os
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 import requests
@@ -84,9 +84,24 @@ def _fetch_bars(symbol, timeframe, limit, start=None):
     # medians are compared directly against these bars' volume, and mixing
     # feeds (e.g. consolidated SIP here vs IEX there) inflates every
     # time-volume ratio by the feeds' market-share gap (~25-100x).
-    params = {"timeframe": timeframe, "limit": limit, "sort": "desc"}
-    if start:
-        params["start"] = start
+    #
+    # `start` must ALWAYS be sent: Alpaca defaults it to the beginning of the
+    # CURRENT day, so an unbounded fetch returns only today's bars no matter
+    # the `limit` -- one daily bar, ~6 hourly bars. That starved every history
+    # consumer (prior-day key levels, premarket gap, 1hr trend pivots,
+    # time-volume baseline, volatility regime, T1/T2 probabilities). Derive a
+    # window wide enough to cover `limit` bars, with calendar slack for
+    # weekends/holidays (~6.5 RTH hourly bars per session).
+    if not start:
+        if timeframe == "1Day":
+            lookback_days = int(limit * 1.6) + 10
+        elif timeframe == "1Hour":
+            lookback_days = int(limit / 6.5 * 1.6) + 7
+        else:
+            lookback_days = 5
+        start = (datetime.now(_ET) - timedelta(days=lookback_days)).isoformat()
+    params = {"timeframe": timeframe, "limit": limit, "sort": "desc",
+              "start": start}
     try:
         r = requests.get(
             DATA_URL.format(symbol),

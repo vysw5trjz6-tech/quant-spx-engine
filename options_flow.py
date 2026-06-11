@@ -72,6 +72,26 @@ _init_db()
 # PULL OPRA TRADES IN THE WINDOW
 # =============================================
 
+def _dataset_available_end(client):
+    """End of OPRA.PILLAR's available historical range as an aware UTC
+    datetime, or None when the metadata call fails (callers then proceed
+    and let the cost estimate surface any range error)."""
+    try:
+        rng = client.metadata.get_dataset_range("OPRA.PILLAR")
+        raw = rng.get("end") if isinstance(rng, dict) else getattr(rng, "end", None)
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            dt = raw
+        else:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        return dt
+    except Exception:
+        return None
+
+
 def pull_opening_flow(symbol, target_date_et=None):
     """
     Pull options trades in 8:00 AM – 10:00 AM ET window for symbol.
@@ -111,6 +131,20 @@ def pull_opening_flow(symbol, target_date_et=None):
     client = databento_adapter._get_client()
     if not client:
         return None
+
+    # OPRA historical availability lags real time (often by hours intraday).
+    # Querying past the available range 422s and aborts the pull for the day;
+    # check first and defer instead -- the scheduler retries until it lands.
+    avail_end = _dataset_available_end(client)
+    if avail_end is not None:
+        try:
+            window_end_dt = datetime.fromisoformat(window_end)
+            if avail_end < window_end_dt:
+                print("[flow] {} deferred: OPRA available to {} < window end {}"
+                      .format(symbol, avail_end.isoformat(), window_end))
+                return None
+        except Exception:
+            pass
 
     # Cost check first — abort if estimate is way over expected
     try:
