@@ -493,6 +493,25 @@ def _databento_blocked():
         return False
 
 
+def _absorb_adapter_log(line):
+    """Sink for databento_adapter._emit_error lines. The adapter writes its
+    errors (notably databento.billing_blocked) to stderr only; mirroring
+    them into the debug_log ring makes the breaker's root cause visible on
+    /debug next to the gex/oi symptoms it explains. No re-print here --
+    the adapter already wrote the line to stderr."""
+    with state_lock:
+        debug_log.append(line)
+        if len(debug_log) > 150:
+            debug_log.pop(0)
+
+
+try:
+    import databento_adapter as _da_mirror
+    _da_mirror.register_log_mirror(_absorb_adapter_log)
+except Exception:
+    pass
+
+
 _last_auth_state = None
 
 
@@ -2436,6 +2455,24 @@ def get_1hr_trend(bars_1hr):
 # TIME-ADJUSTED VOLUME
 # =============================================
 
+# Symbols already warned about a suspect bar-of-day ratio this process,
+# so a persistent feed mismatch logs once per symbol instead of per scan.
+_tv_suspect_warned = set()
+
+
+def _time_vol_ratio_suspect(ratio, intraday_today, current_bar_idx):
+    """A real volume event shows up bar-over-bar as well as against the
+    historical slot median. A huge slot ratio (>10x) on a bar that is NOT
+    even 2x its neighbor is the signature of the profile being built on a
+    different (thinner) feed than the live bars -- e.g. IEX medians vs
+    consolidated SIP volume -- not of real flow."""
+    if ratio <= 10.0 or current_bar_idx < 1:
+        return False
+    prev_vol = intraday_today[current_bar_idx - 1].get("v") or 0
+    cur_vol  = intraday_today[current_bar_idx].get("v") or 0
+    return prev_vol > 0 and cur_vol / prev_vol < 2.0
+
+
 def get_time_vol_ratio(intraday_today, daily_bars, current_bar_idx, symbol=None):
     """
     True bar-of-day volume ratio.
@@ -2458,9 +2495,19 @@ def get_time_vol_ratio(intraday_today, daily_bars, current_bar_idx, symbol=None)
             ratio, label, _pct = volume_truth.get_true_volume_ratio(
                 symbol, current_bar_idx, current_vol)
             if label != "N/A":
-                # Re-format label to match legacy style with multiplier
-                pretty = "{} ({:.1f}x)".format(label.title(), ratio)
-                return ratio, pretty
+                if _time_vol_ratio_suspect(ratio, intraday_today, current_bar_idx):
+                    if symbol not in _tv_suspect_warned:
+                        _tv_suspect_warned.add(symbol)
+                        log_event("volume_truth.ratio_suspect", level="warn",
+                                  symbol=symbol, ratio=ratio,
+                                  bar_idx=current_bar_idx,
+                                  hint="profile feed mismatch? rebuild volume_profile.db")
+                    # Fall through to the legacy approximation, which is
+                    # internally consistent (same feed for bar and average).
+                else:
+                    # Re-format label to match legacy style with multiplier
+                    pretty = "{} ({:.1f}x)".format(label.title(), ratio)
+                    return ratio, pretty
         except Exception as e:
             log("volume_truth lookup failed for {}: {}".format(symbol, e))
             # fall through to legacy
@@ -6732,8 +6779,14 @@ def _refresh_volume_profiles():
         return
     try:
         all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
-        built = volume_truth.refresh_all(all_syms)
+        built, failed = volume_truth.refresh_all(all_syms)
         log("Volume profiles refreshed for {} symbols".format(len(built)))
+        if failed:
+            # A symbol without a profile gets the N/A volume sentinel,
+            # which permanently blocks its volume-gated strategies --
+            # name the casualties instead of hiding them in a count.
+            log_warn("Volume profile build FAILED for {}: {}".format(
+                len(failed), ", ".join(sorted(failed))))
     except Exception as e:
         log("volume profile refresh error: {}".format(e))
 
@@ -6847,6 +6900,15 @@ def _refresh_gex_snapshots():
     built = 0
     try:
         for sym in ("SPY", "QQQ"):
+            # The breaker can trip mid-run (the previous symbol's pull hit
+            # a 402/403). Stop here: every further call is dead on arrival
+            # and a per-symbol snapshot_empty would bury the real cause.
+            if _databento_blocked():
+                import databento_adapter as _da
+                log_event("gex.snapshot_deferred", level="warn",
+                          reason="databento_billing_blocked_midrun",
+                          until=_da.billing_status().get("blocked_until"))
+                break
             spot = get_current_price(sym)
             if not spot:
                 log_event("gex.snapshot_skipped", level="warn",
@@ -6857,6 +6919,14 @@ def _refresh_gex_snapshots():
                 built += 1
                 log_event("gex.snapshot_built", symbol=sym,
                           gex_b=round(gex.get("total_gex", 0) / 1e9, 2))
+            elif _databento_blocked():
+                # This symbol's own pull tripped the breaker: the chain
+                # isn't empty, the account is (out of credit / locked).
+                import databento_adapter as _da
+                log_event("gex.snapshot_deferred", level="warn", symbol=sym,
+                          reason="databento_billing_blocked_midrun",
+                          until=_da.billing_status().get("blocked_until"))
+                break
             else:
                 # Diagnostic: probe the chain directly so the log says
                 # which leg was empty (chain itself, vs. compute step
@@ -6913,9 +6983,23 @@ def _refresh_oi_snapshots():
         return
 
     all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
-    ok_count = 0
-    error_count = 0
-    for sym in all_syms:
+    ok_count      = 0
+    empty_count   = 0   # chain pull returned nothing
+    save_fails    = 0   # chain arrived but no rows persisted
+    exc_count     = 0
+    blocked_after = None  # symbols never attempted: breaker tripped mid-loop
+    for i, sym in enumerate(all_syms):
+        # Billing breaker can trip on any pull in this loop; once it does,
+        # the remaining symbols would all come back empty. Bail with the
+        # cause instead of silently iterating to an unexplained "0/72".
+        if _databento_blocked():
+            blocked_after = len(all_syms) - i
+            import databento_adapter as _da
+            log_event("oi.snapshot_deferred", level="warn",
+                      reason="databento_billing_blocked_midrun",
+                      skipped_symbols=blocked_after,
+                      until=_da.billing_status().get("blocked_until"))
+            break
         try:
             # ETFs pull with_price so the snapshot also carries per-contract
             # volume (the ohlcv-1d pull), giving a Databento volume to
@@ -6929,15 +7013,18 @@ def _refresh_oi_snapshots():
                 if rows > 0:
                     ok_count += 1
                 else:
-                    error_count += 1
+                    save_fails += 1
             else:
-                error_count += 1
+                empty_count += 1
         except Exception as e:
-            error_count += 1
-            if error_count <= 3:  # only log first few errors
+            exc_count += 1
+            if exc_count <= 3:  # only log first few errors
                 log("OI snapshot {} error: {}".format(sym, e))
 
-    log("OI snapshots: {}/{} symbols stored".format(ok_count, len(all_syms)))
+    log("OI snapshots: {}/{} symbols stored "
+        "(empty={} save_fail={} errors={} blocked_skipped={})".format(
+            ok_count, len(all_syms), empty_count, save_fails, exc_count,
+            blocked_after or 0))
 
     # Mark done only if we actually stored data, so a billing-breaker /
     # network failure still retries on the next restart.

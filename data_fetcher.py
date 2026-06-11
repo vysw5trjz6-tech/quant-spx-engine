@@ -78,6 +78,12 @@ def _fetch_bars(symbol, timeframe, limit, start=None):
     # ascending and caps at `limit`, so when the window holds more than `limit`
     # bars it returns the OLDEST `limit` and a (here unused) next_page_token --
     # which would leave the latest bars (and the current price) silently stale.
+    #
+    # No explicit `feed` param: the account default applies. volume_truth's
+    # profile builder must stay on the SAME feed -- its per-slot volume
+    # medians are compared directly against these bars' volume, and mixing
+    # feeds (e.g. consolidated SIP here vs IEX there) inflates every
+    # time-volume ratio by the feeds' market-share gap (~25-100x).
     params = {"timeframe": timeframe, "limit": limit, "sort": "desc"}
     if start:
         params["start"] = start
