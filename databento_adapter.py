@@ -131,6 +131,20 @@ def _pull_with_retry(fn, retries=2, backoff=1.5):
 
 _LOG_JSON = os.getenv("LOG_JSON", "").strip() in ("1", "true", "yes")
 
+# Optional sink registered by main so adapter-level errors (most importantly
+# databento.billing_blocked) also reach the in-app debug-log ring buffer.
+# Without it the breaker's root-cause line lives only on stderr, while the
+# debug log shows nothing but downstream symptoms (gex.snapshot_empty,
+# "OI snapshots: 0/72").
+_log_mirror = None
+
+
+def register_log_mirror(callback):
+    """Register a `callback(line: str)` receiving each _emit_error line,
+    pre-formatted. Exceptions from the callback are swallowed."""
+    global _log_mirror
+    _log_mirror = callback
+
 
 def _emit_error(event, **fields):
     """Single-line structured stderr write. Mirrors main.log_event so this
@@ -146,6 +160,11 @@ def _emit_error(event, **fields):
                                           " | " + kvs if kvs else "")
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
+    if _log_mirror is not None:
+        try:
+            _log_mirror(line)
+        except Exception:
+            pass
 
 
 def _trip_billing_breaker(context):

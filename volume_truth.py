@@ -32,6 +32,14 @@ VOL_CACHE_DB     = "volume_profile.db"
 VOL_LOOKBACK_DAYS = 30
 VOL_REFRESH_HOURS = 24   # rebuild cache every 24h
 
+# Profile data version (stored in SQLite user_version). v2: history pulls
+# stopped forcing feed=iex and now use the account's default feed -- the
+# same feed data_fetcher's live bars come from. IEX prints only a few
+# percent of consolidated tape volume, so v1 medians made every live SIP
+# bar look 25-100x "Exceptional". A version bump wipes stale rows so
+# profiles rebuild on the matching feed.
+_PROFILE_VERSION = 2
+
 
 # =============================================
 # CACHE STORAGE
@@ -58,6 +66,13 @@ def _init_vol_db():
             last_built  TEXT
         )
     """)
+    cur_ver = c.execute("PRAGMA user_version").fetchone()[0]
+    if cur_ver != _PROFILE_VERSION:
+        # Profiles were built under an old (mismatched-feed) scheme --
+        # wipe them so needs_refresh() triggers a clean rebuild.
+        c.execute("DELETE FROM bar_profile")
+        c.execute("DELETE FROM profile_meta")
+        c.execute("PRAGMA user_version = {}".format(int(_PROFILE_VERSION)))
     conn.commit()
     conn.close()
 
@@ -74,20 +89,22 @@ def _fetch_intraday_history(symbol, days_back=VOL_LOOKBACK_DAYS):
     Fetch 5-min bars for the last N trading days.
     Returns list of bars sorted by timestamp.
     """
-    et    = pytz.timezone("America/New_York")
-    end   = datetime.now(et)
+    end   = datetime.now(pytz.utc)
     start = end - timedelta(days=days_back + 10)  # buffer for weekends
 
     bars = []
     page_token = None
     pages      = 0
     while pages < 10:
+        # No explicit `feed`: use the account's default, which is what
+        # data_fetcher's live intraday bars use too. The profile medians
+        # MUST come from the same feed as the live volume they're compared
+        # against in get_true_volume_ratio, or every ratio is garbage.
         params = {
             "timeframe": "5Min",
             "start":     start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end":       end.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit":     10000,
-            "feed":      "iex",
         }
         if page_token:
             params["page_token"] = page_token
@@ -202,13 +219,21 @@ def needs_refresh(symbol):
 
 def refresh_all(symbols):
     """Build/refresh profiles for a list of symbols. Call once at startup
-    and once per day. Skips symbols that don't need refresh."""
-    built = []
+    and once per day. Skips symbols that don't need refresh.
+
+    Returns (built, failed) symbol lists. A symbol in `failed` has no
+    usable profile, which silently disables every volume-gated strategy
+    for it (get_true_volume_ratio returns the N/A sentinel) -- callers
+    should surface that, not just count successes."""
+    built  = []
+    failed = []
     for sym in symbols:
         if needs_refresh(sym):
             if build_profile(sym):
                 built.append(sym)
-    return built
+            else:
+                failed.append(sym)
+    return built, failed
 
 
 # =============================================
