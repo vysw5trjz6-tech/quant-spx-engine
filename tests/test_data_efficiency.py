@@ -139,6 +139,59 @@ def test_oi_snapshots_prune_beyond_retention(monkeypatch, tmp_path):
     assert dates == ["2026-06-12"]
 
 
+# ---------------------------------------------------------------------------
+# 5. IV backfill cost guard
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def guarded_backfill(monkeypatch):
+    """iv_backfill wired to a fake Databento that must never be pulled."""
+    import iv_backfill
+
+    monkeypatch.setattr(da, "is_available", lambda: True)
+    monkeypatch.setattr(iv_backfill, "_alpaca_daily_closes",
+                        lambda sym, s, e: {"2026-06-11": 600.0})
+    monkeypatch.setattr(iv_backfill, "_est_spend", 0.0)
+
+    def _no_pull(*a, **k):
+        raise AssertionError("paid OPRA pull issued despite cost guard")
+    monkeypatch.setattr(da, "get_historical_daily_options", _no_pull)
+    return iv_backfill
+
+
+def test_backfill_skips_symbol_over_per_symbol_cap(guarded_backfill, monkeypatch):
+    # 5.0 per schema x 2 schemas = $10 estimate > $2/symbol default cap.
+    monkeypatch.setattr(da, "get_cost_estimate", lambda *a, **k: 5.0)
+    res = guarded_backfill.backfill_symbol("AAPL")
+    assert res["rows"] == 0
+    assert res["skip_reason"] == "budget"
+
+
+def test_backfill_skips_on_estimate_failure(guarded_backfill, monkeypatch):
+    monkeypatch.setattr(da, "get_cost_estimate",
+                        lambda *a, **k: {"error": "boom"})
+    res = guarded_backfill.backfill_symbol("AAPL")
+    assert res["rows"] == 0
+    assert res["skip_reason"] == "estimate_failed"
+
+
+def test_backfill_total_budget_stops_run(guarded_backfill, monkeypatch):
+    iv_backfill = guarded_backfill
+    monkeypatch.setattr(iv_backfill, "MAX_PER_SYMBOL_USD", 50.0)
+    monkeypatch.setattr(iv_backfill, "MAX_TOTAL_USD", 5.0)
+    # $2 per schema -> $4/symbol: first fits the $5 total, second must not.
+    monkeypatch.setattr(da, "get_cost_estimate", lambda *a, **k: 2.0)
+    monkeypatch.setattr(da, "get_historical_daily_options",
+                        lambda *a, **k: [])
+
+    first = iv_backfill.backfill_symbol("AAPL")
+    assert first["skip_reason"] == "no_data"      # paid, pull came back empty
+
+    second = iv_backfill.backfill_symbol("NVDA")  # $4 + $4 > $5 cap
+    assert second["rows"] == 0
+    assert second["skip_reason"] == "budget"
+
+
 def test_oi_prune_keeps_recent_history(monkeypatch, tmp_path):
     monkeypatch.setattr(oi_delta, "OI_DB", str(tmp_path / "oi.db"))
     oi_delta._init_db()

@@ -7142,6 +7142,96 @@ def _refresh_iv_snapshots():
         log("IV snapshot error: {}".format(e))
 
 
+def _run_iv_backfill_once():
+    """One-shot seed of iv_history.db with ~252 days of ATM IV per symbol.
+
+    compute_iv_rank needs 30+ days of history before it returns anything,
+    and iv_history.db only began surviving redeploys once it moved onto the
+    persistent volume -- so the rolling window starts empty. This seeds it
+    once; the daily 4:15 PM snapshot maintains it from then on.
+
+    Cost controls (the single-name path is a paid full-year OPRA pull):
+      * persistent daily_marker 'iv_backfill' -- never re-runs once a full
+        pass completes with Databento reachable;
+      * symbols that already hold >=200 rows are skipped, so a partial run
+        resumes instead of re-buying what it already wrote;
+      * iv_backfill prices every pull via the free get_cost call and stops
+        adding spend at its per-symbol/total caps. Budget-capped symbols
+        leave the marker unset and are picked up by the next boot's run
+        (each with a fresh budget), walking the universe forward in
+        bounded-cost slices.
+    """
+    if not HAS_IV_RANK:
+        return
+    if _sweep_marker_get("iv_backfill"):
+        return
+    try:
+        import iv_backfill
+        import databento_adapter
+    except ImportError as e:
+        log("IV backfill unavailable: {}".format(e))
+        return
+
+    today_ymd = datetime.now(
+        pytz.timezone("America/New_York")).date().isoformat()
+
+    need = []
+    for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
+        # Structural no-data names (no OPRA history despite a paid pull)
+        # carry a per-symbol marker so retries don't re-bill dead queries.
+        if _sweep_marker_get("ivbf_nodata_" + sym):
+            continue
+        try:
+            if len(iv_rank.get_history(sym, 252)) >= 200:
+                continue
+        except Exception:
+            pass
+        need.append(sym)
+    if not need:
+        _sweep_marker_set("iv_backfill", today_ymd)
+        log("IV backfill: all symbols already seeded; marker set")
+        return
+
+    log("IV backfill: seeding {} symbols (caps: ${}/symbol, ${} total)".format(
+        len(need), iv_backfill.MAX_PER_SYMBOL_USD, iv_backfill.MAX_TOTAL_USD))
+    seeded = deferred = no_data = 0
+    for sym in need:
+        is_proxy = sym in iv_backfill.VIX_PROXY_MAP
+        # The billing breaker can trip on any paid pull in this loop; once
+        # open, every further Databento symbol is dead on arrival -- defer
+        # them instead of classifying the silence as "no data".
+        if not is_proxy and not databento_adapter.is_available():
+            deferred += 1
+            continue
+        try:
+            r = iv_backfill.backfill_symbol(sym)
+        except Exception as e:
+            log("IV backfill {} error: {}".format(sym, e))
+            deferred += 1
+            continue
+        if r.get("rows", 0) > 0:
+            seeded += 1
+        elif r.get("skip_reason") in ("budget", "estimate_failed"):
+            deferred += 1
+        elif is_proxy or not databento_adapter.is_available():
+            # Proxy seeds are free (yfinance) -- always worth retrying on a
+            # later boot. A paid pull that "failed" with the breaker now
+            # open was billed-blocked mid-flight, not empty: also retry.
+            deferred += 1
+        else:
+            no_data += 1
+            _sweep_marker_set("ivbf_nodata_" + sym, today_ymd)
+    log("IV backfill: seeded={} deferred={} no_data={} of {}".format(
+        seeded, deferred, no_data, len(need)))
+
+    # Mark fully complete only when nothing is left to retry. Deferred
+    # symbols (budget caps, breaker, yfinance-blocked proxies) leave the
+    # marker unset so the next boot resumes -- already-seeded symbols are
+    # excluded by the row-count check, so resuming never re-buys them.
+    if deferred == 0:
+        _sweep_marker_set("iv_backfill", today_ymd)
+
+
 # =============================================
 # PREMARKET BRIEF (single morning alert, low-cost)
 # =============================================
@@ -7558,6 +7648,12 @@ def background_scheduler():
             threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
         if not _sweep_already_done_today("oi") and _sweep_retry_due("oi"):
             threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
+
+    # One-shot IV history seed (see _run_iv_backfill_once; the persistent
+    # marker makes this a no-op once a full pass has completed). Runs on any
+    # boot regardless of session/hour -- it reads historical data, and the
+    # sooner it lands the sooner the IV-rank-gated strategies go live.
+    threading.Thread(target=_run_iv_backfill_once, daemon=True).start()
 
     # Mark today's refreshes as done so we don't double-run
     _daily_refresh_done["date"]       = today_str
