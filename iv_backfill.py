@@ -53,6 +53,39 @@ DTE_MAX    = 45
 
 RISK_FREE_RATE = 0.05        # ~3-month T-bill, close enough for IVR
 
+# Cost guard for the Databento path. get_historical_daily_options pulls a
+# full-year OPRA `definition` + `ohlcv-1d` stream per symbol -- the same
+# "fat" query class whose unguarded use previously tripped the 402 billing
+# breaker. metadata.get_cost is free, so every pull is priced first; any
+# symbol over the per-symbol cap is skipped, and the run stops adding spend
+# once the cumulative estimate hits the total cap. Skipped symbols simply
+# retry on a later run (the caller re-attempts whatever has no history yet).
+MAX_PER_SYMBOL_USD = float(os.getenv("IV_BACKFILL_MAX_PER_SYMBOL_USD", "2.0"))
+MAX_TOTAL_USD      = float(os.getenv("IV_BACKFILL_MAX_TOTAL_USD", "25.0"))
+_est_spend = 0.0   # cumulative estimated USD this process
+
+# Why the most recent backfill_symbol call wrote 0 rows: None (it wrote
+# rows), "budget", "estimate_failed", or "no_data". Mirrors the
+# LAST_EARNINGS_ERROR pattern in safety_gates -- callers that orchestrate a
+# universe run need to distinguish "skip now, retry later" (budget) from
+# "this symbol has nothing to give" (no_data).
+LAST_SKIP_REASON = None
+
+
+def _estimate_pull_cost(symbol, start, end):
+    """Estimated USD for the two OPRA pulls backfill_from_databento will
+    issue, or None when the estimate itself fails (treat as: don't pull)."""
+    import databento_adapter
+    total = 0.0
+    for schema in ("definition", "ohlcv-1d"):
+        cost = databento_adapter.get_cost_estimate(
+            "OPRA.PILLAR", [symbol + ".OPT"], schema,
+            start.isoformat(), end.isoformat(), stype_in="parent")
+        if not isinstance(cost, float):
+            return None
+        total += cost
+    return total
+
 
 # =============================================
 # ALPACA DAILY BARS (for spot history)
@@ -212,28 +245,56 @@ def backfill_from_databento(symbol, days=252):
 
     Returns rows_written.
     """
+    global _est_spend, LAST_SKIP_REASON
     try:
         import databento_adapter
     except ImportError:
         print("[iv_backfill] databento_adapter not present")
+        LAST_SKIP_REASON = "no_data"
         return 0
     if not databento_adapter.is_available():
         print("[iv_backfill] DATABENTO_API_KEY not set -- skipping {}".format(symbol))
+        LAST_SKIP_REASON = "no_data"
         return 0
 
     end   = date.today()
     start = end - timedelta(days=int(days * 1.5) + 14)
 
+    # Spot history is free (Alpaca) -- check it before debiting the budget.
     spot_by_date = _alpaca_daily_closes(symbol, start, end)
     if not spot_by_date:
         print("[iv_backfill] no spot history for {}".format(symbol))
+        LAST_SKIP_REASON = "no_data"
         return 0
+
+    # Price the OPRA pull before paying for it (get_cost is free).
+    est = _estimate_pull_cost(symbol, start, end)
+    if est is None:
+        print("[iv_backfill] {}: cost estimate failed -- skipping rather "
+              "than risk a blind pull".format(symbol))
+        LAST_SKIP_REASON = "estimate_failed"
+        return 0
+    if est > MAX_PER_SYMBOL_USD:
+        print("[iv_backfill] {}: est ${:.2f} exceeds ${:.2f}/symbol cap -- "
+              "skipping".format(symbol, est, MAX_PER_SYMBOL_USD))
+        LAST_SKIP_REASON = "budget"
+        return 0
+    if _est_spend + est > MAX_TOTAL_USD:
+        print("[iv_backfill] {}: est ${:.2f} would push run total past "
+              "${:.2f} cap (spent ~${:.2f}) -- skipping".format(
+                  symbol, est, MAX_TOTAL_USD, _est_spend))
+        LAST_SKIP_REASON = "budget"
+        return 0
+    _est_spend += est
+    print("[iv_backfill] {}: est ${:.4f} (run total ~${:.2f})".format(
+        symbol, est, _est_spend))
 
     rows = databento_adapter.get_historical_daily_options(
         symbol, start, end, dte_min=DTE_MIN, dte_max=DTE_MAX,
     )
     if not rows:
         print("[iv_backfill] no OPRA history for {}".format(symbol))
+        LAST_SKIP_REASON = "no_data"
         return 0
 
     by_date = {}
@@ -297,15 +358,24 @@ def backfill_from_databento(symbol, days=252):
 
 def backfill_symbol(symbol, days=252):
     """
-    Route a symbol to the right backfill path. Returns dict with stats.
+    Route a symbol to the right backfill path. Returns dict with stats;
+    when 0 rows were written, `skip_reason` says why ("budget" /
+    "estimate_failed" are retryable later; "no_data" is structural).
     """
+    global LAST_SKIP_REASON
+    LAST_SKIP_REASON = None
     if symbol in VIX_PROXY_MAP:
         n = backfill_from_vix_proxy(symbol, days=days)
         source = "vix_proxy({})".format(VIX_PROXY_MAP[symbol])
+        if n == 0:
+            LAST_SKIP_REASON = "no_data"
     else:
         n = backfill_from_databento(symbol, days=days)
         source = "databento+bs"
-    return {"symbol": symbol, "source": source, "rows": n}
+    out = {"symbol": symbol, "source": source, "rows": n}
+    if n == 0 and LAST_SKIP_REASON:
+        out["skip_reason"] = LAST_SKIP_REASON
+    return out
 
 
 def backfill_universe(symbols, days=252):

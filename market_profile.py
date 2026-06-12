@@ -24,7 +24,7 @@ import statistics
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
-PROFILE_DB = "market_profile.db"
+PROFILE_DB = db_utils.data_path("market_profile.db")
 
 
 def _init_db():

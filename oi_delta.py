@@ -21,7 +21,28 @@ import statistics
 from datetime import datetime, timedelta
 import pytz
 
-OI_DB = "oi_history.db"
+OI_DB = db_utils.data_path("oi_history.db")
+
+# Strike-level snapshots add ~100k rows/day across the 72-symbol sweep, and
+# compute_delta only ever diffs the last handful of sessions. Keep a quarter
+# of history for ad-hoc analysis; drop the rest so the DB doesn't grow by
+# hundreds of MB/year on the persistent volume.
+OI_RETENTION_DAYS = 90
+_last_prune_ymd   = None
+
+
+def _prune_old(conn, today_ymd):
+    """Delete snapshots older than OI_RETENTION_DAYS. At most once per day."""
+    global _last_prune_ymd
+    if _last_prune_ymd == today_ymd:
+        return
+    _last_prune_ymd = today_ymd
+    try:
+        cutoff = (datetime.strptime(today_ymd, "%Y-%m-%d")
+                  - timedelta(days=OI_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        conn.execute("DELETE FROM oi_snapshots WHERE snap_date < ?", (cutoff,))
+    except Exception:
+        pass
 
 
 def _init_db():
@@ -102,6 +123,7 @@ def save_snapshot(symbol, chain_data, snap_date=None):
         except Exception:
             continue
 
+    _prune_old(conn, snap_date)
     conn.commit()
     conn.close()
     return rows

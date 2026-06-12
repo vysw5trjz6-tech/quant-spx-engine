@@ -27,7 +27,7 @@ import json
 from datetime import datetime, timedelta, time as dtime
 import pytz
 
-FLOW_DB = "options_flow.db"
+FLOW_DB = db_utils.data_path("options_flow.db")
 
 
 def _init_db():
@@ -200,9 +200,8 @@ def pull_opening_flow(symbol, target_date_et=None):
         except Exception:
             continue
 
-    # Pull trades + cmbp-1 quotes in window
-    # cmbp-1 = consolidated NBBO; gives us bid/ask at trade time for
-    # aggressor classification
+    # Pull trades in window. The trades schema's own `side` field drives
+    # aggressor classification -- no separate quote pull needed.
     try:
         trades_df = client.timeseries.get_range(
             dataset  = "OPRA.PILLAR",
@@ -219,35 +218,10 @@ def pull_opening_flow(symbol, target_date_et=None):
     if trades_df is None or trades_df.empty:
         return None
 
-    # Try to get quotes for aggressor classification — optional, skip if costly
-    try:
-        cost_q = client.metadata.get_cost(
-            dataset  = "OPRA.PILLAR",
-            symbols  = [parent],
-            stype_in = "parent",
-            schema   = "tcbbo",   # trade + consolidated BBO
-            start    = window_start,
-            end      = window_end,
-        )
-        if cost_q < 3.0:
-            quotes_df = client.timeseries.get_range(
-                dataset  = "OPRA.PILLAR",
-                symbols  = [parent],
-                stype_in = "parent",
-                schema   = "tcbbo",
-                start    = window_start,
-                end      = window_end,
-            ).to_df()
-        else:
-            quotes_df = None
-            print("[flow] {} skipping quotes — cost ${:.2f}".format(symbol, cost_q))
-    except Exception:
-        quotes_df = None
-
-    return _summarize_trades(symbol, flow_date_str, trades_df, quotes_df, inst_map)
+    return _summarize_trades(symbol, flow_date_str, trades_df, inst_map)
 
 
-def _summarize_trades(symbol, flow_date_str, trades_df, quotes_df, inst_map):
+def _summarize_trades(symbol, flow_date_str, trades_df, inst_map):
     """Aggregate raw trades into the flow summary."""
     call_premium = 0.0
     put_premium  = 0.0
@@ -295,9 +269,10 @@ def _summarize_trades(symbol, flow_date_str, trades_df, quotes_df, inst_map):
             key = (meta["strike"], meta["type"])
             strike_premium[key] = strike_premium.get(key, 0.0) + premium
 
-            # Aggressor classification using quotes (if we have them)
-            # Trade hitting bid = sell-aggressor; lifting offer = buy-aggressor.
-            # Without quotes, use the "side" field if Databento provides it.
+            # Aggressor classification from the trades schema's "side" field.
+            # Lifting the offer = buy aggressor; hitting the bid = sell.
+            # (A separate tcbbo quote pull was bought here for a while but
+            # never read -- side covers the classification for free.)
             side = row.get("side")
             is_buy_aggressor = None
             if side == "A":   # ask side hit = buy aggressor

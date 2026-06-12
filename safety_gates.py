@@ -264,7 +264,7 @@ def enforce_config_invariants(cfg):
 # Don't take swing trades into earnings (IV crush wipes the trade).
 # Also flag day trades on earnings day itself as elevated risk.
 
-EARNINGS_CACHE_DB = "earnings_calendar.db"
+EARNINGS_CACHE_DB = db_utils.data_path("earnings_calendar.db")
 
 # Last error seen while fetching the earnings calendar, so the daily refresh
 # caller can report *why* a 0/N run happened instead of failing silently.

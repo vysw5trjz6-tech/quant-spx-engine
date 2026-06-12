@@ -8,8 +8,20 @@
 # - Sets a 5s busy_timeout so concurrent writers retry instead of failing.
 # - Tracks which files have been initialized so the PRAGMAs only run once.
 
+import os
 import sqlite3
 import threading
+
+
+def data_path(filename):
+    """Resolve `filename` onto persistent storage: DATA_DIR env > Railway
+    volume > /tmp. A bare relative DB path lives in the container's ephemeral
+    working dir, so every redeploy wipes it -- losing paid-for Databento
+    pulls and slowly-accumulated history (IV rank alone needs 30+ days)."""
+    base = (os.getenv("DATA_DIR")
+            or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+            or "/tmp")
+    return base.rstrip("/") + "/" + filename
 
 
 _INITIALIZED = set()

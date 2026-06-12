@@ -28,7 +28,7 @@ HEADERS = {
 }
 DATA_URL = "https://data.alpaca.markets/v2/stocks/{}/bars"
 
-VOL_CACHE_DB     = "volume_profile.db"
+VOL_CACHE_DB     = db_utils.data_path("volume_profile.db")
 VOL_LOOKBACK_DAYS = 30
 VOL_REFRESH_HOURS = 24   # rebuild cache every 24h
 
