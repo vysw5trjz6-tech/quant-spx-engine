@@ -26,7 +26,7 @@ HEADERS = {
     "APCA-API-SECRET-KEY": ALPACA_SECRET,
 }
 
-IV_CACHE_DB = "iv_history.db"
+IV_CACHE_DB = db_utils.data_path("iv_history.db")
 
 
 def _init_iv_db():

@@ -388,6 +388,20 @@ _DB_CACHE = ((os.getenv("DATA_DIR")
               or "/tmp").rstrip("/") + "/databento_cache.db")
 
 
+# Cache keys are date-stamped (chain_SPY_2026-06-12, on_ES_..., neg_...), so
+# entries are never overwritten by newer days -- without a sweep the table
+# grows by a few full-chain JSON blobs per day, forever, on the persistent
+# volume. Nothing reads entries past its max_age (longest is 1h; neg 20min),
+# so anything older than this is dead weight.
+_CACHE_RETENTION_SECS = 3 * 24 * 3600
+_last_cache_prune     = 0.0
+
+
+def _prune_cache(conn):
+    cutoff = (_utcnow() - timedelta(seconds=_CACHE_RETENTION_SECS)).isoformat()
+    conn.execute("DELETE FROM cache WHERE stored_at < ?", (cutoff,))
+
+
 def _init_cache():
     conn = db_utils.connect(_DB_CACHE)
     conn.execute("""
@@ -397,6 +411,7 @@ def _init_cache():
             stored_at TEXT
         )
     """)
+    _prune_cache(conn)
     conn.commit()
     conn.close()
 
@@ -423,11 +438,16 @@ def _cache_get(key, max_age_seconds=300):
 
 
 def _cache_set(key, value):
+    global _last_cache_prune
     conn = db_utils.connect(_DB_CACHE)
     conn.execute("""
         INSERT OR REPLACE INTO cache (key, value, stored_at)
         VALUES (?, ?, ?)
     """, (key, json.dumps(value, default=str), _utcnow().isoformat()))
+    # Startup prune covers redeploys; this covers long-lived processes.
+    if time.time() - _last_cache_prune > 24 * 3600:
+        _last_cache_prune = time.time()
+        _prune_cache(conn)
     conn.commit()
     conn.close()
 
@@ -754,6 +774,15 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("chain", [])
+    # A price-enriched chain (the GEX path) is a superset of the OI-only
+    # chain: same statistics pull, plus per-contract prices OI consumers
+    # ignore. Serve it to price-less requests instead of re-paying for the
+    # identical pull under the other cache key.
+    if not with_price:
+        cached = _cache_get("chain_px_{}_{}".format(
+            underlying, target_date_et.isoformat()), max_age_seconds=3600)
+        if cached:
+            return cached.get("chain", [])
     # Don't re-pay for a query that just came back empty/failed.
     if _neg_cached(cache_key):
         return []

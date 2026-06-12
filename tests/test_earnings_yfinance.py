@@ -26,6 +26,9 @@ if _ROOT not in sys.path:
 def fresh_safety_gates(tmp_path, monkeypatch):
     """Re-import safety_gates with EARNINGS_CACHE_DB pointed into tmp_path."""
     monkeypatch.chdir(tmp_path)
+    # EARNINGS_CACHE_DB resolves via db_utils.data_path (DATA_DIR) at import
+    # time, so the env var -- not the cwd -- decides where the DB lands.
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
     if "safety_gates" in sys.modules:
         del sys.modules["safety_gates"]
     import safety_gates  # noqa: WPS433
