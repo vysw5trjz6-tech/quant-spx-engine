@@ -65,7 +65,12 @@ def summarize_plan(regime, gex_bias, premarket):
     elif term_label == "DEEP_CONTANGO":
         parts.append("VIX term steep contango -- watch for vol spike")
 
-    gap = (premarket or {}).get("gap", {})
+    # NB: get_premarket_brief() always sets the "gap" key but leaves it None
+    # when RTH open / overnight ES data isn't available yet (e.g. pre-open, or
+    # a Databento outage). `.get("gap", {})` returns that None -- the default
+    # only applies to a *missing* key -- so coalesce with `or {}` to avoid an
+    # AttributeError that would crash the whole premarket-brief thread.
+    gap = (premarket or {}).get("gap") or {}
     if gap.get("class") == "INSIDE_GAP":
         parts.append("morning fade likely")
     elif "GAP_AND_GO" in (gap.get("class") or ""):

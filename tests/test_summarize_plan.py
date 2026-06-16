@@ -63,6 +63,21 @@ def test_intraday_flip_overrides_morning_label():
     assert "Intraday regime flip" in plan
 
 
+def test_gap_none_does_not_crash():
+    """Production regression: get_premarket_brief() sets gap=None (not absent)
+    when RTH-open/overnight ES data is unavailable. The brief thread crashed
+    with 'NoneType has no attribute get' before send_telegram, so no premarket
+    brief and no alerts went out. A None gap must be treated as 'no gap data'."""
+    plan = _summarize_plan()(
+        regime  = {"regime": "NORMAL"},
+        gex_bias= {"tape_bias": "MIXED"},
+        premarket={"gap": None, "es_overnight": None},
+    )
+    assert plan.endswith(".")
+    assert "morning fade likely" not in plan
+    assert "continuation likely" not in plan
+
+
 def test_term_structure_backwardation_adds_sidenote():
     plan = _summarize_plan()(
         regime  = {
