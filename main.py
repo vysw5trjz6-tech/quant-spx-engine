@@ -1471,6 +1471,7 @@ def market_open():
 # =============================================
 
 import data_fetcher
+import bar_utils
 
 
 def get_intraday(symbol):
@@ -2975,77 +2976,84 @@ def _bars_cache_set(key, bars):
         _BARS_CACHE[key] = (time.time(), bars)
 
 
-# Largest single-bar close-to-close move we'll accept as real before treating
-# a fully-reverting print as corrupt. Daily moves past this that revert in one
-# bar are virtually always bad ticks on the free IEX feed, not tradable events.
-_BAR_SPIKE_FRACTION = 0.35
-
-
 def _sanitize_bars(symbol, bars, kind):
-    """Drop structurally-invalid and single-print spike bars before they reach
-    the cache and the detectors.
+    """Thin wrapper around bar_utils.sanitize_bars that routes drop notices
+    through this module's logger."""
+    return bar_utils.sanitize_bars(symbol, bars, kind, log=log)
 
-    The free Alpaca/IEX daily feed occasionally emits a bad print -- a zero, an
-    inverted high/low, an open/close outside the bar's own range, or a
-    mis-decimaled close. A single such bar silently corrupts everything built
-    on the series: relative strength (KLAC showed a -92% 5-day RS off one bad
-    close, which then gated the whole board as "counter-trend"), the
-    O'Neil/Wyckoff/52w detectors, ATR, Fibonacci levels and stop/target math.
-    The net effect is manufactured or wrongly-suppressed alerts, so we filter
-    here at the single fetch chokepoint rather than in each consumer.
 
-    Conservative by design: structural checks only drop bars that are
-    internally impossible, and the spike check only drops a bar whose close
-    disagrees sharply with BOTH neighbors while the neighbors agree with each
-    other (the signature of a one-bar bad tick). A real gap persists into the
-    next bar, so it survives.
+def _append_live_today_bar(symbol, bars):
+    """Graft a current-session bar onto a Databento daily history.
+
+    Databento's Historical daily feed lacks today's still-forming bar during
+    RTH, but the swing engine treats bars[-1] as the live price (current,
+    adverse-day gate, R:R, targets). So we keep Databento's clean completed
+    history and synthesize today's bar from the real-time snapshot -- which is
+    Alpaca's one genuine strength. If Databento already carries today's bar
+    (after the close) or no live price is available, leave the series as-is.
     """
     if not bars:
         return bars
+    et = pytz.timezone("America/New_York")
+    today = datetime.now(et).date().isoformat()
+    if str(bars[-1].get("t", ""))[:10] >= today:
+        return bars
+    try:
+        price, _age, _src = data_fetcher.get_price_with_freshness(symbol)
+    except Exception:
+        price = None
+    if not price or price <= 0:
+        return bars
+    prev_c = bars[-1]["c"]
+    return bars + [{
+        "t": today + "T00:00:00+00:00",
+        "o": prev_c,
+        "h": max(prev_c, price),
+        "l": min(prev_c, price),
+        "c": round(float(price), 4),
+        "v": 0,
+    }]
 
-    clean = []
-    dropped = 0
-    for b in bars:
-        o, h, l, c = b.get("o"), b.get("h"), b.get("l"), b.get("c")
-        if None in (o, h, l, c) or o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            dropped += 1
-            continue
-        if h < l:
-            dropped += 1
-            continue
-        # Open/close must sit within the bar's own high/low (tiny float slack).
-        lo, hi = l * 0.999, h * 1.001
-        if not (lo <= o <= hi and lo <= c <= hi):
-            dropped += 1
-            continue
-        clean.append(b)
 
-    despiked = []
-    for i, b in enumerate(clean):
-        if 0 < i < len(clean) - 1:
-            prev_c, next_c, cur_c = clean[i - 1]["c"], clean[i + 1]["c"], b["c"]
-            if prev_c > 0 and next_c > 0:
-                neighbors_agree = abs(next_c / prev_c - 1) < 0.12
-                jumps_both = (abs(cur_c / prev_c - 1) > _BAR_SPIKE_FRACTION
-                              and abs(cur_c / next_c - 1) > _BAR_SPIKE_FRACTION)
-                if neighbors_agree and jumps_both:
-                    dropped += 1
-                    continue
-        despiked.append(b)
+def _databento_equity_bars(symbol, timeframe, limit):
+    """Daily/weekly equity bars from Databento (primary source). Returns an
+    ascending list of {o,h,l,c,v,t}, or None if Databento can't serve them so
+    the caller falls back to Alpaca. Weekly is aggregated from clean daily
+    bars since Databento has no native weekly schema."""
+    if timeframe not in ("1Day", "1Week"):
+        return None
+    try:
+        import databento_adapter
+    except ImportError:
+        return None
+    if not databento_adapter.is_available():
+        return None
 
-    if dropped:
-        log("{} {}: dropped {} corrupt bar(s) ({}->{} kept)".format(
-            symbol, kind, dropped, len(bars), len(despiked)))
-    return despiked
+    now = datetime.now(pytz.utc)
+    if timeframe == "1Week":
+        lookback_days = int(limit * 7 * 1.4) + 14
+    else:
+        lookback_days = int(limit * 1.6) + 10
+    start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end   = (now + timedelta(days=1)).strftime("%Y-%m-%d")   # end is exclusive
+
+    daily = databento_adapter.get_equity_bars(symbol, start, end, schema="ohlcv-1d")
+    if not daily:
+        return None
+
+    daily = _append_live_today_bar(symbol, daily)
+    bars  = bar_utils.aggregate_weekly(daily) if timeframe == "1Week" else daily
+    return bars[-limit:] if (limit and len(bars) > limit) else bars
 
 
 def _fetch_bars(symbol, timeframe, limit, kind):
     """
     Cached, rate-limit-aware bar fetch shared by the daily/weekly getters.
 
-    Order of preference: fresh cache -> live fetch (with 429 backoff) ->
-    stale cache. Records each non-200 status into the swing stats so a
-    0-setup scan can report the dominant cause instead of swallowing it.
+    Source order: fresh cache -> Databento (clean consolidated equities) ->
+    Alpaca (with 429 backoff) -> stale cache. Records each non-200 Alpaca
+    status into the swing stats so a 0-setup scan can report the dominant
+    cause instead of swallowing it.
     """
     cache_key = "{}|{}|{}".format(symbol, timeframe, limit)
 
@@ -3053,6 +3061,15 @@ def _fetch_bars(symbol, timeframe, limit, kind):
     if fresh is not None:
         return fresh
 
+    # Primary: Databento US-equities daily/weekly. Far cleaner than free IEX
+    # daily bars; falls through to Alpaca when unavailable or breaker-tripped.
+    db_bars = _databento_equity_bars(symbol, timeframe, limit)
+    if db_bars:
+        db_bars = _sanitize_bars(symbol, db_bars, kind)
+        _bars_cache_set(cache_key, db_bars)
+        return db_bars
+
+    # Fallback: Alpaca.
     # Be explicit about feed + window. On the free Alpaca plan the bars
     # endpoint defaults to the SIP feed, which a free key isn't entitled to --
     # the request still returns HTTP 200 but with an empty `bars` array, so a

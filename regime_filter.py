@@ -15,6 +15,8 @@ import requests
 from datetime import datetime, timedelta, timezone
 import pytz
 
+from bar_utils import sanitize_bars
+
 try:
     import db_utils
     _HAS_DB = True
@@ -373,6 +375,53 @@ def _rolling_rv20(closes):
     return out
 
 
+def _equity_daily_bars(symbol, lookback_days, min_bars=30):
+    """Daily bars for `symbol`, Databento-first (clean consolidated US-equities
+    feed), Alpaca/IEX fallback. Sanitized either way so a single bad print
+    can't poison the realized-vol or RV20 reads that set the trading regime --
+    a corrupt close manufactures two large opposite log-returns and can shove
+    the regime from NORMAL to CRISIS (or vice-versa). Returns an ascending list
+    of {o,h,l,c,v,t}, or [] on failure."""
+    # Primary: Databento consolidated equities.
+    try:
+        import databento_adapter
+        if databento_adapter.is_available():
+            now   = datetime.now(timezone.utc)
+            start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            end   = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            bars  = sanitize_bars(
+                symbol,
+                databento_adapter.get_equity_bars(symbol, start, end, "ohlcv-1d"),
+                "regime")
+            if bars and len(bars) >= min_bars:
+                return bars
+    except Exception:
+        pass
+
+    # Fallback: Alpaca/IEX. sort=desc + reverse keeps the freshest bars when
+    # the [start, now] window holds more than `limit` (Alpaca defaults to
+    # ascending and would otherwise drop the most recent ones).
+    try:
+        et    = pytz.timezone("America/New_York")
+        start = (datetime.now(et) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        params = {
+            "timeframe": "1Day",
+            "start":     start,
+            "limit":     max(lookback_days, min_bars + 10),
+            "feed":      "iex",
+            "sort":      "desc",
+        }
+        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
+                         params=params, timeout=10)
+        if r.status_code != 200:
+            return []
+        bars = r.json().get("bars", []) or []
+        bars.reverse()
+        return sanitize_bars(symbol, bars, "regime")
+    except Exception:
+        return []
+
+
 def get_rv20_percentile(symbol="SPY", history_days=252):
     """
     Returns (today_rv20, percentile_0_to_100) or (None, None) on failure.
@@ -380,27 +429,10 @@ def get_rv20_percentile(symbol="SPY", history_days=252):
     Percentile uses the rolling distribution: percentile 15 means today's
     RV20 is lower than 85% of the past year's RV20 readings.
     """
-    try:
-        et    = pytz.timezone("America/New_York")
-        end   = datetime.now(et)
-        start = end - timedelta(days=history_days + 40)
-        params = {
-            "timeframe": "1Day",
-            "start":     start.strftime("%Y-%m-%d"),
-            "end":       end.strftime("%Y-%m-%d"),
-            "limit":     history_days + 30,
-            "feed":      "iex",
-        }
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params=params, timeout=10)
-        if r.status_code != 200:
-            return None, None
-        bars = r.json().get("bars", [])
-        if len(bars) < 60:
-            return None, None
-        closes = [b["c"] for b in bars]
-    except Exception:
+    bars = _equity_daily_bars(symbol, history_days + 40, min_bars=60)
+    if len(bars) < 60:
         return None, None
+    closes = [b["c"] for b in bars]
 
     series = _rolling_rv20(closes)
     if len(series) < 30:
@@ -483,21 +515,7 @@ def get_realized_vol(symbol="SPY", lookback_days=20):
     we're paying for vol we won't see.
     """
     try:
-        et    = pytz.timezone("America/New_York")
-        end   = datetime.now(et)
-        start = end - timedelta(days=lookback_days + 10)
-        params = {
-            "timeframe": "1Day",
-            "start":     start.strftime("%Y-%m-%d"),
-            "end":       end.strftime("%Y-%m-%d"),
-            "limit":     lookback_days + 5,
-            "feed":      "iex",
-        }
-        r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                         params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        bars = r.json().get("bars", [])
+        bars = _equity_daily_bars(symbol, lookback_days + 15, min_bars=lookback_days)
         if len(bars) < lookback_days:
             return None
         closes = [b["c"] for b in bars[-lookback_days-1:]]

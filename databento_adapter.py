@@ -474,6 +474,98 @@ def _neg_cache_set(key):
 
 
 # =============================================
+# CONSOLIDATED US EQUITY OHLCV BARS
+# =============================================
+#
+# Primary daily/weekly bar source for the swing engine and the regime read.
+# Databento's consolidated US-equities feed is far cleaner than the free
+# Alpaca/IEX daily bars, which intermittently print bad ticks (zeros,
+# mis-decimaled closes) that silently corrupt relative strength, the swing
+# detectors, and every level/target derived from the series. Alpaca remains
+# the fallback when Databento is unavailable.
+#
+# Dataset is env-configurable because account entitlements vary. Default is
+# EQUS.MINI (Databento "US Equities Mini" -- the consolidated 15-exchange +
+# 30-ATS feed). Set DATABENTO_EQUITY_DATASET to override (e.g. EQUS.SUMMARY,
+# DBEQ.BASIC, or a single-venue feed like XNAS.ITCH).
+
+EQUITY_DATASET = os.getenv("DATABENTO_EQUITY_DATASET", "EQUS.MINI").strip()
+
+
+def _is_insufficient_funds(exc):
+    """Narrow 402-only check. Unlike _is_billing_error this does NOT treat a
+    403 as billing: a 403 on the equity dataset usually means "not entitled to
+    this dataset", which must fall back to Alpaca rather than open the shared
+    breaker and take down the funded options/futures paths."""
+    s = "{} {}".format(type(exc).__name__, exc).lower()
+    return (
+        "account_insufficient_funds" in s
+        or "insufficient budget" in s
+        or "insufficient funds" in s
+        or " 402" in s
+        or s.startswith("402")
+    )
+
+
+def get_equity_bars(symbol, start, end, schema="ohlcv-1d"):
+    """Consolidated US-equity OHLCV bars from Databento.
+
+    Returns an ascending list of {t,o,h,l,c,v} dicts, or [] when Databento is
+    unavailable, the breaker is open, or the query yields nothing. `start`/`end`
+    are 'YYYY-MM-DD' strings; `end` is exclusive, so pass tomorrow to include
+    today's (settled) bar.
+
+    Only a genuine 402 insufficient-funds trips the shared billing breaker;
+    entitlement/symbology/availability errors are equity-local -- they
+    negative-cache and let the caller fall back to Alpaca.
+    """
+    client = _get_client()
+    if not client or _billing_blocked():
+        return []
+
+    cache_key = "eqbars_{}_{}_{}_{}".format(symbol, schema, start, end)
+    if _neg_cached(cache_key):
+        return []
+
+    try:
+        df = _pull_with_retry(lambda: client.timeseries.get_range(
+            dataset  = EQUITY_DATASET,
+            symbols  = [symbol],
+            stype_in = "raw_symbol",
+            schema   = schema,
+            start    = start,
+            end      = end,
+        ).to_df())
+    except Exception as e:
+        if _is_insufficient_funds(e):
+            _trip_billing_breaker("equity bars")
+        else:
+            _emit_error("databento.equity_fetch_failed", symbol=symbol,
+                        dataset=EQUITY_DATASET, exc=type(e).__name__)
+            _neg_cache_set(cache_key)
+        return []
+
+    if df is None or df.empty:
+        _neg_cache_set(cache_key)
+        return []
+
+    bars = []
+    for ts, row in df.iterrows():
+        try:
+            bars.append({
+                "t": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "o": float(row["open"]),
+                "h": float(row["high"]),
+                "l": float(row["low"]),
+                "c": float(row["close"]),
+                "v": int(row.get("volume", 0) or 0),
+            })
+        except Exception:
+            continue
+    return bars
+
+
+# =============================================
 # VIX SPOT PROXY (via VX front-month futures)
 # =============================================
 #
