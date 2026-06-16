@@ -2975,6 +2975,70 @@ def _bars_cache_set(key, bars):
         _BARS_CACHE[key] = (time.time(), bars)
 
 
+# Largest single-bar close-to-close move we'll accept as real before treating
+# a fully-reverting print as corrupt. Daily moves past this that revert in one
+# bar are virtually always bad ticks on the free IEX feed, not tradable events.
+_BAR_SPIKE_FRACTION = 0.35
+
+
+def _sanitize_bars(symbol, bars, kind):
+    """Drop structurally-invalid and single-print spike bars before they reach
+    the cache and the detectors.
+
+    The free Alpaca/IEX daily feed occasionally emits a bad print -- a zero, an
+    inverted high/low, an open/close outside the bar's own range, or a
+    mis-decimaled close. A single such bar silently corrupts everything built
+    on the series: relative strength (KLAC showed a -92% 5-day RS off one bad
+    close, which then gated the whole board as "counter-trend"), the
+    O'Neil/Wyckoff/52w detectors, ATR, Fibonacci levels and stop/target math.
+    The net effect is manufactured or wrongly-suppressed alerts, so we filter
+    here at the single fetch chokepoint rather than in each consumer.
+
+    Conservative by design: structural checks only drop bars that are
+    internally impossible, and the spike check only drops a bar whose close
+    disagrees sharply with BOTH neighbors while the neighbors agree with each
+    other (the signature of a one-bar bad tick). A real gap persists into the
+    next bar, so it survives.
+    """
+    if not bars:
+        return bars
+
+    clean = []
+    dropped = 0
+    for b in bars:
+        o, h, l, c = b.get("o"), b.get("h"), b.get("l"), b.get("c")
+        if None in (o, h, l, c) or o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            dropped += 1
+            continue
+        if h < l:
+            dropped += 1
+            continue
+        # Open/close must sit within the bar's own high/low (tiny float slack).
+        lo, hi = l * 0.999, h * 1.001
+        if not (lo <= o <= hi and lo <= c <= hi):
+            dropped += 1
+            continue
+        clean.append(b)
+
+    despiked = []
+    for i, b in enumerate(clean):
+        if 0 < i < len(clean) - 1:
+            prev_c, next_c, cur_c = clean[i - 1]["c"], clean[i + 1]["c"], b["c"]
+            if prev_c > 0 and next_c > 0:
+                neighbors_agree = abs(next_c / prev_c - 1) < 0.12
+                jumps_both = (abs(cur_c / prev_c - 1) > _BAR_SPIKE_FRACTION
+                              and abs(cur_c / next_c - 1) > _BAR_SPIKE_FRACTION)
+                if neighbors_agree and jumps_both:
+                    dropped += 1
+                    continue
+        despiked.append(b)
+
+    if dropped:
+        log("{} {}: dropped {} corrupt bar(s) ({}->{} kept)".format(
+            symbol, kind, dropped, len(bars), len(despiked)))
+    return despiked
+
+
 def _fetch_bars(symbol, timeframe, limit, kind):
     """
     Cached, rate-limit-aware bar fetch shared by the daily/weekly getters.
@@ -3027,6 +3091,7 @@ def _fetch_bars(symbol, timeframe, limit, kind):
                     # ascending so every downstream detector's daily[-1] /
                     # weekly[-1] is the most recent bar, as they all assume.
                     bars.reverse()
+                    bars = _sanitize_bars(symbol, bars, kind)
                     _bars_cache_set(cache_key, bars)
                     return bars
                 # 200 OK but no bars. This is the silent-outage signature
