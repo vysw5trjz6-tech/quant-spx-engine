@@ -28,6 +28,12 @@ HEADERS = {
 }
 DATA_URL = "https://data.alpaca.markets/v2/stocks/{}/bars"
 
+# Must match data_fetcher.ALPACA_FEED: the profile medians built here are
+# compared directly against data_fetcher's live bars, so both have to read the
+# same feed. Pinned (default iex) because Alpaca's implicit SIP default returns
+# 200 + empty bars on a free key -- which silently failed all 72 profile builds.
+ALPACA_FEED = os.getenv("ALPACA_FEED", "iex").strip()
+
 VOL_CACHE_DB     = db_utils.data_path("volume_profile.db")
 VOL_LOOKBACK_DAYS = 30
 VOL_REFRESH_HOURS = 24   # rebuild cache every 24h
@@ -96,15 +102,17 @@ def _fetch_intraday_history(symbol, days_back=VOL_LOOKBACK_DAYS):
     page_token = None
     pages      = 0
     while pages < 10:
-        # No explicit `feed`: use the account's default, which is what
-        # data_fetcher's live intraday bars use too. The profile medians
-        # MUST come from the same feed as the live volume they're compared
-        # against in get_true_volume_ratio, or every ratio is garbage.
+        # Pin the feed (ALPACA_FEED) to match data_fetcher's live intraday
+        # bars. The profile medians MUST come from the same feed as the live
+        # volume they're compared against in get_true_volume_ratio, or every
+        # ratio is garbage -- and the implicit SIP default returns empty on a
+        # free key, which silently failed every build here.
         params = {
             "timeframe": "5Min",
             "start":     start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end":       end.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit":     10000,
+            "feed":      ALPACA_FEED,
         }
         if page_token:
             params["page_token"] = page_token

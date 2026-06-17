@@ -1,4 +1,5 @@
 import data_fetcher
+import volume_truth
 
 
 def _fake_bars(symbol, timeframe, limit, **kwargs):
@@ -62,3 +63,32 @@ def test_prefetch_warms_all_caches(monkeypatch):
     data_fetcher.get_intraday("AAA")
     data_fetcher.get_daily("BBB")
     assert _fake_bars.calls == before
+
+
+def test_default_feed_is_iex():
+    # Free Alpaca keys are IEX-only; the implicit SIP default returns empty
+    # bars and starves every consumer. Default must be an entitled feed.
+    assert data_fetcher.ALPACA_FEED == "iex"
+
+
+def test_live_and_profile_feeds_match():
+    # The profile medians are compared directly against live bars, so the two
+    # modules MUST request the same feed or every volume ratio is garbage.
+    assert data_fetcher.ALPACA_FEED == volume_truth.ALPACA_FEED
+
+
+def test_fetch_bars_pins_feed(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"bars": []}
+
+    def _fake_get(url, headers=None, params=None, timeout=None):
+        captured["params"] = params
+        return _Resp()
+
+    monkeypatch.setattr(data_fetcher.requests, "get", _fake_get)
+    data_fetcher._fetch_bars("FAKE", "5Min", 78, start="2026-01-01T09:30:00-05:00")
+    assert captured["params"]["feed"] == data_fetcher.ALPACA_FEED
