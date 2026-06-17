@@ -490,6 +490,73 @@ def log_event(event, level="info", **fields):
             debug_log.pop(0)
 
 
+def _storage_status():
+    """Inspect where data_path() resolves and whether it actually persists.
+
+    Returns a dict the boot sequence and /diagnostic both consume:
+      persistent : bool  -- True when DATA_DIR or a Railway volume is mounted
+      writable   : bool  -- the dir exists and we can create a file in it
+      data_dir   : str   -- the resolved base directory
+      source     : str   -- which env var supplied it (or "/tmp fallback")
+      detail     : str   -- human-readable note for the unhappy paths
+
+    `persistent` being False means every SQLite DB (volume profiles, but also
+    the paid Databento IV/OI history) lives on the container's ephemeral disk
+    and is wiped on the next redeploy -- the exact failure that silently reset
+    volume profiles to 0 each boot."""
+    if os.getenv("DATA_DIR"):
+        source = "DATA_DIR"
+    elif os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
+        source = "RAILWAY_VOLUME_MOUNT_PATH"
+    else:
+        source = "/tmp fallback"
+    persistent = source != "/tmp fallback"
+
+    writable = False
+    detail   = ""
+    try:
+        os.makedirs(_data_dir, exist_ok=True)
+        probe = _data_dir.rstrip("/") + "/.storage_probe"
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        writable = True
+    except Exception as e:
+        detail = "data dir not writable: {}".format(e)
+
+    if not persistent:
+        detail = ("ephemeral storage -- all SQLite DBs (incl. paid Databento "
+                  "IV/OI history) are WIPED on every redeploy; attach a Railway "
+                  "volume or set DATA_DIR")
+    elif not writable and not detail:
+        detail = "persistent path configured but not writable"
+
+    return {
+        "persistent": persistent,
+        "writable":   writable,
+        "data_dir":   _data_dir,
+        "source":     source,
+        "detail":     detail,
+    }
+
+
+def _log_storage_status():
+    """Boot-time announcement of persistence health. Ephemeral or unwritable
+    storage is a data-loss condition, so it's logged at WARN/ERROR rather than
+    buried in an info line that nobody reads."""
+    st = _storage_status()
+    if not st["persistent"]:
+        log_warn("storage.ephemeral | data_dir={} | {}".format(
+            st["data_dir"], st["detail"]))
+    elif not st["writable"]:
+        log_error("storage.not_writable | data_dir={} | {}".format(
+            st["data_dir"], st["detail"]))
+    else:
+        log("storage.persistent | data_dir={} (via {})".format(
+            st["data_dir"], st["source"]))
+    return st
+
+
 def _databento_blocked():
     """True when the Databento billing breaker is currently engaged."""
     try:
@@ -9589,6 +9656,7 @@ def db_status():
         return jsonify({
             "db_file": DB_FILE,
             "data_dir_env": os.getenv("DATA_DIR", "(not set, using /tmp)"),
+            "storage": _storage_status(),
             "trades": {
                 "total": total_count,
                 "open": open_count,
@@ -10207,6 +10275,7 @@ except Exception as _e:
 log("DB_FILE: {} | data_dir: {} | RAILWAY_VOLUME_MOUNT_PATH: {}".format(
     DB_FILE, _data_dir,
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "(not set)")))
+_log_storage_status()   # loud WARN/ERROR if storage is ephemeral or unwritable
 db_load_latest_config()   # restore AI config from last session
 _maybe_reset_ai_baseline()  # one-time wipe of pre-reset drifted tuning
 threading.Thread(target=background_scheduler, daemon=True).start()

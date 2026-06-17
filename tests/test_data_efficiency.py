@@ -60,6 +60,34 @@ def test_module_db_paths_are_absolute():
         assert os.path.isabs(path), path
 
 
+def test_storage_status_flags_ephemeral(monkeypatch):
+    """Storage health-check must report ephemeral/unwritable loudly so a
+    missing Railway volume can't silently wipe accumulated data each boot."""
+    import importlib
+    import main
+
+    # No DATA_DIR / volume -> ephemeral /tmp fallback.
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH", raising=False)
+    monkeypatch.setattr(main, "_data_dir", "/tmp")
+    st = main._storage_status()
+    assert st["persistent"] is False
+    assert st["source"] == "/tmp fallback"
+    assert "ephemeral" in st["detail"]
+
+    # A mounted Railway volume -> persistent + writable.
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", _TMP_VOL)
+    monkeypatch.setattr(main, "_data_dir", _TMP_VOL)
+    st = main._storage_status()
+    assert st["persistent"] is True
+    assert st["writable"] is True
+    assert st["source"] == "RAILWAY_VOLUME_MOUNT_PATH"
+
+
+import tempfile as _tempfile
+_TMP_VOL = _tempfile.mkdtemp(prefix="qspx-vol-")
+
+
 # ---------------------------------------------------------------------------
 # 2. No paid-but-unread quote pull in options_flow
 # ---------------------------------------------------------------------------
