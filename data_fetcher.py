@@ -34,6 +34,17 @@ DATA_URL     = "https://data.alpaca.markets/v2/stocks/{}/bars"
 QUOTE_URL    = "https://data.alpaca.markets/v2/stocks/{}/quotes/latest"
 SNAPSHOT_URL = "https://data.alpaca.markets/v2/stocks/{}/snapshot"
 
+# Alpaca data feed. A free key is entitled only to IEX, but the bars endpoint's
+# implicit default is the consolidated SIP feed -- which a free key can't read.
+# Rather than erroring, Alpaca returns HTTP 200 with an EMPTY `bars` array, so
+# omitting `feed` silently starves every consumer (intraday change, ORB/VWAP,
+# and volume_truth's 30-day profile history -> "Volume profiles refreshed for 0
+# symbols"). Pin the feed explicitly. It is env-overridable (set ALPACA_FEED=sip
+# on a paid plan) and MUST stay identical to volume_truth's profile feed -- a
+# profile built on one feed and compared to live bars on another inflates every
+# bar-of-day volume ratio by the feeds' market-share gap (~25-100x).
+ALPACA_FEED = os.getenv("ALPACA_FEED", "iex").strip()
+
 # How old the freshest available price source is allowed to be (in seconds)
 # during regular trading hours before we declare the symbol's price "stale"
 # and refuse to signal on it. On free Alpaca (IEX-only feed), thinly-routed
@@ -79,11 +90,11 @@ def _fetch_bars(symbol, timeframe, limit, start=None):
     # bars it returns the OLDEST `limit` and a (here unused) next_page_token --
     # which would leave the latest bars (and the current price) silently stale.
     #
-    # No explicit `feed` param: the account default applies. volume_truth's
-    # profile builder must stay on the SAME feed -- its per-slot volume
-    # medians are compared directly against these bars' volume, and mixing
-    # feeds (e.g. consolidated SIP here vs IEX there) inflates every
-    # time-volume ratio by the feeds' market-share gap (~25-100x).
+    # Feed is pinned (ALPACA_FEED, default iex) rather than left to Alpaca's
+    # implicit SIP default, which a free key can't read and which comes back as
+    # 200 + empty bars. volume_truth's profile builder reads the SAME env var so
+    # its per-slot medians and these live bars stay on one feed -- mixing them
+    # (e.g. SIP here vs IEX there) inflates every time-volume ratio by ~25-100x.
     #
     # `start` must ALWAYS be sent: Alpaca defaults it to the beginning of the
     # CURRENT day, so an unbounded fetch returns only today's bars no matter
@@ -101,7 +112,7 @@ def _fetch_bars(symbol, timeframe, limit, start=None):
             lookback_days = 5
         start = (datetime.now(_ET) - timedelta(days=lookback_days)).isoformat()
     params = {"timeframe": timeframe, "limit": limit, "sort": "desc",
-              "start": start}
+              "start": start, "feed": ALPACA_FEED}
     try:
         r = requests.get(
             DATA_URL.format(symbol),

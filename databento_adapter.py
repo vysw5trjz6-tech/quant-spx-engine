@@ -540,8 +540,14 @@ def get_equity_bars(symbol, start, end, schema="ohlcv-1d"):
         if _is_insufficient_funds(e):
             _trip_billing_breaker("equity bars")
         else:
+            # Surface the actual Databento detail, not just the class name.
+            # `BentoClientError` alone is undiagnosable -- the SDK carries the
+            # real reason (bad dataset code, no entitlement, symbology
+            # mismatch, out-of-range window) in the message, and without it
+            # the log can't tell us why every symbol fails identically.
             _emit_error("databento.equity_fetch_failed", symbol=symbol,
-                        dataset=EQUITY_DATASET, exc=type(e).__name__)
+                        dataset=EQUITY_DATASET, exc=type(e).__name__,
+                        detail=str(e)[:300])
             _neg_cache_set(cache_key)
         return []
 
@@ -676,11 +682,19 @@ def get_vix_proxy(target_date_et=None):
         _cache_set(cache_key, {"vix": vix})
         return vix
     except Exception as e:
-        if _is_billing_error(e):
+        # XCBF.PITCH (VX futures) requires a paid live-data license and
+        # returns 403 without one. Classifying that 403 as "billing" (via the
+        # broad _is_billing_error) trips the SHARED breaker and blanks the
+        # funded equity + options paths for 30 min over a single non-critical
+        # proxy -- exactly the "databento.billing_blocked | context=vix proxy"
+        # cascade seen at the open. Only a genuine 402 insufficient-funds may
+        # open the breaker here; a 403/entitlement error negative-caches and
+        # falls through to the Yahoo/VIXY VIX sources instead.
+        if _is_insufficient_funds(e):
             _trip_billing_breaker("vix proxy")
         else:
             _emit_error("databento.fetch_failed", source="vix_proxy",
-                        exc=type(e).__name__)
+                        exc=type(e).__name__, detail=str(e)[:300])
             _neg_cache_set(cache_key)
         return None
 
