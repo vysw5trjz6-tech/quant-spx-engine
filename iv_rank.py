@@ -204,6 +204,35 @@ def get_history(symbol, lookback_days=252):
     return rows
 
 
+def get_recent_iv(symbol, max_age_days=4):
+    """Return the most recently stored ATM IV for `symbol`, or None if the
+    newest snapshot is older than `max_age_days` calendar days (or missing).
+
+    Lets live consumers -- chiefly the weekly expected-move in key_levels --
+    reuse the daily EOD snapshot instead of re-probing Alpaca's options
+    endpoint on every scan. fetch_atm_iv() is a serial, multi-expiry,
+    10s-timeout call; firing it per symbol every cycle stalls the scan for no
+    quality gain. ATM IV is stable enough day-to-day that the last close's
+    value is a sound basis for target sizing on a daily/weekly-horizon scan;
+    callers fall back to a live pull only when no recent snapshot exists.
+    The 4-day window survives a long holiday weekend.
+    """
+    history = get_history(symbol, 1)
+    if not history:
+        return None
+    obs_date, iv = history[0]
+    if iv is None or iv <= 0:
+        return None
+    try:
+        d  = datetime.strptime(obs_date, "%Y-%m-%d").date()
+        et = pytz.timezone("America/New_York")
+        if (datetime.now(et).date() - d).days > max_age_days:
+            return None
+    except Exception:
+        return None
+    return round(float(iv), 4)
+
+
 # =============================================
 # COMPUTE IV RANK + PERCENTILE
 # =============================================

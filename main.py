@@ -2549,6 +2549,104 @@ def get_1hr_trend(bars_1hr):
 # so a persistent feed mismatch logs once per symbol instead of per scan.
 _tv_suspect_warned = set()
 
+# Aggregate feed-mismatch health. A handful of suspect symbols is noise, but a
+# large slice of the universe tripping the detector means volume_profile.db was
+# built on a different feed than the live bars -- every volume gate is then
+# silently running on the (biased) fallback. We surface the count in
+# /diagnostic and, past a threshold, fire one aggregate warning + a single
+# same-day auto-rebuild so the degradation self-heals instead of persisting.
+_tv_suspect_today = {"date": None, "symbols": set(), "rebuilt": False}
+_tv_suspect_lock  = threading.Lock()
+_TV_SUSPECT_REBUILD_THRESHOLD = 8
+
+# Empirical intraday volume distribution. US equity volume is U-shaped:
+# heaviest in the opening drive, a midday trough, a secondary bump into the
+# close. The legacy fallback below (used when volume_truth has no profile, or
+# when a feed mismatch makes the profile ratio untrustworthy) modeled this as a
+# single power law (day_fraction ** 0.7) -- monotonic, so it can't represent
+# the U: it understates a noon ratio and overstates a 9:35 one, biasing every
+# volume gate exactly when we're already degraded. Replace it with a normalized
+# per-bar weight curve: weight[i] is bar i's expected share of the day's volume,
+# summing to 1 across the 78 RTH 5-min slots.
+_RTH_BARS = 78
+
+
+def _build_intraday_vol_weights(n=_RTH_BARS):
+    open_amp,  open_tau  = 2.4, 6.0     # opening drive decays over ~30 min
+    close_amp, close_tau = 1.3, 9.0     # softer ramp into the close
+    raw = []
+    for i in range(n):
+        raw.append(1.0
+                   + open_amp  * math.exp(-i / open_tau)
+                   + close_amp * math.exp(-(n - 1 - i) / close_tau))
+    total = sum(raw) or 1.0
+    return [w / total for w in raw]
+
+
+_INTRADAY_VOL_WEIGHTS = _build_intraday_vol_weights()
+
+
+def _expected_bar_vol_fraction(bar_idx):
+    """Expected share of a day's volume for 5-min bar `bar_idx` (0 = 9:30)."""
+    if not _INTRADAY_VOL_WEIGHTS:
+        return 1.0 / _RTH_BARS
+    i = max(0, min(bar_idx, len(_INTRADAY_VOL_WEIGHTS) - 1))
+    return _INTRADAY_VOL_WEIGHTS[i]
+
+
+def _note_tv_suspect(symbol):
+    """Record a suspect bar-of-day ratio for `symbol`. When the distinct count
+    crosses the threshold, warn loudly once and kick a single same-day rebuild
+    of every volume profile (feed-mismatch recovery)."""
+    today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    trip_rebuild = False
+    with _tv_suspect_lock:
+        if _tv_suspect_today["date"] != today:
+            _tv_suspect_today["date"]    = today
+            _tv_suspect_today["symbols"] = set()
+            _tv_suspect_today["rebuilt"] = False
+        _tv_suspect_today["symbols"].add(symbol)
+        count = len(_tv_suspect_today["symbols"])
+        if (count >= _TV_SUSPECT_REBUILD_THRESHOLD
+                and not _tv_suspect_today["rebuilt"]):
+            _tv_suspect_today["rebuilt"] = True
+            trip_rebuild = True
+    if trip_rebuild:
+        log_warn(("Volume feed mismatch: {} symbols tripped the suspect "
+                  "bar-of-day detector today -- volume_profile.db looks built "
+                  "on a different feed than the live bars. Forcing a profile "
+                  "rebuild; volume gates run on the fallback until it "
+                  "completes.").format(count))
+        if HAS_VOLUME_TRUTH:
+            threading.Thread(target=_force_rebuild_volume_profiles,
+                             daemon=True).start()
+
+
+def _force_rebuild_volume_profiles():
+    """Rebuild every volume profile regardless of age (feed-mismatch recovery).
+    build_profile bypasses the 24h needs_refresh() age gate."""
+    if not HAS_VOLUME_TRUTH:
+        return
+    try:
+        all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
+        built = sum(1 for s in all_syms if volume_truth.build_profile(s))
+        log("Forced volume-profile rebuild: {}/{} symbols".format(
+            built, len(all_syms)))
+    except Exception as e:
+        log("forced volume profile rebuild error: {}".format(e))
+
+
+def volume_health():
+    """Feed-mismatch health snapshot for /diagnostic."""
+    with _tv_suspect_lock:
+        return {
+            "date":            _tv_suspect_today["date"],
+            "suspect_count":   len(_tv_suspect_today["symbols"]),
+            "suspect_symbols": sorted(_tv_suspect_today["symbols"]),
+            "auto_rebuilt":    _tv_suspect_today["rebuilt"],
+            "rebuild_threshold": _TV_SUSPECT_REBUILD_THRESHOLD,
+        }
+
 
 def _time_vol_ratio_suspect(ratio, intraday_today, current_bar_idx):
     """A real volume event shows up bar-over-bar as well as against the
@@ -2592,6 +2690,10 @@ def get_time_vol_ratio(intraday_today, daily_bars, current_bar_idx, symbol=None)
                                   symbol=symbol, ratio=ratio,
                                   bar_idx=current_bar_idx,
                                   hint="profile feed mismatch? rebuild volume_profile.db")
+                    # Track aggregate health so a universe-wide feed mismatch
+                    # gets one loud warning + an auto-rebuild, not just N quiet
+                    # per-symbol logs.
+                    _note_tv_suspect(symbol)
                     # Fall through to the legacy approximation, which is
                     # internally consistent (same feed for bar and average).
                 else:
@@ -2610,10 +2712,9 @@ def get_time_vol_ratio(intraday_today, daily_bars, current_bar_idx, symbol=None)
     if avg_daily_vol <= 0:
         return 1.0, "N/A"
 
-    day_fraction  = max(0.01, (current_bar_idx + 1) / 78.0)
-    expected_vol  = avg_daily_vol * (day_fraction ** 0.7)
-    expected_per_bar = expected_vol / (current_bar_idx + 1) if current_bar_idx > 0 else expected_vol
-
+    # Expected single-bar volume from the U-shaped intraday distribution
+    # (open/lunch/close), not a monotonic power law that can't see the humps.
+    expected_per_bar = avg_daily_vol * _expected_bar_vol_fraction(current_bar_idx)
     ratio = round(current_vol / expected_per_bar, 2) if expected_per_bar > 0 else 1.0
 
     if ratio >= 3.0:
@@ -10146,6 +10247,10 @@ def diag_endpoint():
             "gex_bias":        _market_state.get("gex_bias"),
             "premarket_brief": _market_state.get("premarket_brief"),
         }
+
+    # Feed-mismatch health: how many symbols are falling back to the biased
+    # volume estimator today, and whether an auto-rebuild has fired.
+    out["volume_health"] = volume_health()
 
     return jsonify(out)
 

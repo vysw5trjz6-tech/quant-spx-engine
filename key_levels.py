@@ -8,9 +8,10 @@ and the dashboard all read the same numbers instead of refetching.
 
 Caching is keyed on (symbol, latest_daily_bar_timestamp, dte): a new daily bar
 or a roll to a new weekly expiry invalidates the entry; otherwise repeated
-calls within a cycle are free. IV is the one network-backed field
-(iv_rank.fetch_atm_iv); if it fails the level object still returns with iv=None
-so callers degrade to fib-only targets.
+calls within a cycle are free. IV is the one network-backed field: it reuses
+the daily EOD snapshot (iv_rank.get_recent_iv) and only falls back to a live
+pull (iv_rank.fetch_atm_iv) when no recent snapshot exists. If both fail the
+level object still returns with iv=None so callers degrade to fib-only targets.
 
 Kept import-light (no dependency on main) to avoid a circular import.
 """
@@ -121,7 +122,13 @@ def get_key_levels(symbol, daily_bars=None, spot=None, direction="CALL",
 
         if _HAS_IV and spot:
             try:
-                kl.atm_iv = iv_rank.fetch_atm_iv(symbol, spot)
+                # Prefer the daily EOD snapshot (iv_history) so a scan doesn't
+                # pay for a slow, serial, multi-expiry options probe every
+                # cycle; fall back to a live pull only when no recent snapshot
+                # exists for the symbol.
+                kl.atm_iv = iv_rank.get_recent_iv(symbol)
+                if kl.atm_iv is None:
+                    kl.atm_iv = iv_rank.fetch_atm_iv(symbol, spot)
             except Exception:
                 kl.atm_iv = None
 
