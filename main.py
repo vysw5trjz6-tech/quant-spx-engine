@@ -1106,16 +1106,24 @@ def db_close_trade(trade_id, exit_price, outcome):
 
 def db_get_today_trades():
     try:
-        et    = pytz.timezone("America/New_York")
-        today = datetime.now(et).strftime("%Y-%m-%d")
+        # Trade `ts` is stored in UTC (db_log_trade), so "today's" trades must
+        # be bounded by the ET session day expressed in UTC -- not matched with
+        # `ts LIKE <ET-date>%`. Those agree only during RTH; once it's past
+        # 8 PM ET (>= midnight UTC) the UTC date is already tomorrow and a
+        # LIKE on the ET date silently drops every trade entered that session.
+        et       = pytz.timezone("America/New_York")
+        start_et = datetime.now(et).replace(hour=0, minute=0, second=0,
+                                            microsecond=0)
+        start_utc = start_et.astimezone(pytz.utc).isoformat()
+        end_utc   = (start_et + timedelta(days=1)).astimezone(pytz.utc).isoformat()
         conn  = db_utils.connect(DB_FILE)
         c     = conn.cursor()
         c.execute("""
             SELECT id,symbol,direction,premium,contracts,stop,target,
                    outcome,exit_price,pnl,r_mult,ts
-            FROM trades WHERE ts LIKE ?
+            FROM trades WHERE ts >= ? AND ts < ?
             ORDER BY ts DESC
-        """, (today + "%",))
+        """, (start_utc, end_utc))
         rows = c.fetchall()
         conn.close()
         cols = ["id","symbol","direction","premium","contracts","stop",
@@ -7711,86 +7719,126 @@ def _check_ib_extension_unlock(spy_intraday_bars):
     return None
 
 
+# Intraday de-risk thresholds. A genuine vol spike needs BOTH a strong jump
+# over the trailing 20-day RV (so we don't react to a quiet tape) AND an
+# absolute floor near the regime boundary (so a big multiple off a tiny base
+# doesn't masquerade as a shock).
+_DERISK_ELEVATED_RATIO = 1.5
+_DERISK_ELEVATED_ABS   = 18.0
+_DERISK_CRISIS_RATIO   = 2.0
+_DERISK_CRISIS_ABS     = 26.0
+_UNLOCK_RATIO          = 1.3
+
+
+def _intraday_rv_spy():
+    """Annualized realized vol (%) from the last ~60 min of SPY 5-min bars,
+    or None when there isn't enough clean data."""
+    intraday = get_intraday("SPY")
+    if not intraday or len(intraday) < 12:
+        return None
+    closes = [b["c"] for b in intraday[-12:]]
+    rets = []
+    for i in range(1, len(closes)):
+        if closes[i - 1] <= 0:
+            return None
+        rets.append(math.log(closes[i] / closes[i - 1]))
+    if len(rets) < 2:
+        return None
+    # 78 5-min bars/day * 252 trading days = 19656.
+    return statistics.stdev(rets) * math.sqrt(19656) * 100
+
+
+def _apply_intraday_regime(new_label, rv_intra, rv20, reason, blurb):
+    """Swap the live regime label + strategy matrix in shared state and notify.
+    Returns the prior label."""
+    with _market_state_lock:
+        regime_now = dict(_market_state.get("regime") or {})
+        prior = regime_now.get("regime")
+        regime_now["regime"] = new_label
+        regime_now["rules"]  = dict(regime_filter.REGIME_STRATEGY_RULES[new_label])
+        regime_now["note"]   = "{} RV_intra={:.1f}% (RV20={:.1f}%).".format(
+            reason, rv_intra, rv20)
+        regime_now["intraday_flip"] = True
+        regime_now["rv_intra"]      = round(rv_intra, 2)
+        _market_state["regime"] = regime_now
+    log("REGIME FLIP: {} -> {} (rv_intra={:.1f}%)".format(
+        prior, new_label, rv_intra))
+    try:
+        send_telegram("REGIME UPDATE: {} -> {}\n{}".format(prior, new_label, blurb))
+    except Exception as e:
+        log("regime flip telegram error: {}".format(e))
+    return prior
+
+
 def _intraday_regime_recheck():
     """
-    Run once around 10:30 AM ET. Compares 30-min realized vol from 5-min SPY
-    bars against the morning's regime classification. If the intraday tape is
-    materially more volatile than the COMPRESSED label implies, force-flip to
-    LOW_VOL and fire a Telegram update so the user knows the matrix changed.
+    Re-classify the live regime against intraday realized vol. Safe to call
+    every scan from ~10:00 AM ET on (not just once at 10:30):
+
+      * De-risk (escalate): a sharp intraday vol expansion that implies a more
+        hostile regime than the live label force-flips UP to ELEVATED (mean
+        reversion off, conviction trimmed) or CRISIS (also swing breakouts
+        off). Strictly monotonic -- we only escalate intraday, never relax, and
+        never re-fire for a regime already reached today. This is the gap the
+        old once-at-10:30 unlock left open: a NORMAL/LOW_VOL morning that turns
+        violent used to keep trading mean reversion into the spike.
+      * Unlock (coiled spring): the original COMPRESSED -> LOW_VOL flip, fired
+        once, when a tight-range morning expands but not violently.
     """
     if not HAS_REGIME:
         return
 
-    et       = pytz.timezone("America/New_York")
-    today    = datetime.now(et).strftime("%Y-%m-%d")
-    if _regime_recheck_done.get("date") == today:
-        return
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).strftime("%Y-%m-%d")
+    if _regime_recheck_done.get("date") != today:
+        _regime_recheck_done.clear()
+        _regime_recheck_done.update(
+            {"date": today, "unlocked": False, "escalated_rank": -1})
 
-    intraday = get_intraday("SPY")
-    # Need at least 12 5-min bars (60 min) of data for a meaningful read
-    if not intraday or len(intraday) < 12:
+    rv_intra = _intraday_rv_spy()
+    if rv_intra is None:
         return
-
-    closes = [b["c"] for b in intraday[-12:]]
-    rets   = []
-    for i in range(1, len(closes)):
-        if closes[i-1] <= 0:
-            return
-        rets.append(math.log(closes[i] / closes[i-1]))
-    if len(rets) < 2:
-        return
-
-    # Annualize 5-min realized vol: 78 5-min bars/day * 252 trading days = 19656
-    sd        = statistics.stdev(rets)
-    rv_intra  = sd * math.sqrt(19656) * 100   # percent annualized
 
     with _market_state_lock:
         regime_now = _market_state.get("regime") or {}
     current_label = regime_now.get("regime")
     rv20          = regime_now.get("realized") or 0
-
-    # Flip rule: intraday RV is 1.3x trailing 20-day, AND we're currently
-    # in COMPRESSED. Any other transition we ignore for now.
-    should_flip = (
-        current_label == "COMPRESSED"
-        and rv20 > 0
-        and rv_intra > rv20 * 1.3
-    )
-
-    _regime_recheck_done["date"]    = today
-    _regime_recheck_done["flipped"] = should_flip
-    _regime_recheck_done["from"]    = current_label
+    cur_rank      = regime_filter.regime_rank(current_label)
     _regime_recheck_done["rv_intra"] = round(rv_intra, 2)
 
-    if not should_flip:
-        log("Intraday regime re-check: {} (rv_intra={:.1f}%, rv20={:.1f}%) - no flip".format(
-            current_label, rv_intra, rv20))
+    # --- De-risk: escalate to a more hostile regime on a real vol spike ---
+    target = None
+    if (rv20 > 0 and rv_intra >= _DERISK_CRISIS_ABS
+            and rv_intra > rv20 * _DERISK_CRISIS_RATIO):
+        target = "CRISIS"
+    elif (rv20 > 0 and rv_intra >= _DERISK_ELEVATED_ABS
+            and rv_intra > rv20 * _DERISK_ELEVATED_RATIO):
+        target = "ELEVATED"
+
+    if target:
+        target_rank = regime_filter.regime_rank(target)
+        if (target_rank > cur_rank
+                and target_rank > _regime_recheck_done.get("escalated_rank", -1)):
+            extra = " Swing breakouts halted." if target == "CRISIS" else ""
+            _apply_intraday_regime(
+                target, rv_intra, rv20,
+                "INTRADAY_DERISK to {}.".format(target),
+                ("Intraday vol spiking ({:.1f}% vs RV20 {:.1f}%).\n"
+                 "Mean reversion disabled, conviction trimmed for the rest of "
+                 "the session.{}").format(rv_intra, rv20, extra))
+            _regime_recheck_done["escalated_rank"] = target_rank
         return
 
-    new_label = "LOW_VOL"
-    _regime_recheck_done["to"] = new_label
-
-    new_regime = dict(regime_now)
-    new_regime["regime"]   = new_label
-    new_regime["rules"]    = dict(regime_filter.REGIME_STRATEGY_RULES[new_label])
-    new_regime["note"]     = "INTRADAY_FLIP from COMPRESSED. RV_intra={:.1f}% (RV20={:.1f}%)".format(
-        rv_intra, rv20)
-    new_regime["intraday_flip"] = True
-    new_regime["rv_intra"]      = round(rv_intra, 2)
-
-    with _market_state_lock:
-        _market_state["regime"] = new_regime
-
-    log("REGIME FLIP: COMPRESSED -> LOW_VOL (rv_intra={:.1f}%)".format(rv_intra))
-    try:
-        send_telegram(
-            "REGIME UPDATE: COMPRESSED -> LOW_VOL\n"
-            "Intraday RV expanding ({:.1f}% vs RV20 {:.1f}%).\n"
-            "Trend strategies fully active for the rest of the session."
-            .format(rv_intra, rv20)
-        )
-    except Exception as e:
-        log("regime flip telegram error: {}".format(e))
+    # --- Unlock: COMPRESSED coiled spring -> LOW_VOL (one-shot) ---
+    if (current_label == "COMPRESSED"
+            and not _regime_recheck_done.get("unlocked")
+            and rv20 > 0 and rv_intra > rv20 * _UNLOCK_RATIO):
+        _apply_intraday_regime(
+            "LOW_VOL", rv_intra, rv20, "INTRADAY_FLIP from COMPRESSED.",
+            ("Intraday RV expanding ({:.1f}% vs RV20 {:.1f}%).\n"
+             "Trend strategies fully active for the rest of the session.")
+            .format(rv_intra, rv20))
+        _regime_recheck_done["unlocked"] = True
 
 
 def _check_overnight_gamma_reversal():
@@ -7853,9 +7901,10 @@ _ib_unlock_state = {
 }
 _ib_unlock_lock = threading.Lock()
 
-# Intraday regime re-classify: runs once at ~10:30 ET. Sets a marker so we
-# don't double-fire and so the brief endpoint can show whether a flip happened.
-_regime_recheck_done = {"date": None, "flipped": False, "from": None, "to": None}
+# Per-day intraday-recheck state. `escalated_rank` is the severity index of the
+# most hostile regime we've de-risked into today (-1 = none), keeping escalation
+# monotonic; `unlocked` guards the one-shot COMPRESSED -> LOW_VOL flip.
+_regime_recheck_done = {"date": None, "unlocked": False, "escalated_rank": -1}
 
 
 def background_scheduler():
@@ -7993,11 +8042,13 @@ def background_scheduler():
                 _daily_refresh_done["flow_attempt"] = time.time()
                 threading.Thread(target=_pull_opening_flow, daemon=True).start()
 
-            # 10:30 AM ET: re-classify regime against intraday RV.
-            # If we labeled today COMPRESSED but the tape is expanding, force
-            # a flip and notify so the matrix reflects reality.
-            if (et_hour >= 10.5 and et_hour < 10.8
-                    and _regime_recheck_done.get("date") != today):
+            # Re-classify regime against intraday RV every scan from ~10:00 AM
+            # to just before the close. The recheck is monotonic + idempotent
+            # internally: it escalates (de-risks) the moment the tape turns
+            # violent and fires the COMPRESSED unlock once, so running it
+            # repeatedly catches an afternoon vol spike the old 10:30 one-shot
+            # would have missed.
+            if _session and 10.0 <= et_hour < 15.92:
                 threading.Thread(target=_intraday_regime_recheck, daemon=True).start()
 
             # --- The following are INTRADAY refreshes ---

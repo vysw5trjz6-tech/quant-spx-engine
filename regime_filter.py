@@ -111,6 +111,33 @@ REGIME_STRATEGY_RULES = {
 }
 
 
+# Calm -> hostile ordering. The intraday recheck uses this to decide whether a
+# volatility shift is an escalation (de-risk) or a relaxation, and to keep
+# intraday flips strictly monotonic (we only ever escalate, never relax).
+REGIME_SEVERITY = ["COMPRESSED", "LOW_VOL", "NORMAL", "ELEVATED", "CRISIS"]
+
+
+def regime_rank(label):
+    """Severity index (0 = calmest). Unknown labels sort as NORMAL."""
+    try:
+        return REGIME_SEVERITY.index(label)
+    except ValueError:
+        return REGIME_SEVERITY.index("NORMAL")
+
+
+def regime_from_realized_vol(realized_vol):
+    """Map an annualized realized-vol % to a regime label, using the same
+    thresholds classify_regime falls back to when VIX is unavailable. Returns
+    None when realized_vol is None."""
+    if realized_vol is None:
+        return None
+    if   realized_vol < 10: return "COMPRESSED"
+    elif realized_vol < 14: return "LOW_VOL"
+    elif realized_vol < 20: return "NORMAL"
+    elif realized_vol < 28: return "ELEVATED"
+    return "CRISIS"
+
+
 # =============================================
 # DATA FETCH
 # =============================================
@@ -554,12 +581,8 @@ def classify_regime(vix=None, realized_vol=None):
                 "rules":    REGIME_STRATEGY_RULES["NORMAL"],
                 "note":     "no_vol_data_default_to_normal",
             }
-        # Realized > 25% annualized = elevated regime
-        if   realized_vol < 10: regime = "COMPRESSED"
-        elif realized_vol < 14: regime = "LOW_VOL"
-        elif realized_vol < 20: regime = "NORMAL"
-        elif realized_vol < 28: regime = "ELEVATED"
-        else:                   regime = "CRISIS"
+        # VIX unavailable: use realized vol as a (poorer) proxy.
+        regime = regime_from_realized_vol(realized_vol)
     else:
         regime = "NORMAL"
         for thresh, name in REGIME_THRESHOLDS:
