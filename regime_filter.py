@@ -172,6 +172,24 @@ _STOOQ_SYMBOLS = {
     "^VIX3M": "%5Evix3m",
 }
 
+# CBOE's official daily index CSVs -- the authoritative source the other
+# free mirrors (Stooq, datahub) merely repackage. Updated every evening after
+# settlement, key-less, and reachable from datacenter IPs where Yahoo/Stooq
+# get blocked. Covers all three legs we need, so it feeds both the spot regime
+# read AND get_vix_term_structure(). This is why it sits ahead of Yahoo.
+_CBOE_URL = ("https://cdn.cboe.com/api/global/us_indices/"
+             "daily_prices/{}_History.csv")
+_CBOE_SYMBOLS = {
+    "^VIX":   "VIX",
+    "^VIX9D": "VIX9D",
+    "^VIX3M": "VIX3M",
+}
+# A last row older than this many calendar days means CBOE's history file has
+# silently frozen (a 200 with stale data is invisible otherwise). Lenient
+# enough to survive a 3-day holiday weekend; the last-good cache (4d) backstops
+# anything longer.
+_CBOE_MAX_STALE_DAYS = 6
+
 
 def _vix_cache_init(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS vix_last_good "
@@ -212,6 +230,46 @@ def _vix_cache_get(ticker):
             return None
         return float(row[0])
     except Exception:
+        return None
+
+
+def _fetch_cboe_close(ticker):
+    """
+    Latest daily close for a ^-index from CBOE's official history CSV.
+    Returns None on any failure, including a silently-stale history file
+    (last row older than _CBOE_MAX_STALE_DAYS) so we fall through to the
+    next source rather than feeding a frozen value into the regime.
+
+    CSV header: DATE,OPEN,HIGH,LOW,CLOSE  (DATE like MM/DD/YYYY).
+    """
+    sym = _CBOE_SYMBOLS.get(ticker)
+    if not sym:
+        return None
+    try:
+        r = requests.get(_CBOE_URL.format(sym), timeout=15)
+        if r.status_code != 200 or not r.text:
+            return None
+        rows = list(csv.DictReader(io.StringIO(r.text)))
+        if not rows:
+            return None
+        last = rows[-1]
+        # Tolerate header whitespace/case drift across CBOE's files.
+        date_key  = next((k for k in last if k.strip().upper() == "DATE"), None)
+        close_key = next((k for k in last if k.strip().upper() == "CLOSE"), None)
+        if not date_key or not close_key:
+            return None
+        last_date = datetime.strptime(last[date_key].strip(), "%m/%d/%Y")
+        age = (datetime.now(timezone.utc).replace(tzinfo=None) - last_date).days
+        if age > _CBOE_MAX_STALE_DAYS:
+            print("[regime] CBOE {} stale (last={}, {}d old); ignoring".format(
+                ticker, last_date.strftime("%Y-%m-%d"), age))
+            return None
+        val = float(last[close_key])
+        print("[regime] CBOE {}={:.2f} (last={})".format(
+            ticker, val, last_date.strftime("%Y-%m-%d")))
+        return val
+    except Exception as e:
+        print("[regime] CBOE {} fetch failed: {}".format(ticker, e))
         return None
 
 
@@ -298,17 +356,20 @@ def _fetch_databento_vix(ticker):
 def _get_vix_value(ticker, lo=1.0, hi=200.0):
     """
     Source priority:
-      1. Yahoo (history endpoint)            -- real spot if reachable
-      2. Yahoo (download/chart endpoint)     -- alternate Yahoo route
-      3. Databento VX front-month + slope    -- proxy, always reachable
-      4. Stooq                               -- usually blocked on Railway
-      5. Last-good cache                     -- final resort
+      1. CBOE official history CSV           -- authoritative, datacenter-friendly
+      2. Yahoo (history endpoint)            -- real spot if reachable
+      3. Yahoo (download/chart endpoint)     -- alternate Yahoo route
+      4. Databento VX front-month + slope    -- proxy, always reachable
+      5. Stooq                               -- usually blocked on Railway
+      6. Last-good cache                     -- final resort
 
-    Real spot first, proxy second. If Yahoo is unblocked on this region
-    we get the actual VIX index value; otherwise we fall through to the
-    term-structure-adjusted VX estimate, which trails spot by ~1 pt.
+    CBOE first: it is the real index value, updated daily, and reachable from
+    datacenter IPs where Yahoo/Stooq get blocked -- the exact failure mode that
+    made the other free sources unreliable. Yahoo stays as a fast second. We
+    only fall through to the term-structure-adjusted VX proxy (Databento),
+    which trails spot by ~1 pt, if both real-index sources are unavailable.
     """
-    for fetch in (_fetch_yahoo_close, _fetch_yahoo_download,
+    for fetch in (_fetch_cboe_close, _fetch_yahoo_close, _fetch_yahoo_download,
                   _fetch_databento_vix, _fetch_stooq_close):
         val = fetch(ticker)
         if val is not None and lo <= val <= hi:
@@ -325,16 +386,20 @@ def get_current_vix():
     """
     Fetch the latest VIX quote.
 
-    Source priority:
-      1. Databento front-month VX future (reachable from datacenter IPs)
-      2. Yahoo Finance / Stooq (real VIX index, free; often blocked on cloud)
-      3. Persistent last-good cache (<= 4 days old)
-      4. VIXY ETF as last-resort proxy with tight sanity guard
-      5. None (caller uses realized vol fallback)
+    Source priority (delegated to _get_vix_value):
+      1. CBOE official history CSV (real index, daily, datacenter-friendly)
+      2. Yahoo Finance (real VIX index, free; often blocked on cloud)
+      3. Databento front-month VX future (proxy, reachable from datacenter IPs)
+      4. Stooq (real index, free; usually blocked on Railway)
+      5. Persistent last-good cache (<= 4 days old)
+    Then, if all of the above fail here:
+      6. VIXY ETF as last-resort proxy with tight sanity guard
+      7. None (caller uses realized vol fallback)
 
-    The VX front-month is a proxy (small contango premium vs spot), but it
-    is the only VIX source consistently reachable from Railway -- Yahoo and
-    Stooq both fail there. Good enough for regime bucketing.
+    CBOE is the authoritative source the free mirrors repackage and is
+    reachable from datacenter IPs, so it leads. The Databento VX front-month
+    is only a proxy (small contango premium vs spot) used when no real-index
+    source responds. Good enough for regime bucketing.
     """
     # --- Paths 1-2: real VIX (Yahoo -> Stooq -> last-good cache) ---
     vix = _get_vix_value("^VIX", 5, 80)
