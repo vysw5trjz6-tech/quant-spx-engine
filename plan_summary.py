@@ -75,5 +75,16 @@ def summarize_plan(regime, gex_bias, premarket):
         parts.append("morning fade likely")
     elif "GAP_AND_GO" in (gap.get("class") or ""):
         parts.append("continuation likely")
+    else:
+        # Pre-open there is no RTH print yet, so the open-vs-overnight gap is
+        # unknowable -- fall back to the real-index premarket read (implied
+        # open vs yesterday's SPX range) so the 9:10 plan still has a gap leg.
+        spx = (premarket or {}).get("spx") or {}
+        prem = spx.get("premarket_class")
+        if prem in ("ABOVE_PREV_HIGH", "BELOW_PREV_LOW"):
+            parts.append("SPX implied open beyond yesterday's range -- "
+                         "continuation watch")
+        elif prem == "INSIDE_PREV_RANGE":
+            parts.append("SPX gap inside yesterday's range -- fill/fade likely")
 
     return ". ".join(parts) + "."

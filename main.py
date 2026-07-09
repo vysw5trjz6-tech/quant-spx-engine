@@ -115,6 +115,20 @@ except ImportError as _e:
     HAS_VOL_OI = False
     print("[init] vol_oi unavailable: {}".format(_e))
 
+try:
+    import index_data
+    HAS_INDEX_DATA = True
+except ImportError as _e:
+    HAS_INDEX_DATA = False
+    print("[init] index_data unavailable: {}".format(_e))
+
+try:
+    import index_options
+    HAS_INDEX_OPTIONS = True
+except ImportError as _e:
+    HAS_INDEX_OPTIONS = False
+    print("[init] index_options unavailable: {}".format(_e))
+
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
 # Default is premarket since most users only need a morning brief.
@@ -128,6 +142,7 @@ _market_state = {
     "regime":           None,   # output of regime_filter.classify_regime()
     "premarket_brief":  None,   # output of overnight_context.get_premarket_brief()
     "gex_bias":         None,   # output of gamma_exposure.get_gex_bias()
+    "index_insights":   None,   # {"date", "SPX": {...}, "NDX": {...}} from index_options
     "regime_ts":        0,      # epoch when regime was last refreshed
 }
 _market_state_lock = threading.Lock()
@@ -1605,19 +1620,56 @@ def get_current_price(symbol):
     return data_fetcher.get_current_price(symbol)
 
 
-# SPX/NDX have no tradable feed here (Alpaca carries ETF options only), so we
-# derive their levels from the ETF proxies for trend / RS context only.
+# SPX/NDX have no live tradable feed here (Alpaca carries ETF options only).
+# Levels are anchored to the REAL index prior close (index_data) and moved by
+# the ETF proxy's intraday return; the fixed multipliers remain only as the
+# last-resort fallback when no index source is reachable.
 INDEX_PROXY = {
-    "SPX": ("SPY", 10.0),    # SPX ~= SPY x 10
-    "NDX": ("QQQ", 41.0),    # NDX ~= QQQ x ~41 (approx; labeled as proxy)
+    "SPX": ("SPY", 10.0),    # SPX ~= SPY x 10 (fallback multiplier only)
+    "NDX": ("QQQ", 41.0),    # NDX ~= QQQ x ~41 (fallback multiplier only)
 }
 
 
-def index_context():
-    """Display-only SPX/NDX context: derived level + intraday % change + RS.
+def _proxy_prev_close(proxy):
+    """Last COMPLETED daily close for the proxy ETF (skips today's live bar)."""
+    bars = get_daily(proxy)
+    if not bars:
+        return None
+    et = pytz.timezone("America/New_York")
+    today_iso = datetime.now(et).date().isoformat()
+    for b in reversed(bars):
+        if str(b.get("t", ""))[:10] < today_iso:
+            return b.get("c")
+    return None
 
-    Never produces a tradable signal. The numbers come from the SPY/QQQ proxies
-    so the dashboard / chat can frame index direction without an index feed.
+
+def _index_anchor_level(idx, proxy, proxy_last):
+    """Real prior index close moved by the proxy's return since ITS close.
+
+    level = real_prev_close x (proxy_last / proxy_prev_close). Both legs
+    span the same period (prior close -> now), so the ratio carries gaps and
+    folds the ETF's basis drift out; a fixed multiplier can be tens of SPX
+    points off. Returns (level, anchored: bool) -- anchored False means the
+    multiplier fallback is needed.
+    """
+    if not HAS_INDEX_DATA or not proxy_last:
+        return None, False
+    try:
+        prev = index_data.prev_session(idx)
+        p_prev = _proxy_prev_close(proxy)
+        if not prev or not p_prev:
+            return None, False
+        return round(prev["c"] * (proxy_last / p_prev), 2), True
+    except Exception:
+        return None, False
+
+
+def index_context():
+    """Display-only SPX/NDX context: real-anchored level + intraday % + RS.
+
+    Never produces a tradable signal. Direction/change still comes from the
+    liquid SPY/QQQ proxies; the LEVEL is anchored on the actual index close
+    when index_data has one.
     Returns a list of dicts, one per index product.
     """
     out = []
@@ -1633,18 +1685,22 @@ def index_context():
             px = get_current_price(proxy)
             bars = get_intraday(proxy)
             chg = get_symbol_change(bars)
-            level = round(px * factor, 2) if px else None
+            level, anchored = _index_anchor_level(idx, proxy, px)
+            if level is None:
+                level = round(px * factor, 2) if px else None
             out.append({
                 "symbol":   idx,
                 "proxy":    proxy,
                 "level":    level,
                 "pct":      chg,
                 "rs":       relative_strength(chg, spy_chg),
-                "is_proxy": True,
+                "is_proxy": not anchored,
+                "anchored": anchored,
             })
         except Exception:
             out.append({"symbol": idx, "proxy": proxy, "level": None,
-                        "pct": None, "rs": None, "is_proxy": True})
+                        "pct": None, "rs": None, "is_proxy": True,
+                        "anchored": False})
     return out
 
 
@@ -1670,8 +1726,13 @@ def render_index_context_strip():
             lvl="{:,.2f}".format(lvl) if lvl else "-",
             col=col,
             pct="{:+.2f}%".format(pct) if pct is not None else "-",
-            px=c.get("proxy", "-"),
+            px=("{} anchored".format(c.get("proxy", "-"))
+                 if c.get("anchored") else c.get("proxy", "-")),
         )
+    all_anchored = all(c.get("anchored") for c in ctx)
+    footer = ("(real index close, moved by proxy &mdash; context only)"
+              if all_anchored else
+              "(proxy levels &mdash; context only, trade SPY/QQQ)")
     return (
         "<div style='background:#0d1117;border:1px solid #30363d;border-radius:8px;"
         "padding:8px 12px;margin-bottom:10px;font-size:11px'>"
@@ -1679,7 +1740,7 @@ def render_index_context_strip():
         "font-size:9px;font-weight:700;margin-right:12px'>Index Context</span>"
         + cells +
         "<span style='color:#6e7681;font-size:9px;margin-left:6px'>"
-        "(proxy levels &mdash; context only, trade SPY/QQQ)</span></div>"
+        + footer + "</span></div>"
     )
 
 
@@ -7125,17 +7186,34 @@ def _refresh_market_state():
                 prev = spy_daily[-2]
                 today_intraday = get_intraday("SPY")
                 rth_open = today_intraday[0]["o"] if today_intraday else None
+                # Real index prior-session bars so the brief can speak in
+                # actual SPX/NDX points instead of ETF-proxy dollars.
+                spx_prev = ndx_prev = None
+                if HAS_INDEX_DATA:
+                    try:
+                        spx_prev = index_data.prev_session("SPX")
+                        ndx_prev = index_data.prev_session("NDX")
+                    except Exception as e:
+                        log("index data fetch error: {}".format(e))
                 brief = overnight_context.get_premarket_brief(
                     prev_rth_close = prev["c"],
                     prev_rth_high  = prev["h"],
                     prev_rth_low   = prev["l"],
                     rth_open       = rth_open,
+                    spx_prev       = spx_prev,
+                    ndx_prev       = ndx_prev,
                 )
                 with _market_state_lock:
                     _market_state["premarket_brief"] = brief
                 log("Premarket brief refreshed")
     except Exception as e:
         log("premarket brief refresh error: {}".format(e))
+
+    try:
+        if HAS_INDEX_OPTIONS:
+            _refresh_index_insights()
+    except Exception as e:
+        log("index options insights error: {}".format(e))
 
     try:
         if HAS_GEX:
@@ -7146,6 +7224,52 @@ def _refresh_market_state():
                 bias.get("tape_bias"), bias.get("note", "")))
     except Exception as e:
         log("GEX bias load error: {}".format(e))
+
+
+def _refresh_index_insights():
+    """
+    Once-daily SPX/NDX options insights (0DTE expected move, gamma walls,
+    P/C OI) from the real index chains. The chain is EOD data — OI and
+    settlement prices only change overnight — so recomputing within a day
+    would re-bill the identical Databento pull for the identical answer.
+    """
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).date().isoformat()
+
+    with _market_state_lock:
+        existing = _market_state.get("index_insights")
+        brief    = _market_state.get("premarket_brief")
+    if existing and existing.get("date") == today and (
+            existing.get("SPX") or existing.get("NDX")):
+        return
+
+    insights = {"date": today}
+    for idx, ctx_key in (("SPX", "spx"), ("NDX", "ndx")):
+        # Best premarket spot: the futures-implied open in index points;
+        # fall back to the real prior close.
+        spot = None
+        ctx = (brief or {}).get(ctx_key) or {}
+        spot = ctx.get("implied_open") or ctx.get("prev_close")
+        if not spot and HAS_INDEX_DATA:
+            try:
+                prev = index_data.prev_session(idx)
+                spot = prev["c"] if prev else None
+            except Exception:
+                spot = None
+        if not spot:
+            continue
+        try:
+            ins = index_options.get_index_options_insights(idx, spot)
+            if ins:
+                insights[idx] = ins
+                log("Index options insights built: {} (0DTE EM ±{} pts)".format(
+                    idx, ins.get("expected_move_pts")))
+        except Exception as e:
+            log("index insights error for {}: {}".format(idx, e))
+
+    if insights.get("SPX") or insights.get("NDX"):
+        with _market_state_lock:
+            _market_state["index_insights"] = insights
 
 
 def _refresh_volume_profiles():
@@ -7607,9 +7731,10 @@ def run_premarket_brief():
     _refresh_market_state()
 
     with _market_state_lock:
-        regime    = _market_state.get("regime")
-        premarket = _market_state.get("premarket_brief")
-        gex_bias  = _market_state.get("gex_bias")
+        regime         = _market_state.get("regime")
+        premarket      = _market_state.get("premarket_brief")
+        gex_bias       = _market_state.get("gex_bias")
+        index_insights = _market_state.get("index_insights") or {}
 
     # Top high-IVR names for earnings IV crush watchlist. Each entry is
     # (symbol, iv_rank, iv_rv_ratio, vrp_favorable). VRP-favorable names
@@ -7663,6 +7788,49 @@ def run_premarket_brief():
             msg_lines.append("  Gap: {} ({}%) — {}".format(
                 gap.get("class"), gap.get("gap_pct"),
                 gap.get("note", "").split(" → ")[-1][:60]))
+        msg_lines.append("")
+
+    # Real-index premarket context + options insights (actual SPX/NDX points)
+    for idx, ctx_key in (("SPX", "spx"), ("NDX", "ndx")):
+        ctx = (premarket or {}).get(ctx_key) or {}
+        ins = index_insights.get(idx) or {}
+        if not ctx and not ins:
+            continue
+        msg_lines.append("{} (index pts):".format(idx))
+        if ctx:
+            msg_lines.append("  Prev close: {:,.2f} | Implied open: {:,.2f} ({:+.2f}%)".format(
+                ctx["prev_close"], ctx["implied_open"], ctx["gap_pct"]))
+            msg_lines.append("  ON range: {:,.2f} – {:,.2f}".format(
+                ctx["on_low"], ctx["on_high"]))
+            if ctx.get("premarket_class"):
+                msg_lines.append("  Open: {} — {}".format(
+                    ctx["premarket_class"], ctx.get("premarket_note", "")))
+        if ins:
+            exp_tag = "0DTE" if ins.get("is_0dte") else \
+                      "{}DTE".format(ins.get("dte"))
+            if ins.get("expected_move_pts") is not None:
+                msg_lines.append(
+                    "  {} exp move: ±{:,.0f} pts (±{:.2f}%) → {:,.0f} / {:,.0f}".format(
+                        exp_tag, ins["expected_move_pts"],
+                        ins["expected_move_pct"],
+                        ins["em_low"], ins["em_high"]))
+            walls = []
+            if ins.get("put_wall"):
+                walls.append("Put wall {:,.0f}".format(ins["put_wall"]))
+            if ins.get("zero_gamma"):
+                walls.append("Zero-γ {:,.0f}".format(ins["zero_gamma"]))
+            if ins.get("call_wall"):
+                walls.append("Call wall {:,.0f}".format(ins["call_wall"]))
+            if walls:
+                msg_lines.append("  " + " | ".join(walls))
+            extras = []
+            if ins.get("pc_oi") is not None:
+                extras.append("P/C OI {:.2f}".format(ins["pc_oi"]))
+            if ins.get("gex_b") is not None:
+                extras.append("GEX ${}B {}".format(
+                    ins["gex_b"], ins.get("gex_regime", "")))
+            if extras:
+                msg_lines.append("  " + " | ".join(extras))
         msg_lines.append("")
 
     # GEX bias
@@ -9996,9 +10164,11 @@ def gex_endpoint():
 
 @app.route("/overnight")
 def overnight_endpoint():
-    """Premarket brief: overnight futures range, inventory, gap class."""
+    """Premarket brief: overnight futures range, inventory, gap class,
+    real-index (SPX/NDX) context and options insights."""
     with _market_state_lock:
-        brief = _market_state.get("premarket_brief")
+        brief    = _market_state.get("premarket_brief")
+        insights = _market_state.get("index_insights")
     if not brief:
         return jsonify({
             "status":        "no_data",
@@ -10006,8 +10176,9 @@ def overnight_endpoint():
             "module_loaded": HAS_OVERNIGHT,
         })
     return jsonify({
-        "status": "ok",
-        "brief":  brief,
+        "status":         "ok",
+        "brief":          brief,
+        "index_insights": insights,
     })
 
 
@@ -10076,9 +10247,10 @@ def iv_coverage_endpoint():
 def edge_endpoint():
     """One-stop dashboard: combined regime + GEX + overnight + top-IVR list."""
     with _market_state_lock:
-        regime    = _market_state.get("regime")
-        brief     = _market_state.get("premarket_brief")
-        gex_bias  = _market_state.get("gex_bias")
+        regime         = _market_state.get("regime")
+        brief          = _market_state.get("premarket_brief")
+        gex_bias       = _market_state.get("gex_bias")
+        index_insights = _market_state.get("index_insights")
 
     # Top 5 high-IVR names
     top_iv = []
@@ -10111,6 +10283,7 @@ def edge_endpoint():
         "regime":             regime,
         "gex_bias":           gex_bias,
         "premarket_brief":    brief,
+        "index_insights":     index_insights,
         "high_ivr_symbols":   top_iv,
         "modules": {
             "volume_truth":     HAS_VOLUME_TRUTH,
