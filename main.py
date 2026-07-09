@@ -356,6 +356,11 @@ DEFAULT_CONFIG = {
     # and almost nothing could alert.
     "weekly_rs_override":       5.0,
     "weekly_max_breakout_age":  3,        # skip breakouts older than N sessions
+    # Concurrent WEEKLY auto positions. The old hard lock of 1 meant a single
+    # open swing muted every other qualified tier-1 setup for up to a week --
+    # the main reason scans full of setups produced no alerts. One position
+    # per symbol still applies within the cap.
+    "weekly_max_positions":     3,
 
     # --- Clear-air (resistance/support proximity) cap ---
     # Levels within this % of current price are treated as already tested /
@@ -689,7 +694,7 @@ def init_db():
                           # position occupies, and how it was opened.
                           ("und_stop","REAL"), ("und_target_t1","REAL"),
                           ("und_target_t2","REAL"), ("horizon","TEXT"),
-                          ("mode","TEXT")]:
+                          ("mode","TEXT"), ("paper_key","TEXT")]:
         try:
             conn.execute("ALTER TABLE trades ADD COLUMN {} {}".format(col, coltype))
         except:
@@ -963,7 +968,11 @@ def db_dismiss_proposal(proposal_id):
 def db_get_all_closed_trades():
     """
     Closed trades for AI analysis -- ALL modes (paper + real), since the
-    AI must learn from every signal it suggested. P&L is intentionally
+    AI must learn from every signal it suggested. The one exclusion is
+    mode='paper_t2': the paper trader's T2 walk is target-calibration
+    telemetry, not a second trade -- counting it would hand every signal
+    an extra, much-harder row and deflate every win-rate the AI sees.
+    P&L is intentionally
     NOT selected: tuning is on pure win/loss + R-multiple (were the price
     targets hit before the stop), never on dollars. Trades logged before
     the active learning_epoch are excluded -- pre-reset data lacks
@@ -982,6 +991,7 @@ def db_get_all_closed_trades():
                    signal_type, horizon
             FROM trades
             WHERE outcome != 'OPEN' AND ts >= ?
+              AND COALESCE(mode, '') != 'paper_t2'
             ORDER BY ts DESC
         """, (epoch,))
         rows = c.fetchall()
@@ -1171,12 +1181,13 @@ def db_get_open_trades():
 # =============================================
 #
 # When a setup is alerted it auto-opens a tracked position (mode='auto') that
-# occupies its tier (WEEKLY or INTRADAY). While a tier holds a live position
-# the scanner emits no new alerts in that tier -- the two tiers are independent,
-# so one weekly and one intraday position can be live at once. The live monitor
-# resolves auto positions against the UNDERLYING targets (T1 = win, stop = loss)
-# each scan, then frees the tier. Manually-taken trades (mode != 'auto') also
-# occupy a tier so they mute alerts, but are only closed by the user.
+# occupies a slot in its tier. INTRADAY holds ONE live position at a time;
+# WEEKLY holds up to weekly_max_positions concurrently (one per symbol) --
+# the tiers are independent of each other. While a tier is full the scanner
+# emits no new alerts in it. The live monitor resolves auto positions against
+# the UNDERLYING targets (T1 = win, stop = loss) each scan, then frees the
+# slot. Manually-taken trades (mode != 'auto') also occupy a slot so they
+# mute alerts, but are only closed by the user.
 
 _OPEN_POS_COLS = ["id", "symbol", "direction", "premium", "stop", "target",
                   "ts", "entry_under", "signal_type", "und_stop",
@@ -1208,6 +1219,19 @@ def db_get_open_positions(horizon=None):
 def tier_has_open_position(horizon):
     """True if the given tier (WEEKLY/INTRADAY) already holds a live position."""
     return bool(db_get_open_positions(horizon))
+
+
+def weekly_alert_capacity():
+    """(free_slots, symbols_holding) for the WEEKLY tier.
+
+    The weekly tier allows up to weekly_max_positions concurrent auto
+    positions (INTRADAY stays single-slot). Symbols already holding an open
+    weekly position are excluded from new alerts regardless of free slots.
+    """
+    open_weekly = db_get_open_positions("WEEKLY")
+    max_pos     = get_config().get("weekly_max_positions", 3)
+    slots       = max(0, max_pos - len(open_weekly))
+    return slots, {p.get("symbol") for p in open_weekly}
 
 
 def open_auto_position(sig):
@@ -6396,16 +6420,22 @@ def run_swing_scan():
     except Exception as e:
         log("monitor_active_positions (weekly) error: {}".format(e))
 
-    # Weekly alerts: ONE live WEEKLY position at a time (tier lock), and within
-    # that, one alert per (symbol, direction, week_expiry) so a setup never
-    # re-fires until its Friday settlement rolls. Alert only the single best
-    # not-yet-alerted tier-1 setup, then lock the tier until it closes.
-    if tier_has_open_position("WEEKLY"):
-        log("WEEKLY tier locked -- live position open, suppressing alerts")
+    # Weekly alerts: up to weekly_max_positions concurrent WEEKLY positions
+    # (one per symbol), and one alert per (symbol, direction, week_expiry) so
+    # a setup never re-fires until its Friday settlement rolls. Fill the free
+    # slots from the top of the prob-sorted list.
+    slots, held_symbols = weekly_alert_capacity()
+    if slots <= 0:
+        log("WEEKLY tier full -- {} live position(s), suppressing alerts".format(
+            len(held_symbols)))
     else:
         for sig in results:                         # results sorted by prob desc
+            if slots <= 0:
+                break
             if sig.get("tier") != 1:
                 continue
+            if sig.get("symbol") in held_symbols:
+                continue                            # one live position per symbol
             key = (sig.get("symbol"), sig.get("direction"), sig.get("week_expiry"))
             with _weekly_alert_lock:
                 if key in _weekly_alerted:
@@ -6424,7 +6454,8 @@ def run_swing_scan():
                     _send_weekly_alert(sig)
                 except Exception as e:
                     log("weekly alert error: {}".format(e))
-            break  # one weekly position at a time
+            held_symbols.add(sig.get("symbol"))
+            slots -= 1
 
     # Compact filter-stage breakdown -- tells you WHY a 0-setups scan
     # was 0 (no_data vs earnings_blocked vs no_signal) and which tier-1
@@ -9004,6 +9035,7 @@ def stats_page():
             SELECT symbol, direction, outcome, pnl, r_mult,
                    grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts
             FROM trades WHERE outcome != 'OPEN'
+              AND COALESCE(mode, '') != 'paper_t2'
             ORDER BY ts DESC
         """)
         rows = c.fetchall()

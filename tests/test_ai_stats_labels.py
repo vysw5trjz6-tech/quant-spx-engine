@@ -69,3 +69,33 @@ def test_training_floor_covers_labeling_fix():
     # Trades logged before the labeling fixes carry fabricated buckets and
     # must stay out of AI tuning.
     assert main.AI_TRAINING_FLOOR >= "2026-07-09T00:00:00+00:00"
+
+
+def test_paper_t2_rows_excluded_from_ai_dataset(monkeypatch):
+    """The T2 walk is calibration telemetry, not a second trade -- it must
+    stay out of the AI's closed-trade dataset."""
+    import os
+    import tempfile
+
+    import db_utils
+
+    fd, path = tempfile.mkstemp(prefix="trades-", suffix=".db")
+    os.close(fd)
+    main.DB_FILE = path
+    main.init_db()
+    monkeypatch.setitem(main._scanner_config, "learning_epoch", "")
+
+    ts = "2099-01-02T15:00:00+00:00"   # safely after any training floor
+    conn = db_utils.connect(path)
+    for mode, outcome in (("paper", "WIN"), ("paper_t2", "EOD"),
+                          ("auto", "LOSS"), (None, "WIN")):
+        conn.execute(
+            "INSERT INTO trades (ts,symbol,direction,outcome,r_mult,grade,mode) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (ts, "SPY", "CALL", outcome, 1.0, "B", mode))
+    conn.commit()
+    conn.close()
+
+    rows = main.db_get_all_closed_trades()
+    assert len(rows) == 3
+    assert all(r["outcome"] != "EOD" for r in rows)

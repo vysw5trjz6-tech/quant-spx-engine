@@ -3,9 +3,12 @@
 #
 # Replaces the manual-logging requirement for the AI improvement loop:
 # every signal the scanner emits gets walked forward through the day's bars,
-# stamped with WIN/LOSS/EOD, and inserted into the trades table with
-# mode='paper'. The existing run_ai_improvement reads from trades, so paper
-# rows feed it automatically.
+# stamped with WIN/LOSS/EOD, and inserted into the trades table. The T1 walk
+# is the trade (mode='paper' -- T1-before-stop is the same win condition the
+# live monitor uses); the T2 walk is stored as calibration telemetry only
+# (mode='paper_t2') and is excluded from AI tuning and win-rate stats. The
+# existing run_ai_improvement reads from trades, so paper rows feed it
+# automatically.
 #
 # Conventions:
 #   - Entry bar is excluded; we walk bars STRICTLY AFTER the signal timestamp
@@ -39,6 +42,7 @@ def init_paper_columns(db_file):
         "ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'real'",
         "ALTER TABLE trades ADD COLUMN horizon TEXT",
         "ALTER TABLE trades ADD COLUMN entry_hour REAL",
+        "ALTER TABLE trades ADD COLUMN paper_key TEXT",
     ):
         try:
             conn.execute(stmt)
@@ -156,12 +160,17 @@ def _todays_signals(conn):
 
 
 def _already_paper_traded(conn, signal_id, target_kind):
+    key = "paper:{}:{}".format(signal_id, target_kind)
     c = conn.cursor()
+    # paper_key is the dedupe key on new rows; older rows stored the same
+    # value in signal_type (which clobbered the real signal type and made
+    # the AI's by_signal groups useless), so keep matching them too.
     c.execute("""
         SELECT id FROM trades
-        WHERE mode = 'paper' AND signal_type = ?
+        WHERE paper_key = ?
+           OR (mode = 'paper' AND signal_type = ?)
         LIMIT 1
-    """, ("paper:{}:{}".format(signal_id, target_kind),))
+    """, (key, key))
     return c.fetchone() is not None
 
 
@@ -172,19 +181,27 @@ def _insert_paper_trade(conn, sig, target_kind, target_under,
      entry_under, und_stop, und_t1, und_t2,
      signal_type, grade, grade_pts, horizon) = sig
 
+    # T1 is the system's actual win condition (the live monitor closes an
+    # auto position as WIN on a T1 touch), so only the T1 replay counts as a
+    # paper trade. The T2 walk is kept as telemetry (mode='paper_t2') for
+    # target calibration, but stays out of AI tuning and win-rate stats --
+    # otherwise every signal ships a second, much-harder row that deflates
+    # the measured win rate by construction.
+    mode = "paper" if target_kind == "T1" else "paper_t2"
+
     c = conn.cursor()
     c.execute("""
         INSERT INTO trades
         (ts, symbol, direction, premium, contracts, stop, target, outcome,
          exit_price, pnl, r_mult, grade, grade_pts, entry_under, signal_type,
-         mode, horizon, entry_hour)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         mode, horizon, entry_hour, paper_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         ts, symbol, direction, premium, contracts, und_stop, target_under,
         outcome, round(exit_under, 4), None, r_mult,
-        grade, grade_pts, entry_under,
+        grade, grade_pts, entry_under, signal_type,
+        mode, horizon, _entry_hour_et(ts),
         "paper:{}:{}".format(sig_id, target_kind),
-        "paper", horizon, _entry_hour_et(ts),
     ))
     conn.commit()
 

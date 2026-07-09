@@ -224,23 +224,55 @@ def test_paper_rows_carry_entry_hour_horizon_and_grade(tmp_path, monkeypatch):
                                       "l": 99.5, "c": 102.5}])
 
     inserted, skipped = pt.run_paper_trader(db_path)
-    assert inserted == 2   # T1 row + T2 row
+    assert inserted == 2   # T1 trade row + T2 telemetry row
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute("""
-        SELECT signal_type, outcome, grade, grade_pts, horizon, entry_hour, mode
+        SELECT signal_type, outcome, grade, grade_pts, horizon, entry_hour,
+               mode, paper_key
         FROM trades ORDER BY id
     """).fetchall()
     conn.close()
 
     assert len(rows) == 2
-    outcomes = {r[0].rsplit(":", 1)[-1]: r for r in rows}
-    assert outcomes["T1"][1] == "WIN"
-    assert outcomes["T2"][1] == "EOD"
+    by_kind = {r[7].rsplit(":", 1)[-1]: r for r in rows}
+    # T1 is the trade (same win condition as the live monitor); T2 is
+    # calibration telemetry and must not count as a second trade.
+    assert by_kind["T1"][1] == "WIN"
+    assert by_kind["T1"][6] == "paper"
+    assert by_kind["T2"][1] == "EOD"
+    assert by_kind["T2"][6] == "paper_t2"
     for r in rows:
+        assert r[0] == "WYCKOFF_SPRING"  # real signal type, not the dedupe key
         assert r[2] == "B"          # grade propagated, not NULL/'?'
         assert r[3] == 72
         assert r[4] == "WEEKLY"     # horizon propagated
         assert r[5] is not None     # entry_hour stamped from signal ts
         assert 10.0 <= r[5] <= 12.0  # 15:35 UTC is 10:35/11:35 ET (DST-dep.)
-        assert r[6] == "paper"
+
+    # Idempotent within the day: a re-run inserts nothing new.
+    inserted2, _ = pt.run_paper_trader(db_path)
+    assert inserted2 == 0
+
+
+def test_dedupe_matches_legacy_rows_with_key_in_signal_type(tmp_path):
+    """Rows written before the paper_key column stored the dedupe key in
+    signal_type -- they must still block re-insertion after the upgrade."""
+    db_path = str(tmp_path / "trades.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE signals (id INTEGER PRIMARY KEY, ts TEXT)""")
+    conn.execute("""CREATE TABLE trades (
+        id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, signal_type TEXT
+    )""")
+    conn.commit()
+    conn.close()
+    pt.init_paper_columns(db_path)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO trades (ts, symbol, signal_type, mode) "
+                 "VALUES ('2026-07-01T14:00:00+00:00', 'SPY', 'paper:7:T1', 'paper')")
+    conn.commit()
+    assert pt._already_paper_traded(conn, 7, "T1")
+    assert not pt._already_paper_traded(conn, 7, "T2")
+    assert not pt._already_paper_traded(conn, 8, "T1")
+    conn.close()
