@@ -5,6 +5,7 @@
 """
 import os
 import tempfile
+from datetime import datetime, timedelta
 
 import db_utils
 import main
@@ -16,6 +17,13 @@ def _fresh_db():
     main.DB_FILE = path
     main.init_db()
     return path
+
+
+def _floor_offset(days):
+    """ISO timestamp `days` relative to the hard AI training floor, so these
+    tests keep working whenever the floor is bumped."""
+    floor = datetime.fromisoformat(main.AI_TRAINING_FLOOR)
+    return (floor + timedelta(days=days)).isoformat()
 
 
 def _insert_closed(ts, outcome="WIN"):
@@ -32,9 +40,9 @@ def test_ai_training_floor_excludes_pre_cutoff(monkeypatch):
     _fresh_db()
     # Empty learning_epoch -> the hard floor must still apply.
     monkeypatch.setitem(main._scanner_config, "learning_epoch", "")
-    _insert_closed("2026-05-01T15:00:00+00:00")   # before floor -> excluded
-    _insert_closed("2026-05-29T15:00:00+00:00")   # on/after floor -> kept
-    _insert_closed("2026-06-02T15:00:00+00:00")   # after floor -> kept
+    _insert_closed(_floor_offset(-28))   # before floor -> excluded
+    _insert_closed(_floor_offset(0))     # on/after floor -> kept
+    _insert_closed(_floor_offset(4))     # after floor -> kept
     rows = main.db_get_all_closed_trades()
     assert len(rows) == 2
     assert all(r["ts"] >= main.AI_TRAINING_FLOOR for r in rows)
@@ -43,13 +51,14 @@ def test_ai_training_floor_excludes_pre_cutoff(monkeypatch):
 def test_learning_epoch_later_than_floor_wins(monkeypatch):
     _fresh_db()
     # A learning_epoch AFTER the floor should further restrict, not loosen.
-    monkeypatch.setitem(main._scanner_config, "learning_epoch",
-                        "2026-06-01T00:00:00+00:00")
-    _insert_closed("2026-05-29T15:00:00+00:00")   # after floor, before epoch -> excluded
-    _insert_closed("2026-06-02T15:00:00+00:00")   # after epoch -> kept
+    epoch = _floor_offset(3)
+    kept  = _floor_offset(5)
+    monkeypatch.setitem(main._scanner_config, "learning_epoch", epoch)
+    _insert_closed(_floor_offset(1))   # after floor, before epoch -> excluded
+    _insert_closed(kept)               # after epoch -> kept
     rows = main.db_get_all_closed_trades()
     assert len(rows) == 1
-    assert rows[0]["ts"] == "2026-06-02T15:00:00+00:00"
+    assert rows[0]["ts"] == kept
 
 
 def test_market_trend_up_down_flat(monkeypatch):

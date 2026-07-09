@@ -348,6 +348,13 @@ DEFAULT_CONFIG = {
     # weeklies into a falling market.
     "weekly_require_uptrend":   True,
     "weekly_min_rs":            0.0,
+    # Strong single-name relative strength overrides the broad-tape veto:
+    # a PUT on a stock lagging SPY by this many RS points (or a CALL leading
+    # by it) stays tier-1 even when the index trend disagrees. Without this
+    # the tape gate downgraded EVERY put while the tape was UP -- including
+    # deep relative-weakness shorts (e.g. RS -16) -- so tier-1 emptied out
+    # and almost nothing could alert.
+    "weekly_rs_override":       5.0,
     "weekly_max_breakout_age":  3,        # skip breakouts older than N sessions
 
     # --- Clear-air (resistance/support proximity) cap ---
@@ -384,7 +391,12 @@ DEFAULT_CONFIG = {
 # to learning_epoch (the later of the two wins), guaranteeing the loop never
 # trains on pre-redesign trades whose entry logic no longer exists. Bump this
 # when the signal logic changes materially.
-AI_TRAINING_FLOOR = "2026-05-29T00:00:00+00:00"
+# 2026-07-09: floor bumped for the stats-labeling fixes. Trades before this
+# carried fabricated AI labels -- paper rows had no entry_hour/rs/alignment
+# (defaulted to 9:30-10:00 / rs_negative / aligned) and weekly swing trades
+# had no grade at all (bucketed as "?"), which produced insights like
+# '"?" outperforms every grade' and 'zero win rate after 11 AM'.
+AI_TRAINING_FLOOR = "2026-07-09T00:00:00+00:00"
 
 # Minimum post-epoch closed trades before the AI may tune anything.
 AI_MIN_TOTAL_SAMPLES = 30
@@ -967,7 +979,7 @@ def db_get_all_closed_trades():
         c.execute("""
             SELECT symbol, direction, outcome, r_mult,
                    grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts,
-                   signal_type
+                   signal_type, horizon
             FROM trades
             WHERE outcome != 'OPEN' AND ts >= ?
             ORDER BY ts DESC
@@ -976,7 +988,7 @@ def db_get_all_closed_trades():
         conn.close()
         cols = ["symbol","direction","outcome","r_mult",
                 "grade","grade_pts","gap_pct","gap_dir","rs","entry_hour","ts",
-                "signal_type"]
+                "signal_type","horizon"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log("DB get all closed trades error: {}".format(e))
@@ -4396,10 +4408,22 @@ def _build_stats_summary(trades):
         "by_grade":      _wl_groups(trades, lambda t: str(t.get("grade") or "?")),
         "by_direction":  _wl_groups(trades, lambda t: str(t.get("direction") or "?")),
         "by_gap_dir":    _wl_groups(trades, lambda t: str(t.get("gap_dir") or "?")),
-        "by_time":       _wl_groups(trades, lambda t: _time_bucket(t.get("entry_hour") or 9.5)),
+        # Unrecorded labels go to explicit "unknown" buckets instead of being
+        # defaulted (entry_hour->9.5, rs->0, aligned->True). Paper trades had
+        # none of these fields, so the defaults silently rewrote most of the
+        # dataset: every paper row showed up as a 9:30-10:00, rs_negative,
+        # aligned trade and the AI tuned time/RS/alignment filters on fiction.
+        "by_time":       _wl_groups(trades, lambda t: _time_bucket(t["entry_hour"])
+                                    if t.get("entry_hour") is not None else "unknown"),
         "by_signal":     _wl_groups(trades, lambda t: str(t.get("signal_type") or "?")),
-        "by_rs":         _wl_groups(trades, lambda t: "rs_positive" if (t.get("rs") or 0) > 0 else "rs_negative"),
-        "by_alignment":  _wl_groups(trades, lambda t: "aligned" if t.get("aligned", True) else "counter_trend"),
+        "by_rs":         _wl_groups(trades, lambda t: "rs_unknown" if t.get("rs") is None
+                                    else ("rs_positive" if t["rs"] > 0 else "rs_negative")),
+        "by_alignment":  _wl_groups(trades, lambda t: "unknown" if t.get("aligned") is None
+                                    else ("aligned" if t["aligned"] else "counter_trend")),
+        # WEEKLY swing trades and INTRADAY 0DTE trades are different
+        # strategies with different hold times -- surface the split so
+        # cross-horizon comparisons are visible instead of implicit.
+        "by_horizon":    _wl_groups(trades, lambda t: str(t.get("horizon") or "?")),
     }
 
 
@@ -4470,6 +4494,13 @@ Consider, ONLY where the relevant group has enough trades:
 5. Whether vwap_reclaim should stay enabled (by_signal).
 
 ## Rules
+- by_horizon separates WEEKLY swing trades (multi-day holds) from INTRADAY
+  0DTE trades. These are DIFFERENT STRATEGIES: never compare grades, time
+  buckets, or win rates across horizons, and never conclude one horizon's
+  signals "outperform" another's grades.
+- Groups named "unknown", "rs_unknown", or "?" mean the label was not
+  recorded for those trades. They are missing data, not a signal category:
+  never base a change on them and never recommend targeting them.
 - A group needs >= {minsamp} trades before you may change a parameter
   driven by it. If a group is below that, leave its parameters UNCHANGED.
 - Never change a weight or rank value by more than 3 in one update.
@@ -5835,12 +5866,19 @@ def scan_swing_symbol(symbol):
 
             # 1) Trade with the broad tape: long setups need positive RS and a
             #    non-falling market; PUT (earnings) setups need the inverse.
+            #    Exception: strong single-name RS overrides the tape veto --
+            #    a deep relative-weakness PUT in an up tape (or a strong
+            #    relative-strength CALL in a down tape) is trading the stock,
+            #    not fighting the index.
             if wcfg.get("weekly_require_uptrend", True):
-                mt = market_trend()
-                if direction == "CALL" and (spy_rs < min_rs or mt == "DOWN"):
+                mt     = market_trend()
+                rs_ovr = wcfg.get("weekly_rs_override", 5.0)
+                if (direction == "CALL" and (spy_rs < min_rs or mt == "DOWN")
+                        and spy_rs < rs_ovr):
                     gate_reason = "counter-trend CALL (RS {:.1f}, tape {})".format(
                         spy_rs, mt)
-                elif direction == "PUT" and (spy_rs > -min_rs or mt == "UP"):
+                elif (direction == "PUT" and (spy_rs > -min_rs or mt == "UP")
+                        and spy_rs > -rs_ovr):
                     gate_reason = "counter-trend PUT (RS {:.1f}, tape {})".format(
                         spy_rs, mt)
 
@@ -5997,6 +6035,20 @@ def scan_swing_symbol(symbol):
         if vol_oi and vol_oi.get("points"):
             prob = min(95, prob + vol_oi["points"])
 
+        # Stamp a letter grade from the setup probability. Weekly signals
+        # historically carried no grade at all, so every weekly paper/auto
+        # trade landed in the AI's "?" grade bucket -- which then dominated
+        # by_grade and read as "ungraded signals beat graded ones".
+        wg_cfg = get_config()
+        if prob >= wg_cfg.get("grade_a_min", 75):
+            sw_grade = "A"
+        elif prob >= wg_cfg.get("grade_b_min", 55):
+            sw_grade = "B"
+        elif prob >= wg_cfg.get("grade_c_min", 35):
+            sw_grade = "C"
+        else:
+            sw_grade = "D"
+
         sig = {
             "symbol":         symbol,
             "price":          round(current, 2),
@@ -6009,6 +6061,8 @@ def scan_swing_symbol(symbol):
             "signal_label":   best["signal_label"],
             "prob":           prob,
             "base_prob":      best["prob"],
+            "grade":          sw_grade,
+            "grade_pts":      int(round(prob)),
             "vol_oi":         vol_oi,
             "spy_rs":         spy_rs,
             "rs":             spy_rs,

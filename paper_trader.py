@@ -35,7 +35,10 @@ def init_paper_columns(db_file):
         "ALTER TABLE signals ADD COLUMN signal_type TEXT",
         "ALTER TABLE signals ADD COLUMN grade TEXT",
         "ALTER TABLE signals ADD COLUMN grade_pts INTEGER",
+        "ALTER TABLE signals ADD COLUMN horizon TEXT",
         "ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'real'",
+        "ALTER TABLE trades ADD COLUMN horizon TEXT",
+        "ALTER TABLE trades ADD COLUMN entry_hour REAL",
     ):
         try:
             conn.execute(stmt)
@@ -108,6 +111,20 @@ def walk_bars(bars_after_entry, direction, entry_under, stop_under, target_under
     return ("EOD", float(close), round(signed_r, 2))
 
 
+def _entry_hour_et(ts_iso):
+    """Signal timestamp -> fractional ET hour (e.g. 10.58 for 10:35 ET).
+
+    Paper rows used to leave entry_hour NULL, and the AI stats layer
+    defaulted NULL to 9.5 -- so every paper trade landed in the
+    9:30-10:00 bucket and the by_time win rates were fiction.
+    """
+    dt = _parse_iso(ts_iso)
+    if dt is None or dt.tzinfo is None:
+        return None
+    et = dt.astimezone(pytz.timezone("America/New_York"))
+    return round(et.hour + et.minute / 60.0, 2)
+
+
 def _bars_after(symbol, signal_ts_iso):
     sig_dt = _parse_iso(signal_ts_iso)
     if sig_dt is None:
@@ -131,7 +148,7 @@ def _todays_signals(conn):
         SELECT id, ts, symbol, direction, price, score, premium, contracts,
                stop, target,
                entry_under, und_stop, und_target_t1, und_target_t2,
-               signal_type, grade, grade_pts
+               signal_type, grade, grade_pts, horizon
         FROM signals
         WHERE substr(ts, 1, 10) = ?
     """, (today,))
@@ -153,20 +170,21 @@ def _insert_paper_trade(conn, sig, target_kind, target_under,
     (sig_id, ts, symbol, direction, price, score, premium, contracts,
      stop, target,
      entry_under, und_stop, und_t1, und_t2,
-     signal_type, grade, grade_pts) = sig
+     signal_type, grade, grade_pts, horizon) = sig
 
     c = conn.cursor()
     c.execute("""
         INSERT INTO trades
         (ts, symbol, direction, premium, contracts, stop, target, outcome,
-         exit_price, pnl, r_mult, grade, grade_pts, entry_under, signal_type, mode)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         exit_price, pnl, r_mult, grade, grade_pts, entry_under, signal_type,
+         mode, horizon, entry_hour)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         ts, symbol, direction, premium, contracts, und_stop, target_under,
         outcome, round(exit_under, 4), None, r_mult,
         grade, grade_pts, entry_under,
         "paper:{}:{}".format(sig_id, target_kind),
-        "paper",
+        "paper", horizon, _entry_hour_et(ts),
     ))
     conn.commit()
 
@@ -191,7 +209,7 @@ def run_paper_trader(db_file, log_fn=None):
             (sig_id, ts, symbol, direction, price, score, premium, contracts,
              stop, target,
              entry_under, und_stop, und_t1, und_t2,
-             signal_type, grade, grade_pts) = sig
+             signal_type, grade, grade_pts, horizon) = sig
 
             if direction not in ("CALL", "PUT"):
                 skipped += 1

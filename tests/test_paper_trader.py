@@ -158,3 +158,89 @@ def test_parse_iso_returns_none_on_garbage():
     assert pt._parse_iso(None)        is None
     assert pt._parse_iso("")          is None
     assert pt._parse_iso("not-a-date") is None
+
+
+# =============================================
+# AI-label propagation: entry_hour + horizon on paper rows
+# =============================================
+
+def test_entry_hour_et_converts_utc_to_fractional_et_hour():
+    # 14:35 UTC in May (EDT, UTC-4) -> 10:35 ET -> 10.58
+    assert pt._entry_hour_et("2026-05-13T14:35:00Z") == 10.58
+    # 15:00 UTC in January (EST, UTC-5) -> 10:00 ET
+    assert pt._entry_hour_et("2026-01-13T15:00:00+00:00") == 10.0
+
+
+def test_entry_hour_et_none_on_missing_or_naive_ts():
+    assert pt._entry_hour_et(None) is None
+    assert pt._entry_hour_et("garbage") is None
+    # Naive timestamp (no tz) can't be converted safely
+    assert pt._entry_hour_et("2026-05-13T14:35:00") is None
+
+
+def test_paper_rows_carry_entry_hour_horizon_and_grade(tmp_path, monkeypatch):
+    """Paper trades must inherit the signal's grade/horizon and a real
+    entry_hour. NULLs here poisoned the AI stats: entry_hour defaulted to
+    the 9:30-10:00 bucket and ungraded weekly rows became the '?' grade."""
+    import pytz as _pytz
+    from datetime import datetime as _dt
+
+    db_path = str(tmp_path / "trades.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE signals (
+        id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, direction TEXT,
+        price REAL, score REAL, premium REAL, strike TEXT, contracts INTEGER,
+        stop REAL, target REAL
+    )""")
+    conn.execute("""CREATE TABLE trades (
+        id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, direction TEXT,
+        premium REAL, contracts INTEGER, stop REAL, target REAL,
+        outcome TEXT, exit_price REAL, pnl REAL, r_mult REAL,
+        grade TEXT, grade_pts INTEGER, gap_pct REAL, gap_dir TEXT,
+        rs REAL, entry_hour REAL, entry_under REAL, signal_type TEXT
+    )""")
+    conn.commit()
+    conn.close()
+    pt.init_paper_columns(db_path)
+
+    # Signal stamped today (ET date) so _todays_signals picks it up.
+    et_today = _dt.now(_pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    sig_ts   = "{}T15:35:00+00:00".format(et_today)
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        INSERT INTO signals (ts, symbol, direction, price, entry_under,
+                             und_stop, und_target_t1, und_target_t2,
+                             signal_type, grade, grade_pts, horizon)
+        VALUES (?, 'GOOGL', 'CALL', 100.0, 100.0, 99.0, 102.0, 104.0,
+                'WYCKOFF_SPRING', 'B', 72, 'WEEKLY')
+    """, (sig_ts,))
+    conn.commit()
+    conn.close()
+
+    # One bar after the signal: hits T1 (102) but not T2 (104) or stop.
+    bar_ts = "{}T16:00:00+00:00".format(et_today)
+    monkeypatch.setattr(pt.data_fetcher, "get_intraday",
+                        lambda sym: [{"t": bar_ts, "o": 100.5, "h": 103.0,
+                                      "l": 99.5, "c": 102.5}])
+
+    inserted, skipped = pt.run_paper_trader(db_path)
+    assert inserted == 2   # T1 row + T2 row
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT signal_type, outcome, grade, grade_pts, horizon, entry_hour, mode
+        FROM trades ORDER BY id
+    """).fetchall()
+    conn.close()
+
+    assert len(rows) == 2
+    outcomes = {r[0].rsplit(":", 1)[-1]: r for r in rows}
+    assert outcomes["T1"][1] == "WIN"
+    assert outcomes["T2"][1] == "EOD"
+    for r in rows:
+        assert r[2] == "B"          # grade propagated, not NULL/'?'
+        assert r[3] == 72
+        assert r[4] == "WEEKLY"     # horizon propagated
+        assert r[5] is not None     # entry_hour stamped from signal ts
+        assert 10.0 <= r[5] <= 12.0  # 15:35 UTC is 10:35/11:35 ET (DST-dep.)
+        assert r[6] == "paper"
