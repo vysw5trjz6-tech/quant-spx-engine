@@ -2,10 +2,16 @@
 # Synthetic backtest of today's signals against today's 5-min bars.
 #
 # Replaces the manual-logging requirement for the AI improvement loop:
-# every signal the scanner emits gets walked forward through the day's bars,
-# stamped with WIN/LOSS/EOD, and inserted into the trades table with
-# mode='paper'. The existing run_ai_improvement reads from trades, so paper
-# rows feed it automatically.
+# every INTRADAY signal the scanner emits gets walked forward through the
+# day's bars, stamped with WIN/LOSS/EOD, and inserted into the trades table.
+# WEEKLY signals are excluded: they settle on Friday and are resolved by the
+# live position monitor over the full hold, so a same-day replay would
+# double-count them with a wrong (mostly-EOD) label. The T1 walk
+# is the trade (mode='paper' -- T1-before-stop is the same win condition the
+# live monitor uses); the T2 walk is stored as calibration telemetry only
+# (mode='paper_t2') and is excluded from AI tuning and win-rate stats. The
+# existing run_ai_improvement reads from trades, so paper rows feed it
+# automatically.
 #
 # Conventions:
 #   - Entry bar is excluded; we walk bars STRICTLY AFTER the signal timestamp
@@ -35,7 +41,11 @@ def init_paper_columns(db_file):
         "ALTER TABLE signals ADD COLUMN signal_type TEXT",
         "ALTER TABLE signals ADD COLUMN grade TEXT",
         "ALTER TABLE signals ADD COLUMN grade_pts INTEGER",
+        "ALTER TABLE signals ADD COLUMN horizon TEXT",
         "ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'real'",
+        "ALTER TABLE trades ADD COLUMN horizon TEXT",
+        "ALTER TABLE trades ADD COLUMN entry_hour REAL",
+        "ALTER TABLE trades ADD COLUMN paper_key TEXT",
     ):
         try:
             conn.execute(stmt)
@@ -108,6 +118,20 @@ def walk_bars(bars_after_entry, direction, entry_under, stop_under, target_under
     return ("EOD", float(close), round(signed_r, 2))
 
 
+def _entry_hour_et(ts_iso):
+    """Signal timestamp -> fractional ET hour (e.g. 10.58 for 10:35 ET).
+
+    Paper rows used to leave entry_hour NULL, and the AI stats layer
+    defaulted NULL to 9.5 -- so every paper trade landed in the
+    9:30-10:00 bucket and the by_time win rates were fiction.
+    """
+    dt = _parse_iso(ts_iso)
+    if dt is None or dt.tzinfo is None:
+        return None
+    et = dt.astimezone(pytz.timezone("America/New_York"))
+    return round(et.hour + et.minute / 60.0, 2)
+
+
 def _bars_after(symbol, signal_ts_iso):
     sig_dt = _parse_iso(signal_ts_iso)
     if sig_dt is None:
@@ -131,7 +155,7 @@ def _todays_signals(conn):
         SELECT id, ts, symbol, direction, price, score, premium, contracts,
                stop, target,
                entry_under, und_stop, und_target_t1, und_target_t2,
-               signal_type, grade, grade_pts
+               signal_type, grade, grade_pts, horizon
         FROM signals
         WHERE substr(ts, 1, 10) = ?
     """, (today,))
@@ -139,12 +163,17 @@ def _todays_signals(conn):
 
 
 def _already_paper_traded(conn, signal_id, target_kind):
+    key = "paper:{}:{}".format(signal_id, target_kind)
     c = conn.cursor()
+    # paper_key is the dedupe key on new rows; older rows stored the same
+    # value in signal_type (which clobbered the real signal type and made
+    # the AI's by_signal groups useless), so keep matching them too.
     c.execute("""
         SELECT id FROM trades
-        WHERE mode = 'paper' AND signal_type = ?
+        WHERE paper_key = ?
+           OR (mode = 'paper' AND signal_type = ?)
         LIMIT 1
-    """, ("paper:{}:{}".format(signal_id, target_kind),))
+    """, (key, key))
     return c.fetchone() is not None
 
 
@@ -153,20 +182,29 @@ def _insert_paper_trade(conn, sig, target_kind, target_under,
     (sig_id, ts, symbol, direction, price, score, premium, contracts,
      stop, target,
      entry_under, und_stop, und_t1, und_t2,
-     signal_type, grade, grade_pts) = sig
+     signal_type, grade, grade_pts, horizon) = sig
+
+    # T1 is the system's actual win condition (the live monitor closes an
+    # auto position as WIN on a T1 touch), so only the T1 replay counts as a
+    # paper trade. The T2 walk is kept as telemetry (mode='paper_t2') for
+    # target calibration, but stays out of AI tuning and win-rate stats --
+    # otherwise every signal ships a second, much-harder row that deflates
+    # the measured win rate by construction.
+    mode = "paper" if target_kind == "T1" else "paper_t2"
 
     c = conn.cursor()
     c.execute("""
         INSERT INTO trades
         (ts, symbol, direction, premium, contracts, stop, target, outcome,
-         exit_price, pnl, r_mult, grade, grade_pts, entry_under, signal_type, mode)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         exit_price, pnl, r_mult, grade, grade_pts, entry_under, signal_type,
+         mode, horizon, entry_hour, paper_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         ts, symbol, direction, premium, contracts, und_stop, target_under,
         outcome, round(exit_under, 4), None, r_mult,
-        grade, grade_pts, entry_under,
+        grade, grade_pts, entry_under, signal_type,
+        mode, horizon, _entry_hour_et(ts),
         "paper:{}:{}".format(sig_id, target_kind),
-        "paper",
     ))
     conn.commit()
 
@@ -191,9 +229,18 @@ def run_paper_trader(db_file, log_fn=None):
             (sig_id, ts, symbol, direction, price, score, premium, contracts,
              stop, target,
              entry_under, und_stop, und_t1, und_t2,
-             signal_type, grade, grade_pts) = sig
+             signal_type, grade, grade_pts, horizon) = sig
 
             if direction not in ("CALL", "PUT"):
+                skipped += 1
+                continue
+            # WEEKLY swings settle on Friday -- a same-day 5-min replay can't
+            # resolve them and stamps most as EOD (counted as losses). Their
+            # real outcome is already recorded by the live position monitor
+            # (mode='auto') over the full hold, so replaying here would
+            # double-count every weekly alert with a systematically wrong
+            # same-day label.
+            if (horizon or "").upper() == "WEEKLY":
                 skipped += 1
                 continue
             if entry_under is None or und_stop is None:

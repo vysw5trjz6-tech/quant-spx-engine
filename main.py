@@ -348,7 +348,19 @@ DEFAULT_CONFIG = {
     # weeklies into a falling market.
     "weekly_require_uptrend":   True,
     "weekly_min_rs":            0.0,
+    # Strong single-name relative strength overrides the broad-tape veto:
+    # a PUT on a stock lagging SPY by this many RS points (or a CALL leading
+    # by it) stays tier-1 even when the index trend disagrees. Without this
+    # the tape gate downgraded EVERY put while the tape was UP -- including
+    # deep relative-weakness shorts (e.g. RS -16) -- so tier-1 emptied out
+    # and almost nothing could alert.
+    "weekly_rs_override":       5.0,
     "weekly_max_breakout_age":  3,        # skip breakouts older than N sessions
+    # Concurrent WEEKLY auto positions. The old hard lock of 1 meant a single
+    # open swing muted every other qualified tier-1 setup for up to a week --
+    # the main reason scans full of setups produced no alerts. One position
+    # per symbol still applies within the cap.
+    "weekly_max_positions":     3,
 
     # --- Clear-air (resistance/support proximity) cap ---
     # Levels within this % of current price are treated as already tested /
@@ -384,7 +396,12 @@ DEFAULT_CONFIG = {
 # to learning_epoch (the later of the two wins), guaranteeing the loop never
 # trains on pre-redesign trades whose entry logic no longer exists. Bump this
 # when the signal logic changes materially.
-AI_TRAINING_FLOOR = "2026-05-29T00:00:00+00:00"
+# 2026-07-09: floor bumped for the stats-labeling fixes. Trades before this
+# carried fabricated AI labels -- paper rows had no entry_hour/rs/alignment
+# (defaulted to 9:30-10:00 / rs_negative / aligned) and weekly swing trades
+# had no grade at all (bucketed as "?"), which produced insights like
+# '"?" outperforms every grade' and 'zero win rate after 11 AM'.
+AI_TRAINING_FLOOR = "2026-07-09T00:00:00+00:00"
 
 # Minimum post-epoch closed trades before the AI may tune anything.
 AI_MIN_TOTAL_SAMPLES = 30
@@ -677,7 +694,7 @@ def init_db():
                           # position occupies, and how it was opened.
                           ("und_stop","REAL"), ("und_target_t1","REAL"),
                           ("und_target_t2","REAL"), ("horizon","TEXT"),
-                          ("mode","TEXT")]:
+                          ("mode","TEXT"), ("paper_key","TEXT")]:
         try:
             conn.execute("ALTER TABLE trades ADD COLUMN {} {}".format(col, coltype))
         except:
@@ -951,7 +968,11 @@ def db_dismiss_proposal(proposal_id):
 def db_get_all_closed_trades():
     """
     Closed trades for AI analysis -- ALL modes (paper + real), since the
-    AI must learn from every signal it suggested. P&L is intentionally
+    AI must learn from every signal it suggested. The one exclusion is
+    mode='paper_t2': the paper trader's T2 walk is target-calibration
+    telemetry, not a second trade -- counting it would hand every signal
+    an extra, much-harder row and deflate every win-rate the AI sees.
+    P&L is intentionally
     NOT selected: tuning is on pure win/loss + R-multiple (were the price
     targets hit before the stop), never on dollars. Trades logged before
     the active learning_epoch are excluded -- pre-reset data lacks
@@ -967,16 +988,17 @@ def db_get_all_closed_trades():
         c.execute("""
             SELECT symbol, direction, outcome, r_mult,
                    grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts,
-                   signal_type
+                   signal_type, horizon
             FROM trades
             WHERE outcome != 'OPEN' AND ts >= ?
+              AND COALESCE(mode, '') != 'paper_t2'
             ORDER BY ts DESC
         """, (epoch,))
         rows = c.fetchall()
         conn.close()
         cols = ["symbol","direction","outcome","r_mult",
                 "grade","grade_pts","gap_pct","gap_dir","rs","entry_hour","ts",
-                "signal_type"]
+                "signal_type","horizon"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log("DB get all closed trades error: {}".format(e))
@@ -1159,12 +1181,13 @@ def db_get_open_trades():
 # =============================================
 #
 # When a setup is alerted it auto-opens a tracked position (mode='auto') that
-# occupies its tier (WEEKLY or INTRADAY). While a tier holds a live position
-# the scanner emits no new alerts in that tier -- the two tiers are independent,
-# so one weekly and one intraday position can be live at once. The live monitor
-# resolves auto positions against the UNDERLYING targets (T1 = win, stop = loss)
-# each scan, then frees the tier. Manually-taken trades (mode != 'auto') also
-# occupy a tier so they mute alerts, but are only closed by the user.
+# occupies a slot in its tier. INTRADAY holds ONE live position at a time;
+# WEEKLY holds up to weekly_max_positions concurrently (one per symbol) --
+# the tiers are independent of each other. While a tier is full the scanner
+# emits no new alerts in it. The live monitor resolves auto positions against
+# the UNDERLYING targets (T1 = win, stop = loss) each scan, then frees the
+# slot. Manually-taken trades (mode != 'auto') also occupy a slot so they
+# mute alerts, but are only closed by the user.
 
 _OPEN_POS_COLS = ["id", "symbol", "direction", "premium", "stop", "target",
                   "ts", "entry_under", "signal_type", "und_stop",
@@ -1196,6 +1219,19 @@ def db_get_open_positions(horizon=None):
 def tier_has_open_position(horizon):
     """True if the given tier (WEEKLY/INTRADAY) already holds a live position."""
     return bool(db_get_open_positions(horizon))
+
+
+def weekly_alert_capacity():
+    """(free_slots, symbols_holding) for the WEEKLY tier.
+
+    The weekly tier allows up to weekly_max_positions concurrent auto
+    positions (INTRADAY stays single-slot). Symbols already holding an open
+    weekly position are excluded from new alerts regardless of free slots.
+    """
+    open_weekly = db_get_open_positions("WEEKLY")
+    max_pos     = get_config().get("weekly_max_positions", 3)
+    slots       = max(0, max_pos - len(open_weekly))
+    return slots, {p.get("symbol") for p in open_weekly}
 
 
 def open_auto_position(sig):
@@ -4396,10 +4432,22 @@ def _build_stats_summary(trades):
         "by_grade":      _wl_groups(trades, lambda t: str(t.get("grade") or "?")),
         "by_direction":  _wl_groups(trades, lambda t: str(t.get("direction") or "?")),
         "by_gap_dir":    _wl_groups(trades, lambda t: str(t.get("gap_dir") or "?")),
-        "by_time":       _wl_groups(trades, lambda t: _time_bucket(t.get("entry_hour") or 9.5)),
+        # Unrecorded labels go to explicit "unknown" buckets instead of being
+        # defaulted (entry_hour->9.5, rs->0, aligned->True). Paper trades had
+        # none of these fields, so the defaults silently rewrote most of the
+        # dataset: every paper row showed up as a 9:30-10:00, rs_negative,
+        # aligned trade and the AI tuned time/RS/alignment filters on fiction.
+        "by_time":       _wl_groups(trades, lambda t: _time_bucket(t["entry_hour"])
+                                    if t.get("entry_hour") is not None else "unknown"),
         "by_signal":     _wl_groups(trades, lambda t: str(t.get("signal_type") or "?")),
-        "by_rs":         _wl_groups(trades, lambda t: "rs_positive" if (t.get("rs") or 0) > 0 else "rs_negative"),
-        "by_alignment":  _wl_groups(trades, lambda t: "aligned" if t.get("aligned", True) else "counter_trend"),
+        "by_rs":         _wl_groups(trades, lambda t: "rs_unknown" if t.get("rs") is None
+                                    else ("rs_positive" if t["rs"] > 0 else "rs_negative")),
+        "by_alignment":  _wl_groups(trades, lambda t: "unknown" if t.get("aligned") is None
+                                    else ("aligned" if t["aligned"] else "counter_trend")),
+        # WEEKLY swing trades and INTRADAY 0DTE trades are different
+        # strategies with different hold times -- surface the split so
+        # cross-horizon comparisons are visible instead of implicit.
+        "by_horizon":    _wl_groups(trades, lambda t: str(t.get("horizon") or "?")),
     }
 
 
@@ -4470,6 +4518,13 @@ Consider, ONLY where the relevant group has enough trades:
 5. Whether vwap_reclaim should stay enabled (by_signal).
 
 ## Rules
+- by_horizon separates WEEKLY swing trades (multi-day holds) from INTRADAY
+  0DTE trades. These are DIFFERENT STRATEGIES: never compare grades, time
+  buckets, or win rates across horizons, and never conclude one horizon's
+  signals "outperform" another's grades.
+- Groups named "unknown", "rs_unknown", or "?" mean the label was not
+  recorded for those trades. They are missing data, not a signal category:
+  never base a change on them and never recommend targeting them.
 - A group needs >= {minsamp} trades before you may change a parameter
   driven by it. If a group is below that, leave its parameters UNCHANGED.
 - Never change a weight or rank value by more than 3 in one update.
@@ -5835,12 +5890,19 @@ def scan_swing_symbol(symbol):
 
             # 1) Trade with the broad tape: long setups need positive RS and a
             #    non-falling market; PUT (earnings) setups need the inverse.
+            #    Exception: strong single-name RS overrides the tape veto --
+            #    a deep relative-weakness PUT in an up tape (or a strong
+            #    relative-strength CALL in a down tape) is trading the stock,
+            #    not fighting the index.
             if wcfg.get("weekly_require_uptrend", True):
-                mt = market_trend()
-                if direction == "CALL" and (spy_rs < min_rs or mt == "DOWN"):
+                mt     = market_trend()
+                rs_ovr = wcfg.get("weekly_rs_override", 5.0)
+                if (direction == "CALL" and (spy_rs < min_rs or mt == "DOWN")
+                        and spy_rs < rs_ovr):
                     gate_reason = "counter-trend CALL (RS {:.1f}, tape {})".format(
                         spy_rs, mt)
-                elif direction == "PUT" and (spy_rs > -min_rs or mt == "UP"):
+                elif (direction == "PUT" and (spy_rs > -min_rs or mt == "UP")
+                        and spy_rs > -rs_ovr):
                     gate_reason = "counter-trend PUT (RS {:.1f}, tape {})".format(
                         spy_rs, mt)
 
@@ -5997,6 +6059,20 @@ def scan_swing_symbol(symbol):
         if vol_oi and vol_oi.get("points"):
             prob = min(95, prob + vol_oi["points"])
 
+        # Stamp a letter grade from the setup probability. Weekly signals
+        # historically carried no grade at all, so every weekly paper/auto
+        # trade landed in the AI's "?" grade bucket -- which then dominated
+        # by_grade and read as "ungraded signals beat graded ones".
+        wg_cfg = get_config()
+        if prob >= wg_cfg.get("grade_a_min", 75):
+            sw_grade = "A"
+        elif prob >= wg_cfg.get("grade_b_min", 55):
+            sw_grade = "B"
+        elif prob >= wg_cfg.get("grade_c_min", 35):
+            sw_grade = "C"
+        else:
+            sw_grade = "D"
+
         sig = {
             "symbol":         symbol,
             "price":          round(current, 2),
@@ -6009,6 +6085,8 @@ def scan_swing_symbol(symbol):
             "signal_label":   best["signal_label"],
             "prob":           prob,
             "base_prob":      best["prob"],
+            "grade":          sw_grade,
+            "grade_pts":      int(round(prob)),
             "vol_oi":         vol_oi,
             "spy_rs":         spy_rs,
             "rs":             spy_rs,
@@ -6342,16 +6420,22 @@ def run_swing_scan():
     except Exception as e:
         log("monitor_active_positions (weekly) error: {}".format(e))
 
-    # Weekly alerts: ONE live WEEKLY position at a time (tier lock), and within
-    # that, one alert per (symbol, direction, week_expiry) so a setup never
-    # re-fires until its Friday settlement rolls. Alert only the single best
-    # not-yet-alerted tier-1 setup, then lock the tier until it closes.
-    if tier_has_open_position("WEEKLY"):
-        log("WEEKLY tier locked -- live position open, suppressing alerts")
+    # Weekly alerts: up to weekly_max_positions concurrent WEEKLY positions
+    # (one per symbol), and one alert per (symbol, direction, week_expiry) so
+    # a setup never re-fires until its Friday settlement rolls. Fill the free
+    # slots from the top of the prob-sorted list.
+    slots, held_symbols = weekly_alert_capacity()
+    if slots <= 0:
+        log("WEEKLY tier full -- {} live position(s), suppressing alerts".format(
+            len(held_symbols)))
     else:
         for sig in results:                         # results sorted by prob desc
+            if slots <= 0:
+                break
             if sig.get("tier") != 1:
                 continue
+            if sig.get("symbol") in held_symbols:
+                continue                            # one live position per symbol
             key = (sig.get("symbol"), sig.get("direction"), sig.get("week_expiry"))
             with _weekly_alert_lock:
                 if key in _weekly_alerted:
@@ -6370,7 +6454,8 @@ def run_swing_scan():
                     _send_weekly_alert(sig)
                 except Exception as e:
                     log("weekly alert error: {}".format(e))
-            break  # one weekly position at a time
+            held_symbols.add(sig.get("symbol"))
+            slots -= 1
 
     # Compact filter-stage breakdown -- tells you WHY a 0-setups scan
     # was 0 (no_data vs earnings_blocked vs no_signal) and which tier-1
@@ -7938,6 +8023,18 @@ def background_scheduler():
     # so a re-attempt after an earlier success costs one metadata call).
     if _is_session and boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
+    # Paper replay on a late boot. The done-flag below is pre-marked for
+    # post-16:05 boots, which used to mean a redeploy after the EOD replay
+    # window silently lost the whole day's synthetic outcomes (no boot-time
+    # spawn existed, unlike IV/GEX/OI). The replay dedupes on paper_key, so
+    # re-running when the pre-redeploy process already covered today is free.
+    if _is_session and HAS_PAPER_TRADER and boot_hour >= 16.05:
+        def _paper_boot_run():
+            try:
+                paper_trader.run_paper_trader(DB_FILE, log_fn=log)
+            except Exception as _e:
+                log("paper trader (boot) error: {}".format(_e))
+        threading.Thread(target=_paper_boot_run, daemon=True).start()
     # GEX/OI read OPRA's EOD statistics batch (published well after the close),
     # so they start at 5:30 PM ET. On a late boot, kick them once here too --
     # the persistent success marker and the retry throttle keep the recurring
@@ -8950,6 +9047,7 @@ def stats_page():
             SELECT symbol, direction, outcome, pnl, r_mult,
                    grade, grade_pts, gap_pct, gap_dir, rs, entry_hour, ts
             FROM trades WHERE outcome != 'OPEN'
+              AND COALESCE(mode, '') != 'paper_t2'
             ORDER BY ts DESC
         """)
         rows = c.fetchall()
