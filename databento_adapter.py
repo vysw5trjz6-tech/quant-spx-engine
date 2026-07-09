@@ -843,10 +843,17 @@ def _scale_dbn_price(raw):
 
 
 def get_options_chain_snapshot(underlying, target_date_et=None,
-                                 expiries_ahead=3, with_price=False):
+                                 expiries_ahead=3, with_price=False,
+                                 roots=None):
     """
     Returns EOD options chain with open interest (and, when with_price=True,
     a per-contract daily price used downstream to solve implied volatility).
+
+    roots: optional list of OPRA option roots to pull as parents in ONE
+    request. Cash-index options split across roots (SPX monthly AM-settled +
+    SPXW daily PM-settled; NDX + NDXP), and OPRA parent symbology groups by
+    root, so pulling just "SPX.OPT" would miss every weekday expiry. Pass
+    roots=["SPX", "SPXW"] to get the full chain. Defaults to [underlying].
 
     Cost-optimized: pulls only the `statistics` schema (1d window, with a
     4d fallback for long weekends) for the parent symbol, then resolves
@@ -873,10 +880,16 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     if target_date_et is None:
         target_date_et = datetime.now(et).date()
 
+    # Multi-root pulls (index options) get their own cache identity so they
+    # can't be satisfied by — or clobber — a single-root pull for the same
+    # underlying. Single-root keys keep the legacy format.
+    root_list = list(roots) if roots else [underlying]
+    key_sym   = "+".join(root_list) if roots else underlying
+
     # Price-enriched chains cache separately so a price-less OI-sweep result
     # can't satisfy a GEX request (which needs the price to compute IV).
     cache_key = "chain_{}{}_{}".format(
-        "px_" if with_price else "", underlying, target_date_et.isoformat())
+        "px_" if with_price else "", key_sym, target_date_et.isoformat())
     cached = _cache_get(cache_key, max_age_seconds=3600)
     if cached:
         return cached.get("chain", [])
@@ -886,7 +899,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     # identical pull under the other cache key.
     if not with_price:
         cached = _cache_get("chain_px_{}_{}".format(
-            underlying, target_date_et.isoformat()), max_age_seconds=3600)
+            key_sym, target_date_et.isoformat()), max_age_seconds=3600)
         if cached:
             return cached.get("chain", [])
     # Don't re-pay for a query that just came back empty/failed.
@@ -894,12 +907,12 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         return []
 
     end_iso = target_date_et.isoformat()
-    parent  = underlying + ".OPT"
+    parents = [r + ".OPT" for r in root_list]
 
     def _pull_stats(start):
         return client.timeseries.get_range(
             dataset  = "OPRA.PILLAR",
-            symbols  = [parent],
+            symbols  = parents,
             stype_in = "parent",
             schema   = "statistics",
             start    = start,
@@ -1020,7 +1033,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
         try:
             ohlcv_df = _pull_with_retry(lambda: client.timeseries.get_range(
                 dataset  = "OPRA.PILLAR",
-                symbols  = [parent],
+                symbols  = parents,
                 stype_in = "parent",
                 schema   = "ohlcv-1d",
                 start    = (target_date_et - timedelta(days=1)).isoformat(),

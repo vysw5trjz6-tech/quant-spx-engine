@@ -81,7 +81,10 @@ def _get_overnight_bars(target_date_et, contract="ES"):
     Get overnight bars. Provider priority:
       1. Databento (real CME futures — best)
       2. Alpaca ETF proxy (SPY/QQQ/IWM extended hours — fallback)
-    Returns list of bar dicts: {t, o, h, l, c, v}
+    Returns (bars, source) where bars is a list of {t, o, h, l, c, v} dicts
+    and source is 'futures' or 'etf_proxy'. The source matters downstream:
+    futures bars are in futures points, proxy bars in ETF dollars, and the
+    two must never be compared against each other's levels.
     """
     # --- Path 1: Databento real futures ---
     try:
@@ -89,8 +92,10 @@ def _get_overnight_bars(target_date_et, contract="ES"):
         if databento_adapter.is_available():
             bars = databento_adapter.get_overnight_bars(contract, target_date_et)
             if bars:
-                return [b for b in bars if all(b.get(k) is not None
+                bars = [b for b in bars if all(b.get(k) is not None
                                                  for k in ("o","h","l","c"))]
+                if bars:
+                    return bars, "futures"
     except ImportError:
         pass
     except Exception:
@@ -100,7 +105,7 @@ def _get_overnight_bars(target_date_et, contract="ES"):
     start_iso, end_iso = overnight_window(target_date_et)
     proxy_map = {"ES": "SPY", "NQ": "QQQ", "RTY": "IWM"}
     proxy = proxy_map.get(contract, "SPY")
-    return _fetch_alpaca_extended_hours(proxy, start_iso, end_iso)
+    return _fetch_alpaca_extended_hours(proxy, start_iso, end_iso), "etf_proxy"
 
 
 # =============================================
@@ -121,7 +126,7 @@ def overnight_range(target_date_et=None, contract="ES"):
         et = pytz.timezone("America/New_York")
         target_date_et = datetime.now(et).date()
 
-    bars = _get_overnight_bars(target_date_et, contract)
+    bars, source = _get_overnight_bars(target_date_et, contract)
     if not bars:
         return None
 
@@ -165,6 +170,7 @@ def overnight_range(target_date_et=None, contract="ES"):
         "middle_v":       middle_v,
         "lower_v":        lower_v,
         "bar_count":      len(bars),
+        "source":         source,
     }
 
 
@@ -329,16 +335,111 @@ def classify_gap(rth_open, prev_rth_close, on_data, prev_rth_high=None,
 
 
 # =============================================
+# REAL-INDEX PREMARKET CONTEXT (SPX / NDX points)
+# =============================================
+#
+# The overnight bars are futures points (or ETF dollars on the fallback
+# path); the levels a trader acts on are cash-index points. The bridge is a
+# ratio anchor: the overnight series' first print lands at ~4:00-4:15 PM ET,
+# i.e. right at the prior RTH close in the SAME instrument's units, so
+#
+#     index_level ≈ real_prev_index_close × (series_level / first_print)
+#
+# The units cancel, which makes this correct for both the ES-futures and the
+# SPY-proxy path, and it folds the futures/cash basis out automatically.
+
+def index_premarket_context(on_data, prev_bar, rth_open=None,
+                             proxy_prev_close=None):
+    """
+    Convert an overnight_range() read into real index points.
+
+    prev_bar: the index's prior completed session {date, o, h, l, c}
+              (index_data.prev_session output).
+    rth_open / proxy_prev_close: optional — today's RTH open and prior close
+              of the SAME proxy instrument (e.g. SPY). When both are given
+              (post-open refresh), a full open-vs-overnight-range gap
+              classification is included under "gap".
+
+    Returns dict in index points, or None when inputs are unusable:
+      prev_close/high/low, implied_open, gap_pct, premarket_class,
+      on_high, on_low, gap (classify_gap output, post-open only).
+    """
+    if not on_data or not prev_bar:
+        return None
+    first = on_data.get("first_print")
+    prev_close = prev_bar.get("c")
+    if not first or first <= 0 or not prev_close:
+        return None
+
+    scale        = float(prev_close) / float(first)
+    implied_open = on_data["last_print"] * scale
+    on_high      = on_data["high"] * scale
+    on_low       = on_data["low"]  * scale
+    gap_pct      = (implied_open - prev_close) / prev_close * 100.0
+
+    prev_high = prev_bar.get("h")
+    prev_low  = prev_bar.get("l")
+
+    # Premarket classification: where the implied open sits vs YESTERDAY'S
+    # range. (Classification vs the overnight range is meaningless before
+    # the bell — the implied open is by construction inside it.)
+    if prev_high and implied_open > prev_high:
+        prem_class = "ABOVE_PREV_HIGH"
+        prem_note  = "implied open above yesterday's high — continuation watch"
+    elif prev_low and implied_open < prev_low:
+        prem_class = "BELOW_PREV_LOW"
+        prem_note  = "implied open below yesterday's low — continuation watch"
+    elif abs(gap_pct) < 0.10:
+        prem_class = "FLAT"
+        prem_note  = "flat open implied — no gap edge"
+    else:
+        prem_class = "INSIDE_PREV_RANGE"
+        prem_note  = "implied open inside yesterday's range — fill/fade likely"
+
+    out = {
+        "prev_date":       prev_bar.get("date"),
+        "prev_close":      round(float(prev_close), 2),
+        "prev_high":       round(float(prev_high), 2) if prev_high else None,
+        "prev_low":        round(float(prev_low), 2) if prev_low else None,
+        "implied_open":    round(implied_open, 2),
+        "gap_pct":         round(gap_pct, 2),
+        "on_high":         round(on_high, 2),
+        "on_low":          round(on_low, 2),
+        "premarket_class": prem_class,
+        "premarket_note":  prem_note,
+        "source":          prev_bar.get("source"),
+        "gap":             None,
+    }
+
+    # Post-open: convert the actual RTH open into index points via the same
+    # proxy ratio, then run the full open-vs-overnight classification.
+    if rth_open and proxy_prev_close:
+        rth_open_idx = float(prev_close) * (float(rth_open) /
+                                             float(proxy_prev_close))
+        out["rth_open"] = round(rth_open_idx, 2)
+        out["gap"] = classify_gap(rth_open_idx, prev_close,
+                                   {"high": on_high, "low": on_low},
+                                   prev_high, prev_low)
+    return out
+
+
+# =============================================
 # UNIFIED PRE-MARKET BRIEF
 # =============================================
 #
 # Single function that wraps everything for the dashboard top bar.
 
 def get_premarket_brief(prev_rth_close, prev_rth_high=None, prev_rth_low=None,
-                          rth_open=None):
+                          rth_open=None, spx_prev=None, ndx_prev=None):
     """
-    Top-bar dashboard data: ES overnight range, inventory, gap class.
-    Call once at 9:25 AM ET (5 min before RTH open).
+    Top-bar dashboard data: ES/NQ overnight range + inventory, real-index
+    (SPX/NDX) premarket context, gap class. Call once at 9:10-9:25 AM ET.
+
+    prev_rth_close/high/low and rth_open are in the SPY proxy's units (what
+    main.py has on hand); they are only compared against overnight bars on
+    the ETF-proxy fallback path where the units actually match.
+    spx_prev / ndx_prev: real index prior-session bars from
+    index_data.prev_session(), enabling index-point context.
     """
     et   = pytz.timezone("America/New_York")
     today = datetime.now(et).date()
@@ -346,10 +447,24 @@ def get_premarket_brief(prev_rth_close, prev_rth_high=None, prev_rth_low=None,
     on_es = overnight_range(today, "ES")
     on_nq = overnight_range(today, "NQ")
 
-    inv_es = overnight_inventory(on_es, prev_rth_close) if on_es else None
+    # Inventory anchors on the series' own first print (~the prior RTH close
+    # in the same units). Anchoring on the SPY close while the bars were ES
+    # futures made explored_up/down always-true garbage.
+    inv_es = overnight_inventory(on_es, on_es["first_print"]) if on_es else None
+    inv_nq = overnight_inventory(on_nq, on_nq["first_print"]) if on_nq else None
 
+    spx_ctx = index_premarket_context(on_es, spx_prev, rth_open,
+                                       prev_rth_close) if on_es else None
+    ndx_ctx = index_premarket_context(on_nq, ndx_prev) if on_nq else None
+
+    # Legacy top-level gap (consumed by plan_summary and opening-drive):
+    # prefer the unit-safe index-point classification; fall back to the raw
+    # proxy comparison ONLY when the bars are actually the same instrument.
     gap = None
-    if rth_open is not None and on_es is not None:
+    if spx_ctx and spx_ctx.get("gap"):
+        gap = spx_ctx["gap"]
+    elif (rth_open is not None and on_es is not None
+            and on_es.get("source") == "etf_proxy"):
         gap = classify_gap(rth_open, prev_rth_close, on_es,
                             prev_rth_high, prev_rth_low)
 
@@ -357,5 +472,8 @@ def get_premarket_brief(prev_rth_close, prev_rth_high=None, prev_rth_low=None,
         "es_overnight":  on_es,
         "nq_overnight":  on_nq,
         "es_inventory":  inv_es,
+        "nq_inventory":  inv_nq,
+        "spx":           spx_ctx,
+        "ndx":           ndx_ctx,
         "gap":           gap,
     }
