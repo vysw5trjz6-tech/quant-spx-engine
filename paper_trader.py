@@ -2,8 +2,11 @@
 # Synthetic backtest of today's signals against today's 5-min bars.
 #
 # Replaces the manual-logging requirement for the AI improvement loop:
-# every signal the scanner emits gets walked forward through the day's bars,
-# stamped with WIN/LOSS/EOD, and inserted into the trades table. The T1 walk
+# every INTRADAY signal the scanner emits gets walked forward through the
+# day's bars, stamped with WIN/LOSS/EOD, and inserted into the trades table.
+# WEEKLY signals are excluded: they settle on Friday and are resolved by the
+# live position monitor over the full hold, so a same-day replay would
+# double-count them with a wrong (mostly-EOD) label. The T1 walk
 # is the trade (mode='paper' -- T1-before-stop is the same win condition the
 # live monitor uses); the T2 walk is stored as calibration telemetry only
 # (mode='paper_t2') and is excluded from AI tuning and win-rate stats. The
@@ -229,6 +232,15 @@ def run_paper_trader(db_file, log_fn=None):
              signal_type, grade, grade_pts, horizon) = sig
 
             if direction not in ("CALL", "PUT"):
+                skipped += 1
+                continue
+            # WEEKLY swings settle on Friday -- a same-day 5-min replay can't
+            # resolve them and stamps most as EOD (counted as losses). Their
+            # real outcome is already recorded by the live position monitor
+            # (mode='auto') over the full hold, so replaying here would
+            # double-count every weekly alert with a systematically wrong
+            # same-day label.
+            if (horizon or "").upper() == "WEEKLY":
                 skipped += 1
                 continue
             if entry_under is None or und_stop is None:

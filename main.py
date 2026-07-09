@@ -8023,6 +8023,18 @@ def background_scheduler():
     # so a re-attempt after an earlier success costs one metadata call).
     if _is_session and boot_hour >= 16.25:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
+    # Paper replay on a late boot. The done-flag below is pre-marked for
+    # post-16:05 boots, which used to mean a redeploy after the EOD replay
+    # window silently lost the whole day's synthetic outcomes (no boot-time
+    # spawn existed, unlike IV/GEX/OI). The replay dedupes on paper_key, so
+    # re-running when the pre-redeploy process already covered today is free.
+    if _is_session and HAS_PAPER_TRADER and boot_hour >= 16.05:
+        def _paper_boot_run():
+            try:
+                paper_trader.run_paper_trader(DB_FILE, log_fn=log)
+            except Exception as _e:
+                log("paper trader (boot) error: {}".format(_e))
+        threading.Thread(target=_paper_boot_run, daemon=True).start()
     # GEX/OI read OPRA's EOD statistics batch (published well after the close),
     # so they start at 5:30 PM ET. On a late boot, kick them once here too --
     # the persistent success marker and the retry throttle keep the recurring

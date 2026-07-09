@@ -212,7 +212,7 @@ def test_paper_rows_carry_entry_hour_horizon_and_grade(tmp_path, monkeypatch):
                              und_stop, und_target_t1, und_target_t2,
                              signal_type, grade, grade_pts, horizon)
         VALUES (?, 'GOOGL', 'CALL', 100.0, 100.0, 99.0, 102.0, 104.0,
-                'WYCKOFF_SPRING', 'B', 72, 'WEEKLY')
+                'ORB_BREAKOUT', 'B', 72, 'INTRADAY')
     """, (sig_ts,))
     conn.commit()
     conn.close()
@@ -243,16 +243,68 @@ def test_paper_rows_carry_entry_hour_horizon_and_grade(tmp_path, monkeypatch):
     assert by_kind["T2"][1] == "EOD"
     assert by_kind["T2"][6] == "paper_t2"
     for r in rows:
-        assert r[0] == "WYCKOFF_SPRING"  # real signal type, not the dedupe key
+        assert r[0] == "ORB_BREAKOUT"  # real signal type, not the dedupe key
         assert r[2] == "B"          # grade propagated, not NULL/'?'
         assert r[3] == 72
-        assert r[4] == "WEEKLY"     # horizon propagated
+        assert r[4] == "INTRADAY"   # horizon propagated
         assert r[5] is not None     # entry_hour stamped from signal ts
         assert 10.0 <= r[5] <= 12.0  # 15:35 UTC is 10:35/11:35 ET (DST-dep.)
 
     # Idempotent within the day: a re-run inserts nothing new.
     inserted2, _ = pt.run_paper_trader(db_path)
     assert inserted2 == 0
+
+
+def test_weekly_signals_are_not_replayed(tmp_path, monkeypatch):
+    """WEEKLY swings settle on Friday and are resolved by the live position
+    monitor; a same-day replay would double-count them as mostly-EOD losses."""
+    import pytz as _pytz
+    from datetime import datetime as _dt
+
+    db_path = str(tmp_path / "trades.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE signals (
+        id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, direction TEXT,
+        price REAL, score REAL, premium REAL, strike TEXT, contracts INTEGER,
+        stop REAL, target REAL
+    )""")
+    conn.execute("""CREATE TABLE trades (
+        id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, direction TEXT,
+        premium REAL, contracts INTEGER, stop REAL, target REAL,
+        outcome TEXT, exit_price REAL, pnl REAL, r_mult REAL,
+        grade TEXT, grade_pts INTEGER, gap_pct REAL, gap_dir TEXT,
+        rs REAL, entry_hour REAL, entry_under REAL, signal_type TEXT
+    )""")
+    conn.commit()
+    conn.close()
+    pt.init_paper_columns(db_path)
+
+    et_today = _dt.now(_pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    sig_ts   = "{}T15:35:00+00:00".format(et_today)
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        INSERT INTO signals (ts, symbol, direction, price, entry_under,
+                             und_stop, und_target_t1, und_target_t2,
+                             signal_type, grade, grade_pts, horizon)
+        VALUES (?, 'NVDA', 'CALL', 100.0, 100.0, 99.0, 102.0, 104.0,
+                'WYCKOFF_SPRING', 'A', 80, 'WEEKLY')
+    """, (sig_ts,))
+    conn.commit()
+    conn.close()
+
+    bar_ts = "{}T16:00:00+00:00".format(et_today)
+    monkeypatch.setattr(pt.data_fetcher, "get_intraday",
+                        lambda sym: [{"t": bar_ts, "o": 100.5, "h": 103.0,
+                                      "l": 99.5, "c": 102.5}])
+
+    inserted, skipped = pt.run_paper_trader(db_path)
+    assert inserted == 0
+    assert skipped == 1
+
+    conn = sqlite3.connect(db_path)
+    n = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+    conn.close()
+    assert n == 0
 
 
 def test_dedupe_matches_legacy_rows_with_key_in_signal_type(tmp_path):
