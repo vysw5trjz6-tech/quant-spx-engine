@@ -109,13 +109,6 @@ except ImportError as _e:
     print("[init] scanner_core unavailable: {}".format(_e))
 
 try:
-    import vol_oi as vol_oi_mod
-    HAS_VOL_OI = True
-except ImportError as _e:
-    HAS_VOL_OI = False
-    print("[init] vol_oi unavailable: {}".format(_e))
-
-try:
     import index_data
     HAS_INDEX_DATA = True
 except ImportError as _e:
@@ -128,6 +121,15 @@ try:
 except ImportError as _e:
     HAS_INDEX_OPTIONS = False
     print("[init] index_options unavailable: {}".format(_e))
+
+try:
+    from vol1d import config as vol1d_config
+    from vol1d import shadow as vol1d_shadow
+    from vol1d import state as vol1d_state
+    HAS_VOL1D = True
+except ImportError as _e:
+    HAS_VOL1D = False
+    print("[init] vol1d unavailable: {}".format(_e))
 
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
@@ -144,6 +146,9 @@ _market_state = {
     "gex_bias":         None,   # output of gamma_exposure.get_gex_bias()
     "index_insights":   None,   # {"date", "SPX": {...}, "NDX": {...}} from index_options
     "regime_ts":        0,      # epoch when regime was last refreshed
+    "vol1d":            None,   # latest vol1d.state.Vol1DState (updater thread)
+    "vol1d_ts":         0,      # epoch when vol1d last computed
+    "gex_live":         None,   # intraday index GEX (vol1d.gex_live), ~60s cadence
 }
 _market_state_lock = threading.Lock()
 
@@ -158,55 +163,20 @@ SCAN_INTERVAL = 300
 ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
 # =============================================
-# PRODUCT TIERING (see scanner redesign)
+# PRODUCT TIERING
 #   INDEX (SPX/NDX)  -> context only, no signal cards (no cash-index options)
-#   ETF   (SPY/QQQ)  -> BOTH weekly and intraday/0DTE
-#   STOCK (~70 names) -> weekly only
+#   ETF   (SPY/QQQ)  -> intraday/0DTE (the tradeable SPX/NDX proxies)
 # =============================================
-ETF_PRODUCTS   = ["SPY", "QQQ"]            # weekly + intraday/0DTE
+ETF_PRODUCTS   = ["SPY", "QQQ"]            # intraday/0DTE
 INDEX_PRODUCTS = ["SPX", "NDX"]            # context only (display level + RS)
 
-# Intraday / 0DTE tradeable universe. ETFs carry daily 0DTE options; the
-# liquid single-stock momentum names below trade the same ORB / VWAP / pullback
-# logic but resolve to the nearest weekly (Fri) contract via get_liquid_option.
-# Kept to a focused, high-liquidity set so the 5-min sweep stays cheap and the
-# IEX volume ratios stay meaningful. These are exactly the names that trend
-# cleanly intraday -- the case where the engine previously had nothing to show.
-INTRADAY_STOCKS = [
-    "NVDA", "TSLA", "AMD", "AAPL", "META", "AMZN", "MSFT", "GOOGL",
-    "NFLX", "AVGO", "MU", "PLTR", "COIN", "SMCI",
-]
-INTRADAY_SYMBOLS = ETF_PRODUCTS + INTRADAY_STOCKS
+# Intraday / 0DTE tradeable universe. The engine is focused on 0DTE SPX/NDX
+# exposure, traded through the daily-expiry ETF proxies.
+INTRADAY_SYMBOLS = list(ETF_PRODUCTS)
 
-# Back-compat alias for the several aux paths (earnings prefetch, digests) that
-# iterate SYMBOLS + SWING_SYMBOLS over the full coverage set.
+# Alias for the aux paths (IV/OI sweeps, dashboards) that iterate the full
+# coverage set.
 SYMBOLS = list(ETF_PRODUCTS)
-
-# Broader universe for the WEEKLY scanner - liquid, optionable stocks.
-# SPY/QQQ are intentionally NOT here (they are ETF_PRODUCTS); leveraged ETFs
-# (TQQQ/SOXL) are excluded from weekly due to decay.
-SWING_UNIVERSE = [
-    # Mega-cap tech
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD", "AVGO", "CRM",
-    # Semis & hardware
-    "INTC", "MU", "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "MRVL", "ON", "SMCI",
-    # AI infrastructure (datacenter compute, power, cooling, networking)
-    "CRWV", "GEV", "VRT", "ANET",
-    # Finance
-    "JPM", "GS", "MS", "BAC", "C", "V", "MA", "AXP", "BX", "KKR",
-    # Healthcare & biotech
-    "LLY", "UNH", "ABBV", "MRK", "PFE", "JNJ", "GILD", "REGN", "BIIB", "MRNA",
-    # Energy & industrials
-    "XOM", "CVX", "OXY", "SLB", "CAT", "DE", "HON", "RTX", "LMT", "GE",
-    # Consumer & retail
-    "COST", "WMT", "HD", "NKE", "SBUX", "MCD", "TGT", "LULU", "DECK", "RH",
-    # Non-index ETFs with strong options
-    "IWM", "XLK", "XLF", "GLD", "SLV", "ARKK",
-]
-
-# The weekly tier scans the ETF products PLUS the stock universe.
-# Alias used by run_swing_scan  [FIX 1: confirmed -- ensures symbol list is found]
-SWING_SYMBOLS = ETF_PRODUCTS + SWING_UNIVERSE
 
 ALPACA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
@@ -232,19 +202,6 @@ debug_log    = []
 all_signals  = []
 next_scan_at = 0
 bot_enabled  = True
-
-swing_signals    = []
-next_swing_scan  = 0
-all_swing_signals  = []
-swing_next_scan_at = 0
-swing_lock         = threading.Lock()
-SWING_SCAN_INTERVAL = 900   # 15 min between swing scans
-# Weekly alert dedup: fire one telegram alert per (symbol, direction,
-# week_expiry) so a setup alerts once for the week's settlement and re-arms
-# automatically when the expiry rolls to next Friday. In-memory is fine -- a
-# container restart simply re-alerts the still-active setups once.
-_weekly_alerted     = set()
-_weekly_alert_lock  = threading.Lock()
 
 
 # =============================================
@@ -358,24 +315,6 @@ DEFAULT_CONFIG = {
     # (a full range, ~1:1 vs the 1.0x T1) gives breakouts room to retest the
     # trigger without stopping out on noise; raised from the old 0.5x.
     "orb_stop_mult":            1.0,
-    # Weekly long setups require the broad tape to agree: positive RS vs SPY
-    # and SPY itself in an uptrend (above its 50DMA). Avoids firing CALL-only
-    # weeklies into a falling market.
-    "weekly_require_uptrend":   True,
-    "weekly_min_rs":            0.0,
-    # Strong single-name relative strength overrides the broad-tape veto:
-    # a PUT on a stock lagging SPY by this many RS points (or a CALL leading
-    # by it) stays tier-1 even when the index trend disagrees. Without this
-    # the tape gate downgraded EVERY put while the tape was UP -- including
-    # deep relative-weakness shorts (e.g. RS -16) -- so tier-1 emptied out
-    # and almost nothing could alert.
-    "weekly_rs_override":       5.0,
-    "weekly_max_breakout_age":  3,        # skip breakouts older than N sessions
-    # Concurrent WEEKLY auto positions. The old hard lock of 1 meant a single
-    # open swing muted every other qualified tier-1 setup for up to a week --
-    # the main reason scans full of setups produced no alerts. One position
-    # per symbol still applies within the cap.
-    "weekly_max_positions":     3,
 
     # --- Clear-air (resistance/support proximity) cap ---
     # Levels within this % of current price are treated as already tested /
@@ -392,8 +331,7 @@ DEFAULT_CONFIG = {
     "chase_resist_frac":        0.34,
     # Overpriced-option guardrail: skip a setup when the selected (~0.40 delta)
     # contract's implied vol exceeds this. Rich IV means paying up for a move
-    # the market has already priced in. Earnings/IV-crush swings are exempt
-    # (they intentionally want high IV and don't pass this cap).
+    # the market has already priced in.
     "max_option_iv":            0.70,
 
     # --- AI state ---
@@ -772,30 +710,6 @@ def init_db():
         )
     """)
 
-    # Swing trade signal cache (for history across scans)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS swing_signals (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts            TEXT,
-            symbol        TEXT,
-            signal_type   TEXT,
-            direction     TEXT,
-            price         REAL,
-            score         REAL,
-            prob_pct      INTEGER,
-            fib_support   TEXT,
-            t1            REAL,
-            t2            REAL,
-            t3            REAL,
-            stop          REAL,
-            option_expiry TEXT,
-            option_strike REAL,
-            option_prem   REAL,
-            dte           INTEGER,
-            notes         TEXT
-        )
-    """)
-
     conn.commit()
     conn.close()
 
@@ -1020,6 +934,67 @@ def db_get_all_closed_trades():
         return []
 
 
+# --- vol1d journaling (spec §6) ---------------------------------------------
+# Entry/exit rows carry the vol regime they fired into so P&L can later be
+# bucketed by combined_regime and the fade/trend routing checked. Columns
+# are added via the same idempotent ALTER TABLE migration pattern
+# paper_trader uses.
+
+_VOL1D_ENTRY_COLS = ("vix1d", "vix1d_tod_z", "exp_move_adj", "iv_rv_spread",
+                     "vol_state", "combined_regime", "vol1d_spiking",
+                     "vol1d_residual", "vol1d_confidence")
+_VOL1D_EXIT_COLS  = ("exit_vix1d", "exit_vix1d_tod_z", "exit_vol_state",
+                     "exit_combined_regime", "exit_vol1d_spiking")
+
+
+def init_vol1d_journal_columns():
+    """Idempotent migration: vol1d entry fields on signals + trades, exit
+    fields on trades."""
+    conn = db_utils.connect(DB_FILE)
+    types = {"vol_state": "TEXT", "combined_regime": "TEXT",
+             "exit_vol_state": "TEXT", "exit_combined_regime": "TEXT",
+             "vol1d_spiking": "INTEGER", "exit_vol1d_spiking": "INTEGER"}
+    for table, cols in (("signals", _VOL1D_ENTRY_COLS),
+                        ("trades",  _VOL1D_ENTRY_COLS + _VOL1D_EXIT_COLS)):
+        for col in cols:
+            try:
+                conn.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
+                    table, col, types.get(col, "REAL")))
+            except Exception:
+                pass   # column already exists
+    conn.commit()
+    conn.close()
+
+
+def _vol1d_entry_fields():
+    """Current Vol1DState flattened onto the entry journal columns, or {}
+    when the module is off/warming — journaling must never block a trade."""
+    if not HAS_VOL1D:
+        return {}
+    st = get_vol1d_state()
+    if st is None:
+        return {}
+    return {
+        "vix1d":            st.vix1d,
+        "vix1d_tod_z":      st.vix1d_tod_z,
+        "exp_move_adj":     st.exp_move_adj,
+        "iv_rv_spread":     st.iv_rv_spread,
+        "vol_state":        st.vol_state,
+        "combined_regime":  st.combined_regime,
+        "vol1d_spiking":    1 if st.spiking else 0,
+        "vol1d_residual":   st.qa_residual,
+        "vol1d_confidence": st.confidence,
+    }
+
+
+def _vol1d_stamp_row(conn, table, row_id, fields):
+    if not fields or row_id is None:
+        return
+    sets = ", ".join("{}=?".format(k) for k in fields)
+    conn.execute("UPDATE {} SET {} WHERE id=?".format(table, sets),
+                 list(fields.values()) + [row_id])
+
+
 def db_log_signal(sig):
     try:
         # Pick the underlying stop / targets the scanner already computed
@@ -1068,6 +1043,7 @@ def db_log_signal(sig):
             sig.get("horizon"), sig.get("tier"), sig.get("product_class"),
             sig.get("conviction"), rationale_json,
         ))
+        _vol1d_stamp_row(conn, "signals", c.lastrowid, _vol1d_entry_fields())
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1102,6 +1078,11 @@ def db_log_trade(symbol, direction, premium, contracts=None, stop=None, target=N
             und_stop, und_target_t1, und_target_t2, horizon, mode
         ))
         trade_id = c.lastrowid
+        # Live entries carry the vol regime they fired into. Paper-replay
+        # rows are inserted at EOD when the state no longer reflects entry
+        # time — they inherit entry-time fields from their signal row.
+        if mode != "paper" and mode != "paper_t2":
+            _vol1d_stamp_row(conn, "trades", trade_id, _vol1d_entry_fields())
         conn.commit()
         conn.close()
         return trade_id
@@ -1134,6 +1115,16 @@ def db_close_trade(trade_id, exit_price, outcome):
             UPDATE trades SET outcome=?, exit_price=?, pnl=?, r_mult=?
             WHERE id=?
         """, (outcome, exit_price, pnl, r_mult, trade_id))
+        # Exit-time vol regime (spec §6: log at entry AND exit).
+        entry = _vol1d_entry_fields()
+        if entry:
+            _vol1d_stamp_row(conn, "trades", trade_id, {
+                "exit_vix1d":            entry["vix1d"],
+                "exit_vix1d_tod_z":      entry["vix1d_tod_z"],
+                "exit_vol_state":        entry["vol_state"],
+                "exit_combined_regime":  entry["combined_regime"],
+                "exit_vol1d_spiking":    entry["vol1d_spiking"],
+            })
         conn.commit()
         conn.close()
         log("Trade {} closed: {} pnl={}".format(trade_id, outcome, pnl))
@@ -1196,9 +1187,9 @@ def db_get_open_trades():
 # =============================================
 #
 # When a setup is alerted it auto-opens a tracked position (mode='auto') that
-# occupies a slot in its tier. INTRADAY holds ONE live position at a time;
-# WEEKLY holds up to weekly_max_positions concurrently (one per symbol) --
-# the tiers are independent of each other. While a tier is full the scanner
+# occupies a slot in its tier. INTRADAY holds ONE live position at a time.
+# (WEEKLY is a legacy tier: the swing engine is gone, but the monitor still
+# resolves any WEEKLY rows left open in the trades DB.) While a tier is full the scanner
 # emits no new alerts in it. The live monitor resolves auto positions against
 # the UNDERLYING targets (T1 = win, stop = loss) each scan, then frees the
 # slot. Manually-taken trades (mode != 'auto') also occupy a slot so they
@@ -1232,21 +1223,12 @@ def db_get_open_positions(horizon=None):
 
 
 def tier_has_open_position(horizon):
-    """True if the given tier (WEEKLY/INTRADAY) already holds a live position."""
-    return bool(db_get_open_positions(horizon))
+    """True if the given tier (e.g. INTRADAY) already holds a live position.
 
-
-def weekly_alert_capacity():
-    """(free_slots, symbols_holding) for the WEEKLY tier.
-
-    The weekly tier allows up to weekly_max_positions concurrent auto
-    positions (INTRADAY stays single-slot). Symbols already holding an open
-    weekly position are excluded from new alerts regardless of free slots.
+    WEEKLY is a legacy horizon: the swing/weekly engine was removed, but the
+    monitor still resolves any WEEKLY rows left open in the trades DB.
     """
-    open_weekly = db_get_open_positions("WEEKLY")
-    max_pos     = get_config().get("weekly_max_positions", 3)
-    slots       = max(0, max_pos - len(open_weekly))
-    return slots, {p.get("symbol") for p in open_weekly}
+    return bool(db_get_open_positions(horizon))
 
 
 def open_auto_position(sig):
@@ -2733,7 +2715,7 @@ def _force_rebuild_volume_profiles():
     if not HAS_VOLUME_TRUTH:
         return
     try:
-        all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
+        all_syms = list(SYMBOLS)
         built = sum(1 for s in all_syms if volume_truth.build_profile(s))
         log("Forced volume-profile rebuild: {}/{} symbols".format(
             built, len(all_syms)))
@@ -2904,8 +2886,7 @@ def compute_rank_score(result):
 def _next_expiry_dates(n=4):
     """
     Returns today + next N expiry dates (skipping weekends).
-    Individual stocks only have weekly (Fri) options.
-    ETFs like SPY/QQQ have daily options.
+    SPY/QQQ have daily options.
     """
     import datetime as _dt
     et   = pytz.timezone("America/New_York")
@@ -2926,7 +2907,6 @@ def get_liquid_option(symbol, direction, underlying_price=None,
     Fetch the nearest available ATM option via Alpaca options snapshot API.
 
     SPY/QQQ have daily 0DTE options.
-    Individual stocks (TSLA, AMD, etc.) only have weekly options (Fri expiry).
     We try today first, then fall back up to 5 trading days out.
 
     Past the 0DTE cutoff (et_hour >= zero_dte_cutoff) we do NOT select a 0DTE
@@ -3135,339 +3115,6 @@ def current_week_expiry(now_et=None, zero_dte_cutoff=None):
 
     dte = (friday - today).days
     return friday.strftime("%Y-%m-%d"), dte
-
-
-def get_swing_option(symbol, direction, underlying_price=None):
-    """ATM-ish (~0.40 delta) option on the current-week Friday settlement.
-
-    The weekly tier's option picker. Mirrors get_liquid_option's Alpaca
-    snapshot machinery but targets a single fixed expiry (current_week_expiry)
-    so a weekly signal rides one contract through the week.
-
-    Returns (premium, strike, is_live, dte_label, volume) where volume is the
-    contract's Alpaca daily option volume (None if unavailable).
-    """
-    import datetime as _dt
-
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        return None, None, False, None, None
-
-    cfg = get_config()
-    expiry_str, dte = current_week_expiry(
-        zero_dte_cutoff=cfg.get("zero_dte_cutoff_hour", 14.5))
-    dte_label = "{}DTE".format(dte) if dte > 0 else "0DTE"
-
-    option_type = "call" if direction == "CALL" else "put"
-    headers = {
-        "APCA-API-KEY-ID":     ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    }
-    url = "https://data.alpaca.markets/v1beta1/options/snapshots/{}".format(symbol)
-
-    params = {
-        "feed":            "indicative",
-        "expiration_date": expiry_str,
-        "type":            option_type,
-        "limit":           50,
-    }
-    if underlying_price:
-        params["strike_price_gte"] = round(underlying_price * 0.94, 2)
-        params["strike_price_lte"] = round(underlying_price * 1.06, 2)
-
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        if r.status_code != 200:
-            return None, None, False, None, None
-        snapshots = r.json().get("snapshots", {}) or {}
-
-        candidates = []
-        for contract_sym, snap in snapshots.items():
-            try:
-                strike = int(contract_sym[-8:]) / 1000.0
-            except Exception:
-                continue
-            quote = snap.get("latestQuote") or {}
-            bid   = float(quote.get("bp") or 0)
-            ask   = float(quote.get("ap") or 0)
-            if bid > 0 and ask > 0:
-                mid = round((bid + ask) / 2, 2)
-            elif ask > 0:
-                mid = round(ask, 2)
-            else:
-                continue
-            if not (0.05 <= mid <= 50.00):
-                continue
-            greeks = snap.get("greeks") or {}
-            delta  = abs(float(greeks.get("delta") or 0))
-            # Alpaca daily option volume (the field the quote-only picker used
-            # to ignore) -- the volume side of the vol/OI confluence check.
-            day    = snap.get("dailyBar") or {}
-            vol    = day.get("v")
-            candidates.append({"strike": strike, "price": mid, "delta": delta,
-                               "volume": int(vol) if vol is not None else None})
-
-        if not candidates:
-            return None, None, False, dte_label, None
-
-        if any(c["delta"] > 0 for c in candidates):
-            candidates.sort(key=lambda x: abs(x["delta"] - 0.40))
-        elif underlying_price:
-            candidates.sort(key=lambda x: abs(x["strike"] - underlying_price))
-        best = candidates[0]
-        return best["price"], best["strike"], True, dte_label, best.get("volume")
-    except Exception as e:
-        log("Swing option exception {} {}: {}".format(symbol, expiry_str, e))
-        return None, None, False, None, None
-
-
-# =============================================
-# SWING ENGINE -- DATA FETCHERS
-# =============================================
-
-# Daily/weekly bars barely change intraday, yet the swing scan re-pulls the
-# full 72-symbol universe (x2 timeframes) every few minutes in bursts of 8
-# threads. That hammers Alpaca's rate limiter -- a single 429 on the first
-# symbols cascades into a whole-universe "data:0/72" outage. A short-TTL cache
-# means the burst only happens once; a much longer stale window lets a
-# transient outage reuse the last good bars instead of zeroing the scan.
-_BARS_CACHE      = {}
-_BARS_CACHE_LOCK = threading.Lock()
-_BARS_FRESH_TTL  = 30 * 60       # serve from cache without re-fetching
-_BARS_STALE_TTL  = 6 * 3600      # last-resort reuse when a fetch fails
-
-
-def _bars_cache_get(key, max_age):
-    with _BARS_CACHE_LOCK:
-        entry = _BARS_CACHE.get(key)
-        if entry and (time.time() - entry[0]) <= max_age:
-            return entry[1]
-    return None
-
-
-def _bars_cache_set(key, bars):
-    with _BARS_CACHE_LOCK:
-        _BARS_CACHE[key] = (time.time(), bars)
-
-
-def _sanitize_bars(symbol, bars, kind):
-    """Thin wrapper around bar_utils.sanitize_bars that routes drop notices
-    through this module's logger."""
-    return bar_utils.sanitize_bars(symbol, bars, kind, log=log)
-
-
-def _append_live_today_bar(symbol, bars):
-    """Graft a current-session bar onto a Databento daily history.
-
-    Databento's Historical daily feed lacks today's still-forming bar during
-    RTH, but the swing engine treats bars[-1] as the live price (current,
-    adverse-day gate, R:R, targets). So we keep Databento's clean completed
-    history and synthesize today's bar from the real-time snapshot -- which is
-    Alpaca's one genuine strength. If Databento already carries today's bar
-    (after the close) or no live price is available, leave the series as-is.
-    """
-    if not bars:
-        return bars
-    et = pytz.timezone("America/New_York")
-    today = datetime.now(et).date().isoformat()
-    if str(bars[-1].get("t", ""))[:10] >= today:
-        return bars
-    try:
-        price, _age, _src = data_fetcher.get_price_with_freshness(symbol)
-    except Exception:
-        price = None
-    if not price or price <= 0:
-        return bars
-    prev_c = bars[-1]["c"]
-    return bars + [{
-        "t": today + "T00:00:00+00:00",
-        "o": prev_c,
-        "h": max(prev_c, price),
-        "l": min(prev_c, price),
-        "c": round(float(price), 4),
-        "v": 0,
-    }]
-
-
-def _databento_equity_bars(symbol, timeframe, limit):
-    """Daily/weekly equity bars from Databento (primary source). Returns an
-    ascending list of {o,h,l,c,v,t}, or None if Databento can't serve them so
-    the caller falls back to Alpaca. Weekly is aggregated from clean daily
-    bars since Databento has no native weekly schema."""
-    if timeframe not in ("1Day", "1Week"):
-        return None
-    try:
-        import databento_adapter
-    except ImportError:
-        return None
-    if not databento_adapter.is_available():
-        return None
-
-    now = datetime.now(pytz.utc)
-    if timeframe == "1Week":
-        lookback_days = int(limit * 7 * 1.4) + 14
-    else:
-        lookback_days = int(limit * 1.6) + 10
-    start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end   = (now + timedelta(days=1)).strftime("%Y-%m-%d")   # end is exclusive
-
-    daily = databento_adapter.get_equity_bars(symbol, start, end, schema="ohlcv-1d")
-    if not daily:
-        return None
-
-    daily = _append_live_today_bar(symbol, daily)
-    bars  = bar_utils.aggregate_weekly(daily) if timeframe == "1Week" else daily
-    return bars[-limit:] if (limit and len(bars) > limit) else bars
-
-
-def _fetch_bars(symbol, timeframe, limit, kind):
-    """
-    Cached, rate-limit-aware bar fetch shared by the daily/weekly getters.
-
-    Source order: fresh cache -> Databento (clean consolidated equities) ->
-    Alpaca (with 429 backoff) -> stale cache. Records each non-200 Alpaca
-    status into the swing stats so a 0-setup scan can report the dominant
-    cause instead of swallowing it.
-    """
-    cache_key = "{}|{}|{}".format(symbol, timeframe, limit)
-
-    fresh = _bars_cache_get(cache_key, _BARS_FRESH_TTL)
-    if fresh is not None:
-        return fresh
-
-    # Primary: Databento US-equities daily/weekly. Far cleaner than free IEX
-    # daily bars; falls through to Alpaca when unavailable or breaker-tripped.
-    db_bars = _databento_equity_bars(symbol, timeframe, limit)
-    if db_bars:
-        db_bars = _sanitize_bars(symbol, db_bars, kind)
-        _bars_cache_set(cache_key, db_bars)
-        return db_bars
-
-    # Fallback: Alpaca.
-    # Be explicit about feed + window. On the free Alpaca plan the bars
-    # endpoint defaults to the SIP feed, which a free key isn't entitled to --
-    # the request still returns HTTP 200 but with an empty `bars` array, so a
-    # whole-universe sweep silently reports data:0/N with no error status. Pin
-    # feed=iex (the free entitlement) and pass an explicit start date wide
-    # enough to cover `limit` bars so Alpaca never short-changes the window.
-    if timeframe == "1Week":
-        _lookback_days = int(limit * 7 * 1.4) + 14
-    elif timeframe == "1Day":
-        _lookback_days = int(limit * 1.6) + 10      # trading->calendar slack
-    else:
-        _lookback_days = 7
-    _start_iso = (datetime.now(pytz.utc)
-                  - timedelta(days=_lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # sort=desc is critical: Alpaca defaults to ascending and, when the
-    # [start, now] window holds MORE than `limit` bars, returns the OLDEST
-    # `limit` bars plus a next_page_token. We don't paginate, so an ascending
-    # fetch silently drops the most recent bars -- for limit=90 over a ~154d
-    # window that's the latest ~3-4 weeks, leaving daily[-1] (the "current
-    # price") a month stale across the whole universe. Fetching newest-first
-    # and reversing back to ascending guarantees we keep the freshest `limit`.
-    params = {"timeframe": timeframe, "limit": limit,
-              "feed": "iex", "start": _start_iso, "sort": "desc"}
-
-    attempts = 3
-    backoff  = 0.5
-    for attempt in range(attempts):
-        try:
-            r = requests.get(DATA_URL.format(symbol), headers=HEADERS,
-                             params=params,
-                             timeout=10)
-            if r.status_code == 200:
-                bars = r.json().get("bars", []) or []
-                if bars:
-                    # We fetched newest-first (sort=desc); flip back to
-                    # ascending so every downstream detector's daily[-1] /
-                    # weekly[-1] is the most recent bar, as they all assume.
-                    bars.reverse()
-                    bars = _sanitize_bars(symbol, bars, kind)
-                    _bars_cache_set(cache_key, bars)
-                    return bars
-                # 200 OK but no bars. This is the silent-outage signature
-                # (feed/entitlement or a too-narrow window). Record it
-                # distinctly so the universe-OUTAGE line names the real cause
-                # instead of "no HTTP status captured", then drop to the
-                # stale-cache fallback below (retrying an empty 200 is futile).
-                _swing_stats_bump("http_200_empty")
-                _log_swing_fetch_err(symbol, kind + "/empty",
-                                     "200 OK but bars=[] (feed=iex/subscription/window?)")
-                break
-            _swing_stats_bump("http_{}".format(r.status_code))
-            # 429 = rate limited: back off and retry before giving up.
-            # Add full jitter so the 8 concurrent batch threads that all got
-            # 429'd don't wake and retry in lockstep (which just re-triggers
-            # the limit). sleep ~ [backoff, 2*backoff).
-            if r.status_code == 429 and attempt < attempts - 1:
-                time.sleep(backoff + random.uniform(0, backoff))
-                backoff *= 2
-                continue
-            _log_swing_fetch_err(symbol, kind + "/http",
-                                 "{} {}".format(r.status_code, r.text[:120]))
-            break
-        except Exception as e:
-            _swing_stats_bump("http_exc")
-            if attempt < attempts - 1:
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-            _log_swing_fetch_err(symbol, kind + "/exc",
-                                 "{}: {}".format(type(e).__name__, str(e)[:120]))
-            break
-
-    # Live fetch failed -- reuse the last good bars if we have any.
-    stale = _bars_cache_get(cache_key, _BARS_STALE_TTL)
-    if stale is not None:
-        _swing_stats_bump("served_stale")
-    return stale
-
-
-def get_daily_extended(symbol, limit=90):
-    return _fetch_bars(symbol, "1Day", limit, "daily")
-
-
-def get_weekly_bars(symbol, limit=52):
-    return _fetch_bars(symbol, "1Week", limit, "weekly")
-
-
-# =============================================
-# SWING ENGINE -- FIBONACCI
-# =============================================
-
-FIBO_RETRACE = [0.236, 0.382, 0.500, 0.618, 0.786]
-FIBO_EXTEND  = [1.000, 1.272, 1.618, 2.000, 2.618]
-
-
-def fibonacci_levels(swing_low, swing_high, direction="CALL"):
-    """
-    Retracements = pullback support (CALL) or bounce resistance (PUT).
-    Extensions   = upside targets (CALL) or downside targets (PUT).
-    """
-    rng = swing_high - swing_low
-    if rng <= 0:
-        return {}, {}
-    retrace = {}
-    extend  = {}
-    if direction == "CALL":
-        for r in FIBO_RETRACE:
-            retrace[r] = round(swing_high - rng * r, 2)
-        for e in FIBO_EXTEND:
-            extend[e]  = round(swing_low  + rng * e, 2)
-    else:
-        for r in FIBO_RETRACE:
-            retrace[r] = round(swing_low  + rng * r, 2)
-        for e in FIBO_EXTEND:
-            extend[e]  = round(swing_high - rng * e, 2)
-    return retrace, extend
-
-
-def nearest_fib(price, levels):
-    if not levels:
-        return None, None, None
-    best_r = min(levels, key=lambda r: abs(levels[r] - price))
-    best_v = levels[best_r]
-    pct    = round(abs(price - best_v) / price * 100, 2)
-    return best_v, best_r, pct
 
 
 # =============================================
@@ -3735,15 +3382,6 @@ def scan_all_symbols():
                     int(age_s), source or "?")
             results.append(result); continue
         result["price_source"] = source
-
-        # --- 0DTE earnings flag (don't block, just warn) ---
-        if HAS_SAFETY_GATES:
-            try:
-                _allowed, _reason = safety_gates.earnings_filter(symbol, "0dte")
-                if "HIGH_RISK" in _reason or "caution" in _reason:
-                    result["earnings_warning"] = _reason
-            except Exception:
-                pass
 
         vol_mult = volatility_score(daily)
         if vol_mult == 0.0:
@@ -4345,6 +3983,21 @@ def run_signal_scan():
     if intraday_locked:
         log("INTRADAY tier locked -- live position open, suppressing alerts")
 
+    # vol1d SHADOW hook: evaluate + log what the vol module WOULD do to
+    # each alertable signal (veto/stand-aside/downweight/size). It filters
+    # NOTHING until vol1d config enforce=True is flipped after reviewing
+    # the vol1d_shadow logs.
+    if HAS_VOL1D and alertable:
+        try:
+            _vcfg = vol1d_config.get_config()
+            alertable = vol1d_shadow.process_signals(
+                alertable, get_vol1d_state(), cfg=_vcfg,
+                has_open_position=intraday_locked)
+            if _vcfg.get("enforce"):
+                log_event("vol1d.enforce_active", allowed=len(alertable))
+        except Exception as _e:
+            log("vol1d shadow error: {}".format(_e))
+
     # Telegram: alert on confirmed signals
     for sig in (alertable if not intraday_locked else []):
         if bot_enabled and should_alert(sig["symbol"], sig["direction"]):
@@ -4370,18 +4023,13 @@ def run_signal_scan():
                 context_line += "GEX: ${}B {}".format(
                     _g["gex_b"], _g.get("tape_bias", ""))
 
-            # Earnings warning if present
-            earn_warning = ""
-            if sig.get("earnings_warning"):
-                earn_warning = "\n\n⚠️ {}".format(sig["earnings_warning"])
-
             msg = (
                 "{sig_type} {horizon} SIGNAL — {grade} ({gpts}pts)\n\n"
                 "{sym} {dirn}  •  ${price}\n"
                 "Strike: {strike}  •  Premium: ${prem}\n"
                 "Stop ${stop}  •  Target ${target}  •  conv x{conv:.2f}\n\n"
                 "Gap: {gap}%  •  RS vs SPY: {rs}%\n"
-                "Vol: {vol_lbl}{ctx}{ew}"
+                "Vol: {vol_lbl}{ctx}"
             ).format(
                 sig_type   = sig.get("signal_type", "ORB"),
                 horizon    = sig.get("horizon", "INTRADAY"),
@@ -4399,7 +4047,6 @@ def run_signal_scan():
                 rs         = sig.get("rs", "?"),
                 vol_lbl    = sig.get("vol_ratio") or "?",
                 ctx        = "\n\n" + context_line if context_line else "",
-                ew         = earn_warning,
             )
             send_telegram(msg)
             # Auto-open the tracked position so this tier is now locked until
@@ -4849,7 +4496,7 @@ def run_friday_digest():
         "summary": p.get("summary", ""),
     } for p in proposals]
 
-    prompt = """You are reviewing a week of automated 0DTE/swing options signals from an algorithmic trading system. \
+    prompt = """You are reviewing a week of automated 0DTE options signals from an algorithmic trading system. \
 Most outcomes are paper-traded (synthetic backtest of the system's own signals against intraday bars), so treat them as signal quality rather than realized PnL.
 
 WEEK STATS:
@@ -5060,2092 +4707,6 @@ If the data does not yet support any specific proposal, return: {{"proposals": [
         log("AI proposals: Exception: {}".format(e))
 
 
-# =============================================
-# SWING TRADE SCANNER
-# =============================================
-
-def get_daily_bars(symbol, limit=60):
-    """Fetch daily OHLCV bars from Alpaca."""
-    try:
-        r = requests.get(
-            DATA_URL.format(symbol),
-            headers=HEADERS,
-            params={"timeframe": "1Day", "limit": limit, "adjustment": "split"},
-            timeout=10
-        )
-        if r.status_code != 200:
-            return []
-        return r.json().get("bars", [])
-    except Exception as e:
-        log("daily_bars {}: {}".format(symbol, e))
-        return []
-
-
-def swing_fibonacci(bars, direction="CALL"):
-    """
-    Find the dominant swing low and swing high in last 20 daily bars.
-    Returns dict with retracement supports and extension targets.
-    direction: CALL = bullish (extensions above price), PUT = bearish
-    """
-    if len(bars) < 10:
-        return None
-
-    recent = bars[-20:]
-    highs  = [b["h"] for b in recent]
-    lows   = [b["l"] for b in recent]
-
-    swing_high = max(highs)
-    swing_low  = min(lows)
-    rng        = swing_high - swing_low
-
-    if rng <= 0:
-        return None
-
-    if direction == "CALL":
-        # Bullish: measure from swing low up
-        base   = swing_low
-        top    = swing_high
-        retrace_levels = {
-            "23.6": round(top - rng * 0.236, 2),
-            "38.2": round(top - rng * 0.382, 2),
-            "50.0": round(top - rng * 0.500, 2),
-            "61.8": round(top - rng * 0.618, 2),
-            "78.6": round(top - rng * 0.786, 2),
-        }
-        ext_levels = {
-            "127.2": round(base + rng * 1.272, 2),
-            "161.8": round(base + rng * 1.618, 2),
-            "200.0": round(base + rng * 2.000, 2),
-            "261.8": round(base + rng * 2.618, 2),
-        }
-    else:
-        # Bearish: measure from swing high down
-        base   = swing_high
-        top    = swing_low
-        retrace_levels = {
-            "23.6": round(top + rng * 0.236, 2),
-            "38.2": round(top + rng * 0.382, 2),
-            "50.0": round(top + rng * 0.500, 2),
-            "61.8": round(top + rng * 0.618, 2),
-            "78.6": round(top + rng * 0.786, 2),
-        }
-        ext_levels = {
-            "127.2": round(base - rng * 1.272, 2),
-            "161.8": round(base - rng * 1.618, 2),
-            "200.0": round(base - rng * 2.000, 2),
-            "261.8": round(base - rng * 2.618, 2),
-        }
-
-    return {
-        "swing_low":  swing_low,
-        "swing_high": swing_high,
-        "range":      round(rng, 2),
-        "retracements": retrace_levels,
-        "extensions":   ext_levels,
-    }
-
-
-# =============================================
-# SWING ENGINE -- UTILITY
-# =============================================
-
-def _avg_vol(bars, lookback=50):
-    """Average daily volume over lookback bars, ignoring zeros."""
-    vols = [b["v"] for b in bars[-lookback:] if b.get("v", 0) > 0]
-    return statistics.mean(vols) if vols else 1
-
-
-def _sma(bars, n, field="c"):
-    """Simple moving average of last n bars."""
-    vals = [b[field] for b in bars[-n:]]
-    return statistics.mean(vals) if len(vals) == n else None
-
-
-def _atr(bars, n=14):
-    """Average True Range over n bars."""
-    trs = []
-    for i in range(1, len(bars)):
-        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i-1]["c"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if not trs:
-        return 0
-    return statistics.mean(trs[-n:]) if len(trs) >= n else statistics.mean(trs)
-
-
-def _high52w(bars):
-    return max(b["h"] for b in bars) if bars else 0
-
-def _low52w(bars):
-    return min(b["l"] for b in bars) if bars else 0
-
-
-# =============================================
-# SWING ENGINE -- WEINSTEIN STAGE FILTER
-# =============================================
-
-def weinstein_stage(bars, weekly_bars=None):
-    """
-    Stan Weinstein Stage Analysis.
-
-    Stage 1: Basing -- price flat around 30-week SMA, low volume
-    Stage 2: Markup  -- price above rising 30-week SMA, expanding volume  <-- BUY ZONE
-    Stage 3: Top     -- price extended, SMA flattening
-    Stage 4: Decline -- price below falling 30-week SMA                   <-- AVOID / SHORT
-
-    Uses 30-week SMA on weekly bars, or proxies with 150-day SMA on daily.
-    Returns: 1, 2, 3, or 4 (int) and slope direction.
-    """
-    src = weekly_bars if (weekly_bars and len(weekly_bars) >= 35) else None
-
-    if src:
-        # True Weinstein: 30-week SMA
-        sma30w_now  = _sma(src, 30) if len(src) >= 30 else None
-        sma30w_prev = statistics.mean([b["c"] for b in src[-35:-5]]) if len(src) >= 35 else None
-        price       = src[-1]["c"]
-        avg_vol_w   = _avg_vol(src, 30)
-        recent_vol  = statistics.mean([b["v"] for b in src[-4:]]) if len(src) >= 4 else avg_vol_w
-        vol_expand  = recent_vol > avg_vol_w * 1.1
-    else:
-        # Proxy: 150-day SMA on daily bars (~= 30 weeks)
-        if not bars or len(bars) < 160:
-            return 2, True   # default: assume Stage 2 if insufficient data
-        sma30w_now  = _sma(bars, 150)
-        sma30w_prev = statistics.mean([b["c"] for b in bars[-160:-10]]) if len(bars) >= 160 else None
-        price       = bars[-1]["c"]
-        avg_vol_w   = _avg_vol(bars, 50)
-        recent_vol  = statistics.mean([b["v"] for b in bars[-10:]])
-        vol_expand  = recent_vol > avg_vol_w * 1.1
-
-    if sma30w_now is None or sma30w_prev is None:
-        return 2, True
-
-    sma_rising  = sma30w_now > sma30w_prev
-    sma_falling = sma30w_now < sma30w_prev
-
-    # Stage boundaries
-    pct_above = (price - sma30w_now) / sma30w_now * 100
-
-    if price > sma30w_now and sma_rising:
-        if pct_above > 30:
-            return 3, True   # extended / topping
-        return 2, True       # sweet spot
-    elif price > sma30w_now and not sma_rising:
-        return 3, False      # above but SMA rolling over
-    elif price < sma30w_now and sma_falling:
-        return 4, False      # decline
-    else:
-        return 1, False      # basing / below flat SMA
-
-
-# =============================================
-# SWING ENGINE -- DETECTOR 1: O'NEIL PIVOT BREAKOUT
-# =============================================
-
-def detect_oneil_pivot(daily, weekly=None):
-    """
-    William O'Neil / IBD Cup-with-Handle & Pivot Breakout.
-
-    Criteria (all must be met):
-    1. Stock within 10% of 52-week high (must be in a leadership position)
-    2. Formed a consolidation base: 4-15 weeks, ATR contracted >= 25% vs prior ATR
-    3. Breakout above the base high (pivot point) on volume >= 40% above 50-day avg
-    4. Close near the high of the breakout day (> midpoint of day's range)
-    5. Weinstein Stage 2 (stock in markup phase, not topping or declining)
-
-    Probability calibration from O'Neil research:
-    - All 5 criteria met: ~65% hit T1 in trending market
-    - Volume >= 2x average on breakout: bump to ~70%
-    - RS vs market positive: bump to ~72%
-
-    Returns dict or None.
-    """
-    if not daily or len(daily) < 60:
-        return None
-
-    price      = daily[-1]["c"]
-    high_52w   = _high52w(daily[-252:] if len(daily) >= 252 else daily)
-    avg_vol_50 = _avg_vol(daily, 50)
-
-    # 1. Within 10% of 52-week high (leadership requirement)
-    if price < high_52w * 0.90:
-        return None
-
-    # 2. Find consolidation base: last 4-15 weeks (~20-75 trading days)
-    #    Base = a range where price traded within 15% of each other
-    #    Look for the most recent base
-    base_end   = len(daily) - 1
-    base_start = None
-
-    for lookback in range(20, 76):
-        segment = daily[-(lookback):-1]
-        if len(segment) < 10:
-            continue
-        seg_high = max(b["h"] for b in segment)
-        seg_low  = min(b["l"] for b in segment)
-        if seg_low > 0 and (seg_high - seg_low) / seg_low <= 0.18:
-            base_start = len(daily) - lookback
-            base_high  = seg_high
-            base_low   = seg_low
-            break
-
-    if base_start is None:
-        return None
-
-    # ATR contraction: base ATR should be < 75% of prior-period ATR
-    base_bars  = daily[base_start:-1]
-    prior_bars = daily[max(0, base_start - len(base_bars)):base_start]
-    if len(base_bars) < 5 or len(prior_bars) < 5:
-        return None
-
-    atr_base  = _atr(base_bars,  min(14, len(base_bars)))
-    atr_prior = _atr(prior_bars, min(14, len(prior_bars)))
-    # FIX 3: raised threshold 0.85 -> 0.92 (was rejecting valid bases with only 8-14%
-    # ATR contraction; volatile markets often can't clear the original 15% bar)
-    if atr_prior > 0 and atr_base / atr_prior > 0.92:
-        return None   # ATR not contracted enough -- not a tight base
-
-    # 3. Breakout above base high (pivot) -- check today or last 7 days
-    # FIX 4: extended lookback range(0,4) -> range(0,8) so we catch breakouts
-    # up to 7 days old that are still holding above the pivot (valid continuation entries)
-    today = daily[-1]
-    pivot_broken = False
-    days_since_breakout = 0
-
-    for lookback_days in range(0, 8):
-        bar = daily[-(1 + lookback_days)]
-        vol_ratio = bar["v"] / avg_vol_50 if avg_vol_50 > 0 else 0
-        if bar["h"] > base_high and bar["c"] > base_high * 0.995:
-            if vol_ratio >= 1.40:   # 40%+ above average (O'Neil requirement)
-                pivot_broken        = True
-                days_since_breakout = lookback_days
-                breakout_vol_ratio  = vol_ratio
-                break
-
-    if not pivot_broken:
-        return None
-
-    # 4. Breakout day close near high (conviction)
-    brk_bar    = daily[-(1 + days_since_breakout)]
-    day_range  = brk_bar["h"] - brk_bar["l"]
-    close_rank = (brk_bar["c"] - brk_bar["l"]) / day_range if day_range > 0 else 0.5
-    if close_rank < 0.50:   # closed in lower half of range = weak
-        return None
-
-    # 5. FIX 2: Weinstein Stage 1 or 2 filter (was Stage 2 only -- Stage 1 base
-    # breakouts are valid setups and were being rejected across the board)
-    stage, sma_rising = weinstein_stage(daily, weekly)
-    if stage not in (1, 2):
-        return None
-
-    # Probability calculation (O'Neil-calibrated)
-    prob = 62
-    if breakout_vol_ratio >= 2.0:   prob += 8    # strong institutional conviction
-    elif breakout_vol_ratio >= 1.6: prob += 4
-    if days_since_breakout == 0:    prob += 5    # fresh breakout today
-    if close_rank >= 0.80:          prob += 4    # closed at top of range
-    if atr_base / (atr_prior + 0.001) < 0.60:   prob += 3   # very tight base
-    if stage == 1:                  prob -= 4    # slight haircut vs confirmed Stage 2
-    prob = min(prob, 82)
-
-    # Swing low = base low (stop placement)
-    swing_low  = base_low
-    swing_high = base_high
-
-    retrace, extend = fibonacci_levels(swing_low, swing_high, "CALL")
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-
-    base_weeks = round((len(daily) - 1 - base_start) / 5, 1)
-
-    return {
-        "signal_type":   "ONEIL_PIVOT",
-        "signal_label":  "O'Neil Pivot Breakout",
-        "direction":     "CALL",
-        "prob":          prob,
-        "swing_low":     swing_low,
-        "swing_high":    swing_high,
-        "retrace":       retrace,
-        "extend":        extend,
-        "near_fib_val":  nfv,
-        "near_fib_r":    nfr,
-        "fib_dist":      nfd,
-        "vol_vs_avg":    round(breakout_vol_ratio, 2),
-        "days_since":    days_since_breakout,
-        "earn_gap":      round((price - base_high) / base_high * 100, 2),
-        "base_weeks":    base_weeks,
-        "pivot":         round(base_high, 2),
-        "close_rank":    round(close_rank * 100, 1),
-        "stage":         stage,
-        "notes":         "Base: {:.0f}wks | Pivot: ${:.2f} | Vol: {:.1f}x | Close rank: {:.0f}% | Stage {}".format(
-                            base_weeks, base_high, breakout_vol_ratio, close_rank * 100, stage),
-    }
-
-
-# =============================================
-# SWING ENGINE -- DETECTOR 2: WYCKOFF SPRING
-# =============================================
-
-def detect_wyckoff_spring(daily, weekly=None):
-    """
-    Wyckoff Accumulation Spring -- highest-probability Wyckoff entry.
-
-    The Spring is an engineered shakeout:
-    1. Support level has been tested >= 3 times (establishes the line)
-    2. Price breaks briefly BELOW support on LOW volume (the spring/trap)
-    3. Price immediately recovers back above support within 1-3 days
-    4. Recovery day has above-average volume (institutional buying the dip)
-    5. This sets up a "Sign of Strength" rally
-
-    Historical hit rate from Wyckoff methodology: ~68-72% when all criteria met.
-
-    Also detects Wyckoff Distribution (opposite: breaks above resistance then fails)
-    for PUT signals.
-
-    Returns dict or None.
-    """
-    if not daily or len(daily) < 40:
-        return None
-
-    avg_vol = _avg_vol(daily, 50)
-    price   = daily[-1]["c"]
-
-    # Find a well-tested support level (3+ touches in last 60 bars)
-    # Support = a price level where lows clustered within 1.5%
-    candidate_supports = []
-    lows = [b["l"] for b in daily[-60:]]
-
-    for i, base_low in enumerate(lows):
-        touches = sum(1 for l in lows if abs(l - base_low) / base_low < 0.015)
-        if touches >= 3:
-            candidate_supports.append(base_low)
-
-    # Deduplicate: cluster nearby supports
-    support_levels = []
-    for lvl in candidate_supports:
-        if not any(abs(lvl - existing) / existing < 0.02 for existing in support_levels):
-            support_levels.append(lvl)
-
-    if not support_levels:
-        return None
-
-    # Take the most-tested support in the last 60 bars
-    support = max(support_levels, key=lambda lvl: sum(
-        1 for l in lows if abs(l - lvl) / lvl < 0.015))
-
-    # Look for a spring: price briefly dipped below support then recovered
-    # Check last 1-5 bars for the spring
-    spring_bar  = None
-    spring_idx  = None
-    for lookback in range(1, 6):
-        bar  = daily[-(1 + lookback)]
-        prev = daily[-(2 + lookback)] if lookback + 2 <= len(daily) else None
-        if prev is None:
-            continue
-
-        # Spring criteria:
-        # a) Low went below support
-        # b) Close recovered above support
-        # c) Volume was LOW on the spring day (no panic -- it's engineered)
-        vol_ratio = bar["v"] / avg_vol if avg_vol > 0 else 1
-        dipped_below  = bar["l"] < support * 0.998
-        closed_above  = bar["c"] > support * 0.995
-        low_volume    = vol_ratio < 1.0   # should be below average (not panic selling)
-
-        if dipped_below and closed_above and low_volume:
-            spring_bar  = bar
-            spring_idx  = len(daily) - 1 - lookback
-            spring_vol  = vol_ratio
-            spring_low  = bar["l"]
-            break
-
-    if spring_bar is None:
-        return None
-
-    # Confirm recovery: current price must be above support
-    if price < support * 0.998:
-        return None
-
-    # Check recovery volume is higher (Sign of Strength)
-    # FIX 6: lowered recovery vol threshold from 0.9x to 0.75x avg_vol
-    # Large-caps and ETFs rarely show dramatic recovery volume; 0.75x is still
-    # meaningful confirmation that sellers are not in control
-    recent_bars    = daily[spring_idx + 1:]
-    if recent_bars:
-        recovery_vol   = statistics.mean([b["v"] for b in recent_bars])
-        vol_expanding  = recovery_vol > avg_vol * 0.75
-    else:
-        vol_expanding  = False
-
-    # Weinstein Stage: spring should occur in Stage 1/2 (accumulation zone)
-    # FIX 2: changed from stage==4 exclusion to requiring stage in (1,2)
-    # Wyckoff springs by definition happen during accumulation (Stage 1) or
-    # early markup (Stage 2) -- Stage 3/4 springs are bear-market traps
-    stage, _ = weinstein_stage(daily, weekly)
-    if stage not in (1, 2):
-        return None
-
-    # Count support touches for probability calibration
-    support_touches = sum(1 for l in lows if abs(l - support) / support < 0.015)
-
-    # Probability (Wyckoff-calibrated)
-    prob = 64
-    if support_touches >= 4:     prob += 6
-    if support_touches >= 5:     prob += 4
-    if vol_expanding:            prob += 6
-    if spring_vol < 0.7:         prob += 4   # very low spring vol = cleaner trap
-    if stage in (1, 2):          prob += 4
-    prob = min(prob, 80)
-
-    # Fib levels: use last major swing for extension targets
-    swing_low  = spring_low
-    swing_high = max(b["h"] for b in daily[-60:])
-
-    retrace, extend = fibonacci_levels(swing_low, swing_high, "CALL")
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-
-    days_since = len(daily) - 1 - spring_idx
-
-    return {
-        "signal_type":   "WYCKOFF_SPRING",
-        "signal_label":  "Wyckoff Spring",
-        "direction":     "CALL",
-        "prob":          prob,
-        "swing_low":     swing_low,
-        "swing_high":    swing_high,
-        "retrace":       retrace,
-        "extend":        extend,
-        "near_fib_val":  nfv,
-        "near_fib_r":    nfr,
-        "fib_dist":      nfd,
-        "vol_vs_avg":    round(spring_vol, 2),
-        "days_since":    days_since,
-        "earn_gap":      round((price - support) / support * 100, 2),
-        "support_level": round(support, 2),
-        "touches":       support_touches,
-        "stage":         stage,
-        "notes":         "Support: ${:.2f} ({} touches) | Spring vol: {:.1f}x | {} days ago".format(
-                            support, support_touches, spring_vol, days_since),
-    }
-
-
-# =============================================
-# SWING ENGINE -- DETECTOR 3: 52-WEEK HIGH BREAKOUT
-# =============================================
-
-def detect_52w_breakout(daily, weekly=None):
-    """
-    52-Week High Breakout with Tight Consolidation.
-
-    Academic research (Moskowitz, Jegadeesh & Titman momentum papers) and
-    O'Neil's data both confirm: stocks making new 52-week highs on volume
-    while in a tight consolidation (3+ weeks within 10% of the high) have
-    the highest forward 3-month return of any signal type.
-
-    Criteria:
-    1. Price within 3% of all-time-high in the data (or 52-week high)
-    2. Spent >= 3 weeks within 10% of that high (showing distribution has ended)
-    3. Volume contraction during consolidation (supply dried up)
-    4. Breakout: new high on volume >= 30% above 50-day avg
-    5. Stage 2 filter (must be in markup phase)
-
-    Probability: ~60-65% (slightly lower than O'Neil because less specific entry)
-    """
-    if not daily or len(daily) < 60:
-        return None
-
-    price      = daily[-1]["c"]
-    high_all   = _high52w(daily)
-    avg_vol_50 = _avg_vol(daily, 50)
-
-    # 1. Must be within 5% of all-time high in dataset
-    if price < high_all * 0.95:
-        return None
-
-    # 2. FIX 5: Tight consolidation relaxed from 15 bars/90% to 10 bars/88%
-    # Original requirement was too strict: many valid setups form bases with
-    # slightly wider ranges or fewer bars, especially in volatile markets
-    tight_bars = [b for b in daily[-50:] if b["c"] >= high_all * 0.88]
-    if len(tight_bars) < 10:
-        return None
-
-    # 3. Volume contraction during consolidation
-    consol_vol   = statistics.mean([b["v"] for b in daily[-20:]])
-    prior_vol    = _avg_vol(daily[-50:-20], 30) if len(daily) >= 50 else avg_vol_50
-    vol_contraction = consol_vol < prior_vol * 0.90
-
-    # 4. Breakout bar: new closing high on above-average volume
-    today     = daily[-1]
-    prev_high = max(b["h"] for b in daily[-50:-1]) if len(daily) >= 2 else 0
-    new_high  = today["c"] >= prev_high * 0.998   # within 0.2% of prior high counts
-    brk_vol   = today["v"] / avg_vol_50 if avg_vol_50 > 0 else 1
-
-    # Also accept if breakout was in last 3 bars
-    recent_breakout = False
-    for lb in range(0, 4):
-        bar     = daily[-(1 + lb)]
-        bar_vol = bar["v"] / avg_vol_50 if avg_vol_50 > 0 else 1
-        if bar["c"] >= prev_high * 0.998 and bar_vol >= 1.30:
-            recent_breakout  = True
-            brk_vol          = bar_vol
-            days_since_break = lb
-            break
-
-    if not recent_breakout:
-        return None
-
-    # 5. Stage 2 filter
-    stage, sma_rising = weinstein_stage(daily, weekly)
-    if stage not in (2,):
-        return None
-
-    # Probability
-    prob = 58
-    if vol_contraction:          prob += 5
-    if brk_vol >= 1.6:           prob += 5
-    if brk_vol >= 2.0:           prob += 4
-    if len(tight_bars) >= 25:    prob += 4   # longer base = more reliable
-    if days_since_break == 0:    prob += 4   # fresh today
-    prob = min(prob, 78)
-
-    # Consolidation range for fib
-    consol_low  = min(b["l"] for b in daily[-20:])
-    consol_high = max(b["h"] for b in daily[-20:])
-
-    retrace, extend = fibonacci_levels(consol_low, consol_high, "CALL")
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-
-    return {
-        "signal_type":   "HI52_BREAKOUT",
-        "signal_label":  "52-Week High Breakout",
-        "direction":     "CALL",
-        "prob":          prob,
-        "swing_low":     consol_low,
-        "swing_high":    consol_high,
-        "retrace":       retrace,
-        "extend":        extend,
-        "near_fib_val":  nfv,
-        "near_fib_r":    nfr,
-        "fib_dist":      nfd,
-        "vol_vs_avg":    round(brk_vol, 2),
-        "days_since":    days_since_break,
-        "earn_gap":      round((price / prev_high - 1) * 100, 2),
-        "stage":         stage,
-        "notes":         "52w high: ${:.2f} | Break vol: {:.1f}x | {} tight weeks".format(
-                            high_all, brk_vol, round(len(tight_bars) / 5, 1)),
-    }
-
-
-# =============================================
-# SWING ENGINE -- DETECTOR 4: EARNINGS CONTINUATION
-#   (same pattern, now gated by Stage 2 filter)
-# =============================================
-
-def detect_earnings_continuation(daily, weekly=None):
-    """
-    Post-earnings gap continuation. Proven edge: stocks that gap up on earnings
-    with strong volume and hold the gap continue higher 60-65% of the time
-    within the next 3 weeks (O'Neil, Zacks research).
-
-    Now gated by Stage 2 filter -- earnings pops in Stage 3/4 are traps.
-    """
-    if not daily or len(daily) < 25:
-        return None
-
-    avg_vol = _avg_vol(daily, 30)
-    price   = daily[-1]["c"]
-
-    # Find earnings gap: >3% gap on > 2x volume in last 20 bars
-    earn_idx = None
-    for i in range(len(daily) - 20, len(daily) - 2):
-        b, prev = daily[i], daily[i - 1]
-        if b["v"] / avg_vol >= 2.0 and abs((b["o"] - prev["c"]) / prev["c"] * 100) >= 3.0:
-            earn_idx  = i
-            earn_gap  = (b["o"] - prev["c"]) / prev["c"] * 100
-            earn_open = b["o"]
-            pre_close = prev["c"]
-            break
-
-    if earn_idx is None:
-        return None
-
-    days_since = len(daily) - 1 - earn_idx
-    if not (1 <= days_since <= 20):
-        return None
-
-    direction = "CALL" if earn_gap > 0 else "PUT"
-
-    # Gap must be mostly held (< 40% given back)
-    gap_size = abs(earn_open - pre_close) or 0.01
-    if direction == "CALL":
-        pullback = max(0, (earn_open - price) / gap_size)
-    else:
-        pullback = max(0, (price - earn_open) / gap_size)
-    if pullback > 0.40:
-        return None
-
-    # FIX 2: Accept Stage 1 and Stage 2 for CALL continuations (was Stage 2 only)
-    # Earnings gaps in Stage 1 can be valid re-ratings from a basing phase;
-    # only Stage 3 (topping) and Stage 4 (decline) should be excluded
-    stage, _ = weinstein_stage(daily, None)
-    if direction == "CALL" and stage not in (1, 2):
-        return None
-
-    # Probability (O'Neil / Zacks calibrated)
-    prob  = 60
-    prob += max(0, 12 - days_since)
-    prob += 8 if pullback < 0.15 else 0
-    prob += 5 if earn_gap > 6.0  else 0
-    if stage == 1: prob -= 3   # slight haircut for Stage 1 vs Stage 2
-    prob  = min(prob, 82)
-
-    pre_earn   = daily[max(0, earn_idx - 10):earn_idx]
-    swing_low  = min(b["l"] for b in pre_earn) if pre_earn else daily[earn_idx]["l"]
-    swing_high = max(b["h"] for b in (pre_earn + [daily[earn_idx]])) if pre_earn else daily[earn_idx]["h"]
-
-    retrace, extend = fibonacci_levels(swing_low, swing_high, direction)
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-
-    vol_vs_avg = round(statistics.mean([b["v"] for b in daily[-5:]]) / avg_vol, 2)
-
-    return {
-        "signal_type":   "EARNINGS_CONT",
-        "signal_label":  "Post-Earnings Continuation",
-        "direction":     direction,
-        "prob":          prob,
-        "swing_low":     swing_low,
-        "swing_high":    swing_high,
-        "retrace":       retrace,
-        "extend":        extend,
-        "near_fib_val":  nfv,
-        "near_fib_r":    nfr,
-        "fib_dist":      nfd,
-        "vol_vs_avg":    vol_vs_avg,
-        "days_since":    days_since,
-        "earn_gap":      round(earn_gap, 2),
-        "stage":         stage,
-        "notes":         "Gap: {:+.1f}% | {} days ago | Pullback: {:.0f}% | Stage {}".format(
-                            earn_gap, days_since, pullback * 100, stage),
-    }
-
-
-# =============================================
-# SWING ENGINE -- PER-SYMBOL ORCHESTRATOR
-# =============================================
-
-def _check_earnings_iv_crush(symbol):
-    """
-    Detect the earnings IV-crush setup. Returns a swing-signal-shaped dict
-    or None.
-
-    Conditions (ALL must hold):
-      - Tomorrow is the symbol's next earnings date
-      - IV Rank >= 70 (premium is rich vs the stock's own history)
-      - At least 30 days of IV history stored
-      - Implied move > historical avg post-earnings move by 1pp+
-      - At least 4 prior earnings observations
-    """
-    if not (HAS_NEW_STRATS and HAS_IV_RANK and HAS_SAFETY_GATES):
-        return None
-
-    try:
-        dte = safety_gates.days_to_earnings(symbol)
-        if dte != 1:
-            return None
-
-        # Need IV Rank
-        spot = get_current_price(symbol)
-        if not spot:
-            return None
-
-        iv_data = iv_rank.compute_iv_rank(symbol)
-        if not iv_data or iv_data["iv_rank"] < 70:
-            return None
-        # Variance-risk-premium gate: don't sell premium when implied vol is
-        # not at least 20% richer than realized. iv_rv_ratio is added by
-        # compute_iv_rank when realized vol is computable; if absent we let
-        # the trade through (back-compat for symbols without RV history).
-        if iv_data.get("iv_rv_ratio") is not None and not iv_data.get("vrp_favorable"):
-            return None
-
-        # Need ATM straddle pricing
-        call_premium, _ck, _cl, _cd = get_liquid_option(symbol, "CALL", spot)
-        put_premium,  _pk, _pl, _pd = get_liquid_option(symbol, "PUT",  spot)
-        if not call_premium or not put_premium:
-            return None
-
-        daily = get_daily_extended(symbol, limit=400)
-        prior_earnings = safety_gates.get_prior_earnings_dates(symbol)
-        if not daily or len(prior_earnings) < 4:
-            return None
-
-        sig = new_strategies.detect_earnings_iv_crush(
-            symbol               = symbol,
-            spot                 = spot,
-            atm_call             = call_premium,
-            atm_put              = put_premium,
-            iv_rank              = iv_data["iv_rank"],
-            daily_bars           = daily,
-            prior_earnings_dates = prior_earnings,
-            days_to_earnings     = dte,
-        )
-        if not sig:
-            return None
-
-        # Adapt to the swing-signal shape used elsewhere
-        return {
-            "signal_type":   "EARNINGS_IV_CRUSH",
-            "signal_label":  "Earnings IV Crush (short premium)",
-            "direction":     "SHORT_PREMIUM",
-            "structure":     sig["structure"],
-            "tier":          1,
-            "prob":          int(sig["expected_win_rate"] * 100),
-            "score":         sig["score"],
-            "spot":          spot,
-            "iv_rank":       iv_data["iv_rank"],
-            "iv_percentile": iv_data["iv_percentile"],
-            "implied_move":  sig["implied_move"],
-            "historic_move": sig["historical_move"],
-            "edge_pct":      sig["edge_pct"],
-            "short_call_k":  sig["short_call_k"],
-            "long_call_k":   sig["long_call_k"],
-            "short_put_k":   sig["short_put_k"],
-            "long_put_k":    sig["long_put_k"],
-            "exit_when":     sig["exit_when"],
-            "symbol":        symbol,
-        }
-    except Exception as e:
-        log("IV crush check error for {}: {}".format(symbol, e))
-        return None
-
-
-_market_trend_cache = {"ts": 0, "trend": None}
-
-
-def market_trend():
-    """Broad-tape trend for the weekly directional gate: 'UP'/'DOWN'/'FLAT'.
-
-    SPY close vs its 50-day SMA, with the SMA slope as a tie-breaker. Cached
-    for an hour so the per-symbol weekly sweep doesn't recompute it 70x.
-    """
-    now = time.time()
-    if _market_trend_cache["trend"] and now - _market_trend_cache["ts"] < 3600:
-        return _market_trend_cache["trend"]
-    trend = "FLAT"
-    try:
-        spy = get_daily_extended("SPY", limit=80) or []
-        if len(spy) >= 55:
-            closes = [b["c"] for b in spy]
-            sma50_now  = sum(closes[-50:]) / 50.0
-            sma50_prev = sum(closes[-55:-5]) / 50.0
-            price = closes[-1]
-            if price > sma50_now and sma50_now >= sma50_prev:
-                trend = "UP"
-            elif price < sma50_now and sma50_now <= sma50_prev:
-                trend = "DOWN"
-            else:
-                trend = "FLAT"
-    except Exception:
-        pass
-    _market_trend_cache.update({"ts": now, "trend": trend})
-    return trend
-
-
-def scan_swing_symbol(symbol):
-    """
-    Tier 1: fully-triggered signals (O'Neil, Wyckoff Spring, 52W, Earnings Cont.)
-    Tier 2: pattern-forming watchlist (base building, accum zone, near high, gap holding)
-    Tier 3 (NEW): Earnings IV crush — short premium 1 day before earnings
-    """
-    try:
-        # --- Tier 3: Earnings IV Crush (runs BEFORE the blackout filter) ---
-        # On the day before earnings, IF iv_rank > 70 AND implied move > historical,
-        # fire a short-premium iron condor setup. This is the ONE case where we
-        # WANT to trade into earnings.
-        iv_crush_sig = _check_earnings_iv_crush(symbol)
-        if iv_crush_sig:
-            _swing_stats_bump("iv_crush")
-            return iv_crush_sig
-
-        # --- Earnings blackout: skip directional swing trades within 10 trading days ---
-        if HAS_SAFETY_GATES:
-            try:
-                allowed, reason = safety_gates.earnings_filter(symbol, "swing")
-                if not allowed:
-                    _swing_stats_bump("earnings_blackout")
-                    log("swing {}: skipped — {}".format(symbol, reason))
-                    return None
-            except Exception as e:
-                log("earnings_filter error for {}: {}".format(symbol, e))
-
-        daily  = get_daily_extended(symbol, limit=260)
-        weekly = get_weekly_bars(symbol, limit=52)
-        if not daily or len(daily) < 60:
-            _swing_stats_bump("no_data")
-            return None
-        current = daily[-1]["c"]
-        if not current or current <= 0:
-            _swing_stats_bump("no_data")
-            return None
-        _swing_stats_bump("had_data")
-
-        spy_d  = get_daily_extended("SPY", limit=10)
-        spy_rs = 0.0
-        if spy_d and len(spy_d) >= 5:
-            spy_chg = (spy_d[-1]["c"] - spy_d[-5]["c"]) / spy_d[-5]["c"] * 100
-            sym_chg = (daily[-1]["c"]  - daily[-5]["c"]) / daily[-5]["c"] * 100
-            spy_rs  = round(sym_chg - spy_chg, 2)
-
-        type_pri = {"ONEIL_PIVOT": 4, "WYCKOFF_SPRING": 3, "HI52_BREAKOUT": 2, "EARNINGS_CONT": 1}
-
-        tier1_sigs = []
-        for name, fn in [("oneil",   lambda: detect_oneil_pivot(daily, weekly)),
-                          ("wyckoff", lambda: detect_wyckoff_spring(daily, weekly)),
-                          ("hi52",    lambda: detect_52w_breakout(daily, weekly)),
-                          ("earn",    lambda: detect_earnings_continuation(daily, weekly))]:
-            try:
-                r = fn()
-                if r:
-                    r["tier"] = 1
-                    tier1_sigs.append(r)
-                    _swing_stats_bump("t1_" + name)
-            except Exception:
-                pass
-
-        tier2_sigs = []
-        for fn in [lambda: watch_oneil_base_forming(daily, weekly),
-                   lambda: watch_wyckoff_accumulation(daily, weekly),
-                   lambda: watch_52w_approaching(daily, weekly),
-                   lambda: watch_earnings_gap_holding(daily, weekly)]:
-            try:
-                r = fn()
-                if r:
-                    r["tier"] = 2
-                    tier2_sigs.append(r)
-            except Exception:
-                pass
-
-        all_sigs = tier1_sigs + tier2_sigs
-        if not all_sigs:
-            _swing_stats_bump("no_signal")
-            return None
-        if tier1_sigs:
-            _swing_stats_bump("tier1")
-        else:
-            _swing_stats_bump("tier2_only")
-
-        if tier1_sigs:
-            best = max(tier1_sigs, key=lambda s: (s["prob"], type_pri.get(s["signal_type"], 0)))
-        else:
-            best = max(tier2_sigs, key=lambda s: s["prob"])
-
-        direction = best["direction"]
-        tier      = best["tier"]
-
-        # Weekly quality gates (tier-1 only). A failed gate downgrades the
-        # setup to tier-2 -- it stays visible on the dashboard as a watch, but
-        # won't alert or auto-open a position (both are tier-1 only).
-        if tier == 1:
-            wcfg        = get_config()
-            min_rs      = wcfg.get("weekly_min_rs", 0.0)
-            max_age     = wcfg.get("weekly_max_breakout_age", 3)
-            gate_reason = None
-
-            # 1) Trade with the broad tape: long setups need positive RS and a
-            #    non-falling market; PUT (earnings) setups need the inverse.
-            #    Exception: strong single-name RS overrides the tape veto --
-            #    a deep relative-weakness PUT in an up tape (or a strong
-            #    relative-strength CALL in a down tape) is trading the stock,
-            #    not fighting the index.
-            if wcfg.get("weekly_require_uptrend", True):
-                mt     = market_trend()
-                rs_ovr = wcfg.get("weekly_rs_override", 5.0)
-                if (direction == "CALL" and (spy_rs < min_rs or mt == "DOWN")
-                        and spy_rs < rs_ovr):
-                    gate_reason = "counter-trend CALL (RS {:.1f}, tape {})".format(
-                        spy_rs, mt)
-                elif (direction == "PUT" and (spy_rs > -min_rs or mt == "UP")
-                        and spy_rs > -rs_ovr):
-                    gate_reason = "counter-trend PUT (RS {:.1f}, tape {})".format(
-                        spy_rs, mt)
-
-            # 2) Don't chase a breakout that already ran days ago (breakout
-            #    detectors only -- earnings 'days_since' means days-since-report).
-            if gate_reason is None and best.get("signal_type") in (
-                    "ONEIL_PIVOT", "WYCKOFF_SPRING", "HI52_BREAKOUT"):
-                age = best.get("days_since")
-                if age is not None and age > max_age:
-                    gate_reason = "stale breakout ({}d old)".format(age)
-
-            # 3) Earnings continuation from a Stage-1 base is a weak entry.
-            if (gate_reason is None
-                    and best.get("signal_type") == "EARNINGS_CONT"
-                    and best.get("stage") == 1):
-                gate_reason = "stage-1 earnings continuation"
-
-            # 4) Don't enter against the stock's OWN current-day move. The
-            #    structural detectors (e.g. Wyckoff spring) score the pattern,
-            #    not today's tape -- so a name dumping -4% intraday could still
-            #    print a fresh CALL. A sharp adverse day invalidates the entry
-            #    until it stabilizes. Uses prior close so gaps count.
-            if gate_reason is None and len(daily) >= 2 and daily[-2]["c"]:
-                max_adverse = wcfg.get("swing_max_adverse_day_pct", 3.0)
-                day_chg = (current - daily[-2]["c"]) / daily[-2]["c"] * 100
-                if direction == "CALL" and day_chg <= -max_adverse:
-                    gate_reason = "adverse day for CALL ({:+.1f}%)".format(day_chg)
-                elif direction == "PUT" and day_chg >= max_adverse:
-                    gate_reason = "adverse day for PUT ({:+.1f}%)".format(day_chg)
-
-            if gate_reason:
-                tier = 2
-                best["tier"] = 2
-                best["gate_reason"] = gate_reason
-                _swing_stats_bump("tier1_gated")
-                log("{}: tier-1 downgraded -> {}".format(symbol, gate_reason))
-
-        exts = best.get("extend", {})
-        if direction == "CALL":
-            above = sorted([(r, v) for r, v in exts.items() if v > current], key=lambda x: x[1])
-        else:
-            above = sorted([(r, v) for r, v in exts.items() if v < current],
-                           key=lambda x: x[1], reverse=True)
-
-        # Fib-extension targets (the legacy basis, also fed to the blend below).
-        t1 = above[0][1] if len(above) >= 1 else None
-        t2 = above[1][1] if len(above) >= 2 else None
-        t3 = above[2][1] if len(above) >= 3 else None
-
-        stop = (best.get("retrace", {}).get(0.618)
-                or round(current * (0.96 if direction == "CALL" else 1.04), 2))
-
-        # --- Weekly expected-move / Fibonacci blend (current-week settlement) ---
-        week_expiry, dte = current_week_expiry(
-            zero_dte_cutoff=get_config().get("zero_dte_cutoff_hour", 14.5))
-        atm_iv = expected_move = None
-        target_basis = "FIB"
-        t1_prob = t2_prob = None
-        if HAS_KEY_LEVELS:
-            try:
-                kl = key_levels_mod.get_key_levels(
-                    symbol, daily_bars=daily, spot=current,
-                    direction=direction, week_expiry=week_expiry, dte=dte)
-                atm_iv        = kl.atm_iv
-                expected_move = kl.expected_move_1sd
-            except Exception:
-                pass
-        if HAS_TARGETS:
-            try:
-                tg = targets_mod.compute_price_targets(
-                    current, direction, "WEEKLY", iv=atm_iv, dte=dte,
-                    fib_extend=best.get("extend", {}),
-                    fib_retrace=best.get("retrace", {}))
-                if tg:
-                    if tg.get("t1") is not None:
-                        t1 = tg["t1"]
-                    if tg.get("t2") is not None:
-                        t2 = tg["t2"]
-                    if tg.get("stop") is not None:
-                        stop = tg["stop"]
-                    t1_prob       = tg.get("t1_prob")
-                    t2_prob       = tg.get("t2_prob")
-                    target_basis  = tg.get("basis", target_basis)
-                    expected_move = tg.get("expected_move_1sd", expected_move)
-            except Exception:
-                pass
-
-        rr1  = round(abs(t1 - current) / abs(current - stop), 2) if (
-            t1 and stop and abs(current - stop) > 0) else 0
-
-        # R:R floor (tier-1 only). A near-zero R:R means the first target is
-        # already at/through the current price -- the move the detector found
-        # has already happened, so there's no reward left to justify the risk.
-        # This is the "0.0:1 R:R" card: downgrade it to a watch instead of
-        # surfacing it as an actionable 80% setup.
-        if tier == 1:
-            min_rr = get_config().get("swing_min_rr", 1.0)
-            if rr1 < min_rr:
-                tier = 2
-                best["tier"] = 2
-                best["gate_reason"] = "R:R {:.1f} below {:.1f} floor".format(rr1, min_rr)
-                _swing_stats_bump("tier1_gated_rr")
-                log("{}: tier-1 downgraded -> {}".format(symbol, best["gate_reason"]))
-
-        # Weekly option on the current-week settlement (tier-1 only). Build a
-        # dict the dashboard/renderers expect; premium-stop/target are
-        # size-free per-contract levels.
-        opt = None
-        opt_volume = None
-        opt_strike = None
-        if tier == 1:
-            prem, opt_strike, is_live, dte_label, opt_volume = get_swing_option(
-                symbol, direction, current)
-            if prem and is_live:
-                opt = {
-                    "premium": prem,
-                    "strike":  opt_strike,
-                    "expiry":  week_expiry,
-                    "dte":     dte,
-                    "delta":   0.40,
-                    "iv":      round(atm_iv * 100, 1) if atm_iv else 0,
-                    "volume":  opt_volume,
-                    "bid":     "-",
-                    "ask":     "-",
-                }
-
-        product_class = "ETF" if symbol in ETF_PRODUCTS else "STOCK"
-
-        # Volume-vs-OI confluence on the weekly contract (Alpaca volume x
-        # Databento OI). SPY/QQQ already have OI from the daily GEX pipeline;
-        # for tier-1 stock setups allow an on-demand cached OI sweep.
-        vol_oi = None
-        if HAS_VOL_OI and tier == 1 and opt_strike is not None:
-            try:
-                vol_oi = vol_oi_mod.compute_vol_oi(
-                    symbol, opt_strike, week_expiry,
-                    "call" if direction == "CALL" else "put",
-                    alpaca_volume=opt_volume,
-                    allow_fetch=(product_class == "STOCK"))
-            except Exception as e:
-                log("vol_oi error {}: {}".format(symbol, e))
-
-        # Map directional targets onto the und_call_*/und_put_* keys so
-        # db_log_signal and the paper trader can persist them.
-        und_keys = {}
-        if direction == "CALL":
-            und_keys = {"und_call_t1": t1, "und_call_t2": t2, "und_call_stop": stop}
-        else:
-            und_keys = {"und_put_t1": t1, "und_put_t2": t2, "und_put_stop": stop}
-
-        # Higher-than-expected volume vs OI lifts continuation probability as an
-        # added confluence factor (only when both feeds confirmed it).
-        prob = best["prob"]
-        if vol_oi and vol_oi.get("points"):
-            prob = min(95, prob + vol_oi["points"])
-
-        # Stamp a letter grade from the setup probability. Weekly signals
-        # historically carried no grade at all, so every weekly paper/auto
-        # trade landed in the AI's "?" grade bucket -- which then dominated
-        # by_grade and read as "ungraded signals beat graded ones".
-        wg_cfg = get_config()
-        if prob >= wg_cfg.get("grade_a_min", 75):
-            sw_grade = "A"
-        elif prob >= wg_cfg.get("grade_b_min", 55):
-            sw_grade = "B"
-        elif prob >= wg_cfg.get("grade_c_min", 35):
-            sw_grade = "C"
-        else:
-            sw_grade = "D"
-
-        sig = {
-            "symbol":         symbol,
-            "price":          round(current, 2),
-            "direction":      direction,
-            "tier":           tier,
-            "horizon":        "WEEKLY",
-            "product_class":  product_class,
-            "conviction":     current_conviction(),
-            "signal_type":    best["signal_type"],
-            "signal_label":   best["signal_label"],
-            "prob":           prob,
-            "base_prob":      best["prob"],
-            "grade":          sw_grade,
-            "grade_pts":      int(round(prob)),
-            "vol_oi":         vol_oi,
-            "spy_rs":         spy_rs,
-            "rs":             spy_rs,
-            "t1":             t1,
-            "t2":             t2,
-            "t3":             t3,
-            "stop":           round(stop, 2) if stop is not None else None,
-            "t1_prob":        t1_prob,
-            "t2_prob":        t2_prob,
-            "target_basis":   target_basis,
-            "expected_move":  expected_move,
-            "atm_iv":         atm_iv,
-            "week_expiry":    week_expiry,
-            "dte":            dte,
-            "rr1":            rr1,
-            "swing_low":      best.get("swing_low"),
-            "swing_high":     best.get("swing_high"),
-            "retrace":        best.get("retrace", {}),
-            "extend":         best.get("extend",  {}),
-            "near_fib_val":   best.get("near_fib_val"),
-            "near_fib_r":     best.get("near_fib_r"),
-            "fib_dist":       best.get("fib_dist"),
-            "vol_vs_avg":     best.get("vol_vs_avg"),
-            "earn_gap":       best.get("earn_gap"),
-            "days_since":     best.get("days_since"),
-            "pct_from_pivot": best.get("pct_from_pivot"),
-            "notes":          best.get("notes", ""),
-            "stage":          best.get("stage"),
-            "all_types":      [s["signal_type"] for s in all_sigs],
-            "option":         opt,
-        }
-        sig.update(und_keys)
-        if HAS_SCANNER_CORE:
-            try:
-                sig["rationale"] = scanner_core.build_rationale(sig)
-            except Exception:
-                pass
-        return sig
-    except Exception as e:
-        log("Swing {} error: {}".format(symbol, e))
-        return None
-
-
-def watch_wyckoff_accumulation(daily, weekly=None):
-    if not daily or len(daily) < 40:
-        return None
-    avg_vol = _avg_vol(daily, 50)
-    price   = daily[-1]["c"]
-    recent  = daily[-40:]
-    lows    = [b["l"] for b in recent]
-    support_levels = []
-    for base_low in lows:
-        touches = sum(1 for l in lows if abs(l - base_low) / (base_low or 1) < 0.018)
-        if touches >= 3:
-            if not any(abs(base_low - e) / (e or 1) < 0.02 for e in support_levels):
-                support_levels.append(base_low)
-    if not support_levels:
-        return None
-    support = max(support_levels, key=lambda lvl: sum(
-        1 for l in lows if abs(l - lvl) / (lvl or 1) < 0.018))
-    touches    = sum(1 for l in lows if abs(l - support) / (support or 1) < 0.018)
-    pct_above  = (price - support) / (support or 1) * 100
-    if not (0 <= pct_above <= 8):
-        return None
-    recent_vol = statistics.mean([b["v"] for b in daily[-10:]])
-    prior_vol  = statistics.mean([b["v"] for b in daily[-30:-10]]) if len(daily) >= 30 else avg_vol
-    vol_quiet  = recent_vol < prior_vol * 0.85
-    stage, _   = weinstein_stage(daily, weekly)
-    if stage == 4:
-        return None
-    prob  = 44
-    prob += 6 if touches >= 4 else 0
-    prob += 4 if touches >= 5 else 0
-    prob += 5 if vol_quiet else 0
-    prob += 4 if stage in (1, 2) else 0
-    prob  = min(prob, 60)
-    swing_high = max(b["h"] for b in recent)
-    retrace, extend = fibonacci_levels(support, swing_high, "CALL")
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-    return {"signal_type": "WATCH_WYCKOFF", "signal_label": "Wyckoff Accum. Zone",
-            "direction": "CALL", "tier": 2, "prob": prob,
-            "swing_low": support, "swing_high": swing_high,
-            "retrace": retrace, "extend": extend,
-            "near_fib_val": nfv, "near_fib_r": nfr, "fib_dist": nfd,
-            "vol_vs_avg": round(recent_vol / avg_vol, 2),
-            "days_since": 0, "earn_gap": 0, "stage": stage,
-            "pct_from_pivot": round(pct_above, 2),
-            "notes": "Support ${:.2f} ({} touches) | {:.1f}% above | {}".format(
-                support, touches, pct_above, "Vol quiet" if vol_quiet else "Watch vol")}
-
-
-def watch_52w_approaching(daily, weekly=None):
-    if not daily or len(daily) < 40:
-        return None
-    price    = daily[-1]["c"]
-    high_52w = _high52w(daily[-252:] if len(daily) >= 252 else daily)
-    avg_vol  = _avg_vol(daily, 50)
-    pct_from_high = (high_52w - price) / (high_52w or 1) * 100
-    if not (1.0 <= pct_from_high <= 12.0):
-        return None
-    tight_bars = [b for b in daily[-30:] if b["c"] >= high_52w * 0.88]
-    if len(tight_bars) < 10:
-        return None
-    consol_vol = statistics.mean([b["v"] for b in daily[-15:]])
-    vol_contracting = consol_vol < avg_vol * 0.88
-    stage, sma_rising = weinstein_stage(daily, weekly)
-    if stage in (3, 4):
-        return None
-    prob  = 40
-    prob += 6 if vol_contracting else 0
-    prob += 6 if pct_from_high < 4.0 else 0
-    prob += 5 if stage == 2 else 0
-    prob += 4 if len(tight_bars) >= 20 else 0
-    prob  = min(prob, 58)
-    consol_low = min(b["l"] for b in daily[-20:])
-    retrace, extend = fibonacci_levels(consol_low, high_52w, "CALL")
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-    return {"signal_type": "WATCH_52W", "signal_label": "Approaching 52W High",
-            "direction": "CALL", "tier": 2, "prob": prob,
-            "swing_low": consol_low, "swing_high": high_52w,
-            "retrace": retrace, "extend": extend,
-            "near_fib_val": nfv, "near_fib_r": nfr, "fib_dist": nfd,
-            "vol_vs_avg": round(consol_vol / avg_vol, 2),
-            "days_since": 0, "earn_gap": 0, "stage": stage,
-            "pct_from_pivot": round(pct_from_high, 2),
-            "notes": "{:.1f}% from 52w high ${:.2f} | {} | Stage {}".format(
-                pct_from_high, high_52w,
-                "Vol contracting" if vol_contracting else "Watch vol", stage)}
-
-
-def watch_earnings_gap_holding(daily, weekly=None):
-    if not daily or len(daily) < 20:
-        return None
-    avg_vol = _avg_vol(daily, 30)
-    price   = daily[-1]["c"]
-    earn_idx = None
-    for i in range(len(daily) - 25, len(daily) - 2):
-        b, prev = daily[i], daily[i-1]
-        gap_pct = (b["o"] - prev["c"]) / (prev["c"] or 1) * 100
-        if b["v"] / (avg_vol or 1) >= 1.8 and gap_pct >= 2.5:
-            earn_idx  = i
-            earn_gap  = gap_pct
-            earn_open = b["o"]
-            break
-    if earn_idx is None:
-        return None
-    days_since = len(daily) - 1 - earn_idx
-    if not (3 <= days_since <= 30):
-        return None
-    if price < earn_open * 0.97:
-        return None
-    post_bars = daily[earn_idx:]
-    pre_bars  = daily[max(0, earn_idx-10):earn_idx]
-    if len(post_bars) < 3 or len(pre_bars) < 3:
-        return None
-    atr_post = _atr(post_bars, min(10, len(post_bars)))
-    atr_pre  = _atr(pre_bars,  min(10, len(pre_bars)))
-    if atr_pre > 0 and atr_post / atr_pre > 1.8:
-        return None
-    stage, _ = weinstein_stage(daily, weekly)
-    if stage == 4:
-        return None
-    prob  = 45
-    prob += 5 if days_since <= 10 else 0
-    prob += 5 if earn_gap > 5.0 else 0
-    prob += 5 if atr_pre > 0 and atr_post / atr_pre < 1.2 else 0
-    prob  = min(prob, 58)
-    pre_earn   = daily[max(0, earn_idx-10):earn_idx]
-    swing_low  = min(b["l"] for b in pre_earn) if pre_earn else daily[earn_idx]["l"]
-    swing_high = max(b["h"] for b in daily[earn_idx:])
-    retrace, extend = fibonacci_levels(swing_low, swing_high, "CALL")
-    nfv, nfr, nfd   = nearest_fib(price, retrace)
-    return {"signal_type": "WATCH_EARNINGS", "signal_label": "Earnings Gap Holding",
-            "direction": "CALL", "tier": 2, "prob": prob,
-            "swing_low": swing_low, "swing_high": swing_high,
-            "retrace": retrace, "extend": extend,
-            "near_fib_val": nfv, "near_fib_r": nfr, "fib_dist": nfd,
-            "vol_vs_avg": round(statistics.mean([b["v"] for b in daily[-5:]]) / (avg_vol or 1), 2),
-            "days_since": days_since, "earn_gap": round(earn_gap, 2), "stage": stage,
-            "pct_from_pivot": 0,
-            "notes": "Gap {:+.1f}% | {} days ago | Holding above ${:.2f}".format(
-                earn_gap, days_since, earn_open)}
-
-_swing_stats           = {}
-_swing_stats_lock      = threading.Lock()
-_swing_fetch_err_count = 0  # rate-limit per-symbol fetch error logging
-
-
-def _swing_stats_bump(key):
-    with _swing_stats_lock:
-        _swing_stats[key] = _swing_stats.get(key, 0) + 1
-
-
-def _swing_stats_reset():
-    global _swing_fetch_err_count
-    with _swing_stats_lock:
-        _swing_stats.clear()
-        _swing_fetch_err_count = 0
-
-
-def _swing_stats_snapshot():
-    with _swing_stats_lock:
-        return dict(_swing_stats)
-
-
-def _log_swing_fetch_err(symbol, kind, detail):
-    """
-    Surface per-symbol Alpaca data-fetch failures with throttling.
-    Without this the swing scan can report "data:0/72" while bare excepts
-    swallow the actual cause (auth, rate limit, status code). Cap at 5
-    lines per scan so a full-universe outage doesn't flood the log.
-    """
-    global _swing_fetch_err_count
-    with _swing_stats_lock:
-        if _swing_fetch_err_count >= 5:
-            return
-        _swing_fetch_err_count += 1
-    log("  swing fetch fail [{}] {}: {}".format(kind, symbol, detail))
-
-
-def _send_weekly_alert(sig):
-    """Telegram alert for a weekly tier-1 setup (current-week settlement)."""
-    opt = sig.get("option") or {}
-    rationale = sig.get("rationale") or {}
-    t1, t2 = sig.get("t1"), sig.get("t2")
-    t1p = sig.get("t1_prob")
-    msg = (
-        "{stype} WEEKLY — {sym} {dirn}  •  ${price}\n"
-        "Exp {exp} ({dte}DTE)  •  conv x{conv:.2f}\n"
-        "T1 {t1}{t1p}  •  T2 {t2}  •  Stop {stop}  •  basis {basis}\n"
-        "RS {rs} vs SPY  •  prob {prob}%{prem}{summ}"
-    ).format(
-        stype = sig.get("signal_type", "SWING"),
-        sym   = sig.get("symbol"),
-        dirn  = sig.get("direction"),
-        price = sig.get("price"),
-        exp   = sig.get("week_expiry", "?"),
-        dte   = sig.get("dte", "?"),
-        conv  = sig.get("conviction", 1.0) or 1.0,
-        t1    = t1 if t1 is not None else "-",
-        t1p   = " ({}%)".format(t1p) if t1p is not None else "",
-        t2    = t2 if t2 is not None else "-",
-        stop  = sig.get("stop", "-"),
-        basis = sig.get("target_basis", "FIB"),
-        rs    = sig.get("rs", sig.get("spy_rs", "?")),
-        prob  = sig.get("prob", "?"),
-        prem  = ("\nPremium ${} strike {}".format(opt["premium"], opt.get("strike"))
-                 if opt.get("premium") else ""),
-        summ  = ("\n" + rationale["summary"]) if rationale.get("summary") else "",
-    )
-    send_telegram(msg)
-
-
-def run_unified_scan(do_intraday=False, do_weekly=False):
-    """Assemble the unified tiered payload from current scanner state.
-
-    The intraday (scan_all_symbols/run_signal_scan) and weekly (run_swing_scan)
-    passes run on their own cadences from the scheduler; this is the single
-    read-side entry point that merges their latest results into one tiered,
-    conviction-ranked payload plus SPX/NDX context. Optionally (re)triggers a
-    pass first when do_intraday / do_weekly is set.
-    """
-    if do_weekly:
-        run_swing_scan()
-    if do_intraday:
-        run_signal_scan()
-
-    with state_lock:
-        intraday = [r for r in all_signals
-                    if r.get("status") in ("SIGNAL", "SIGNAL (no options)")]
-        weekly   = list(swing_signals)
-
-    context = {"index": index_context()}
-    if HAS_SCANNER_CORE:
-        return scanner_core.merge_and_rank(intraday, weekly, context)
-    return {"weekly": weekly, "intraday": intraday, "context": context}
-
-
-def run_swing_scan():
-    """
-    Scan SWING_SYMBOLS concurrently (batches of 4).
-    Updates both swing_signals (used by renderer) and all_swing_signals (used by chat).
-    """
-    global swing_signals, next_swing_scan, all_swing_signals, swing_next_scan_at
-    # Daily bars don't change overnight or on weekends/holidays, so a
-    # 72-symbol Alpaca sweep outside the session is guaranteed-empty
-    # waste. Gate on trading-day + a window that covers premarket + RTH
-    # + the post-close print (~9:00 AM -> 4:15 PM ET).
-    et       = pytz.timezone("America/New_York")
-    et_hour  = datetime.now(et).hour + datetime.now(et).minute / 60.0
-    if not (is_trading_day() and 9.0 <= et_hour <= 16.25):
-        next_swing_scan    = time.time() + SWING_SCAN_INTERVAL
-        swing_next_scan_at = next_swing_scan
-        return
-    _swing_stats_reset()
-    log("=== Swing scan starting ({} symbols) ===".format(len(SWING_SYMBOLS)))
-
-    results      = []
-    results_lock = threading.Lock()
-
-    def worker(sym):
-        sig = scan_swing_symbol(sym)
-        if sig:
-            with results_lock:
-                results.append(sig)
-
-    # Batches of 4 with a 1s pause: 8-wide bursts (2+ requests per symbol)
-    # stacked on top of the 5-min intraday scan were tripping Alpaca's
-    # 200 req/min limit (429s on WMT/HD/XLK/... every overlapping cycle).
-    for i in range(0, len(SWING_SYMBOLS), 4):
-        batch   = SWING_SYMBOLS[i:i + 4]
-        threads = [threading.Thread(target=worker, args=(s,), daemon=True) for s in batch]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=25)
-        time.sleep(1.0)
-
-    type_pri = {"ONEIL_PIVOT": 4, "WYCKOFF_SPRING": 3, "HI52_BREAKOUT": 2, "EARNINGS_CONT": 1}
-    results.sort(key=lambda x: (-x["prob"], -type_pri.get(x["signal_type"], 0)))
-
-    with state_lock:
-        swing_signals      = results
-        next_swing_scan    = time.time() + SWING_SCAN_INTERVAL
-        all_swing_signals  = results
-        swing_next_scan_at = next_swing_scan
-
-    # Resolve live auto positions first (may free the WEEKLY tier).
-    try:
-        monitor_active_positions()
-    except Exception as e:
-        log("monitor_active_positions (weekly) error: {}".format(e))
-
-    # Weekly alerts: up to weekly_max_positions concurrent WEEKLY positions
-    # (one per symbol), and one alert per (symbol, direction, week_expiry) so
-    # a setup never re-fires until its Friday settlement rolls. Fill the free
-    # slots from the top of the prob-sorted list.
-    slots, held_symbols = weekly_alert_capacity()
-    if slots <= 0:
-        log("WEEKLY tier full -- {} live position(s), suppressing alerts".format(
-            len(held_symbols)))
-    else:
-        for sig in results:                         # results sorted by prob desc
-            if slots <= 0:
-                break
-            if sig.get("tier") != 1:
-                continue
-            if sig.get("symbol") in held_symbols:
-                continue                            # one live position per symbol
-            key = (sig.get("symbol"), sig.get("direction"), sig.get("week_expiry"))
-            with _weekly_alert_lock:
-                if key in _weekly_alerted:
-                    continue
-                _weekly_alerted.add(key)
-            try:
-                db_log_signal(sig)
-            except Exception as e:
-                log("weekly db_log_signal error: {}".format(e))
-            try:
-                open_auto_position(sig)
-            except Exception as e:
-                log("weekly open_auto_position error: {}".format(e))
-            if bot_enabled:
-                try:
-                    _send_weekly_alert(sig)
-                except Exception as e:
-                    log("weekly alert error: {}".format(e))
-            held_symbols.add(sig.get("symbol"))
-            slots -= 1
-
-    # Compact filter-stage breakdown -- tells you WHY a 0-setups scan
-    # was 0 (no_data vs earnings_blocked vs no_signal) and which tier-1
-    # detectors fired. Keep keys short so the line is grep-friendly.
-    s = _swing_stats_snapshot()
-    parts = [
-        "data:{}/{}".format(s.get("had_data", 0), len(SWING_SYMBOLS)),
-        "no_data:{}".format(s.get("no_data", 0)),
-        "earn_blk:{}".format(s.get("earnings_blackout", 0)),
-        "no_sig:{}".format(s.get("no_signal", 0)),
-        "t1:{}".format(s.get("tier1", 0)),
-        "t2_only:{}".format(s.get("tier2_only", 0)),
-        "iv_crush:{}".format(s.get("iv_crush", 0)),
-        "det[oneil={} wyckoff={} hi52={} earn={}]".format(
-            s.get("t1_oneil", 0), s.get("t1_wyckoff", 0),
-            s.get("t1_hi52", 0), s.get("t1_earn", 0)),
-    ]
-    if s.get("served_stale"):
-        parts.append("stale:{}".format(s.get("served_stale")))
-    log("Swing scan done: {} setups | {}".format(len(results), " ".join(parts)))
-
-    # A whole-universe data outage is the single most common reason the swing
-    # engine silently goes dark. The per-symbol fetch errors are throttled to
-    # 5 lines/scan, so without this an outage looks identical to a quiet day.
-    # When nobody got data, report the dominant HTTP status so the cause
-    # (429 rate-limit vs 401/403 auth vs 5xx) is unambiguous.
-    if s.get("had_data", 0) == 0:
-        http_counts = {k[5:]: v for k, v in s.items() if k.startswith("http_")}
-        if http_counts:
-            dominant = max(http_counts.items(), key=lambda kv: kv[1])
-            log("Swing universe OUTAGE: 0/{} symbols had data | "
-                "dominant status={} ({} hits) | statuses={}".format(
-                    len(SWING_SYMBOLS), dominant[0], dominant[1],
-                    ", ".join("{}={}".format(k, v) for k, v in
-                              sorted(http_counts.items()))))
-        else:
-            log("Swing universe OUTAGE: 0/{} symbols had data | "
-                "no HTTP status captured (check Alpaca auth / connectivity)".format(
-                    len(SWING_SYMBOLS)))
-
-
-def _build_weekly_section():
-    """Build the WEEKLY/PRIMARY tier as an embeddable HTML section.
-
-    Returns just the inner section (header + legend + cards), no page wrapper,
-    so it can be dropped into the single unified dashboard alongside the
-    intraday/0DTE tier. (Formerly render_swing_dashboard, a standalone page.)
-    """
-    with state_lock:
-        sigs = list(swing_signals)
-        secs = max(0, int(next_swing_scan - time.time()))
-
-    type_labels = {
-        "ONEIL_PIVOT":    ("O'NEIL PIVOT",   "#2d1b69", "#a371f7"),
-        "WYCKOFF_SPRING": ("WYCKOFF SPRING", "#1a3a2a", "#3fb950"),
-        "HI52_BREAKOUT":  ("52W BREAKOUT",   "#1f3d5c", "#58a6ff"),
-        "EARNINGS_CONT":  ("EARN CONT",      "#3d2800", "#e3b341"),
-        "WATCH_ONEIL":    ("BASE FORMING",   "#1e1e2e", "#8b5cf6"),
-        "WATCH_WYCKOFF":  ("ACCUM ZONE",     "#0d2010", "#22c55e"),
-        "WATCH_52W":      ("NEAR 52W HIGH",  "#0d2038", "#38bdf8"),
-        "WATCH_EARNINGS": ("GAP HOLDING",    "#2a1800", "#fb923c"),
-    }
-
-
-    tier1_render = [s for s in sigs if s.get("tier", 1) == 1]
-    tier2_render = [s for s in sigs if s.get("tier", 2) == 2]
-
-    t1_cards = ""
-    for s in tier1_render:
-        cards_html = ""
-        prob      = s["prob"]
-        direction = s["direction"]
-        price     = s["price"]
-        symbol    = s["symbol"]
-        sig_type  = s.get("signal_type", "")
-        sig_label = s.get("signal_label", sig_type)
-        notes     = s.get("notes", "")
-        stage     = s.get("stage")
-        opt       = s.get("option") or {}
-
-        # Probability color
-        if prob >= 70:
-            prob_color = "#3fb950"
-        elif prob >= 55:
-            prob_color = "#e3b341"
-        else:
-            prob_color = "#f85149"
-
-        dir_color = "#3fb950" if direction == "CALL" else "#f85149"
-        dir_arrow = "&#9650;" if direction == "CALL" else "&#9660;"
-
-        # Signal type badge (primary)
-        lbl, bg, fg = type_labels.get(sig_type, (sig_type, "#21262d", "#8b949e"))
-        badges = ("<span style='background:{};color:{};font-size:9px;font-weight:700;"
-                  "text-transform:uppercase;letter-spacing:.6px;padding:2px 7px;"
-                  "border-radius:3px;margin-right:4px'>{}</span>").format(bg, fg, lbl)
-
-        # Additional signal badges
-        for extra_type in s.get("all_types", []):
-            if extra_type == sig_type:
-                continue
-            el, ebg, efg = type_labels.get(extra_type, (extra_type, "#21262d", "#8b949e"))
-            badges += ("<span style='background:{};color:{};font-size:9px;font-weight:600;"
-                       "padding:2px 6px;border-radius:3px;margin-right:3px;opacity:.7'>{}</span>"
-                       ).format(ebg, efg, el)
-
-        # Stage badge
-        stage_badge = ""
-        if stage:
-            sc = "#3fb950" if stage == 2 else "#e3b341" if stage == 1 else "#f85149"
-            stage_badge = ("<span style='background:#0d1117;color:{};font-size:9px;"
-                           "font-weight:700;padding:2px 7px;border-radius:3px;"
-                           "border:1px solid {};margin-right:4px'>STAGE {}</span>"
-                           ).format(sc, sc, stage)
-
-        # Horizon / product-class / conviction / target-basis badges
-        _hz   = s.get("horizon", "WEEKLY")
-        _pc   = s.get("product_class", "")
-        _conv = s.get("conviction")
-        _basis = s.get("target_basis")
-        stage_badge += ("<span style='background:#0d1117;color:#58a6ff;font-size:9px;"
-                        "font-weight:700;padding:2px 7px;border-radius:3px;"
-                        "border:1px solid #1f3d5c;margin-right:4px'>{} {}</span>"
-                        ).format(_hz, _pc).replace("  ", " ")
-        if _conv is not None:
-            _cc = "#3fb950" if _conv >= 1.0 else "#e3b341" if _conv >= 0.7 else "#f85149"
-            stage_badge += ("<span style='background:#0d1117;color:{};font-size:9px;"
-                            "font-weight:700;padding:2px 7px;border-radius:3px;"
-                            "border:1px solid {};margin-right:4px'>conv x{:.2f}</span>"
-                            ).format(_cc, _cc, _conv)
-        if _basis:
-            stage_badge += ("<span style='background:#0d1117;color:#a371f7;font-size:9px;"
-                            "font-weight:700;padding:2px 7px;border-radius:3px;"
-                            "border:1px solid #2d1b69;margin-right:4px'>{}</span>"
-                            ).format(_basis)
-        _vo = s.get("vol_oi")
-        if _vo and _vo.get("flag") in ("ELEVATED", "UNUSUAL"):
-            _voc = "#f0883e" if _vo["flag"] == "UNUSUAL" else "#e3b341"
-            stage_badge += ("<span style='background:#0d1117;color:{c};font-size:9px;"
-                            "font-weight:700;padding:2px 7px;border-radius:3px;"
-                            "border:1px solid {c};margin-right:4px' "
-                            "title='Alpaca volume vs Databento OI'>VOL/OI {r} {f}</span>"
-                            ).format(c=_voc, r=_vo.get("ratio"), f=_vo["flag"])
-
-        # Fib extensions block
-        extend = s.get("extend", {})
-        fib_html = ""
-        if extend:
-            if direction == "CALL":
-                ext_items = sorted([(k, v) for k, v in extend.items() if v > price],
-                                   key=lambda x: x[1])[:3]
-            else:
-                ext_items = sorted([(k, v) for k, v in extend.items() if v < price],
-                                   key=lambda x: x[1], reverse=True)[:3]
-            if ext_items:
-                fib_lines = "".join(
-                    "<div style='display:flex;justify-content:space-between'>"
-                    "<span style='color:#8b949e'>{} ext</span>"
-                    "<span style='color:#e6edf3;font-family:monospace'>${:.2f}</span></div>"
-                    .format(k, v) for k, v in ext_items)
-                fib_html = """
-<div style='background:#0d1117;border-radius:6px;padding:8px 10px;margin-bottom:8px'>
-  <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-              letter-spacing:.6px;margin-bottom:5px'>Fibonacci Extension Targets</div>
-  <div style='font-size:11px'>{fib_lines}</div>
-  <div style='font-size:10px;color:#8b949e;margin-top:4px'>
-    Base: ${low:.2f} &ndash; ${high:.2f}
-  </div>
-</div>""".format(
-                    fib_lines = fib_lines,
-                    low       = s.get("swing_low")  or 0,
-                    high      = s.get("swing_high") or 0)
-
-        # Option section
-        opt_html = ""
-        if opt.get("premium"):
-            exp_short = (opt.get("expiry") or "")[-5:].replace("-", "/")
-            prem      = opt["premium"]
-            opt_html = """
-<div style='background:#0d1117;border-radius:6px;padding:8px 10px;
-            border:1px solid #238636;margin-bottom:8px'>
-  <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-              letter-spacing:.6px;margin-bottom:4px'>
-    Recommended Option &nbsp;
-    <span style='color:#e3b341'>{dte} DTE &nbsp; exp {exp}</span>
-  </div>
-  <div style='display:flex;justify-content:space-between;align-items:center'>
-    <div>
-      <span style='font-size:16px;font-weight:700;font-family:monospace'>${prem:.2f}</span>
-      <span style='font-size:10px;color:#8b949e;margin-left:6px'>premium</span>
-    </div>
-    <div style='text-align:right;font-size:11px'>
-      <div style='color:#e6edf3'>Strike ${strike} {dir}</div>
-      <div style='color:#8b949e'>Delta {delta:.2f} &nbsp; IV {iv}%</div>
-    </div>
-  </div>
-  <div style='font-size:10px;color:#8b949e;margin-top:4px'>
-    Stop if premium &lt; <span style='color:#f85149'>${stp:.2f}</span>
-    &nbsp;&nbsp; Target 2x <span style='color:#3fb950'>${tgt:.2f}</span>
-    &nbsp;&nbsp; Bid/Ask ${bid}/{ask}
-  </div>
-</div>""".format(
-                dte    = opt.get("dte", "?"),
-                exp    = exp_short,
-                prem   = prem,
-                strike = opt.get("strike", "?"),
-                dir    = direction,
-                delta  = opt.get("delta") or 0,
-                iv     = opt.get("iv") or 0,
-                stp    = round(prem * 0.45, 2),
-                tgt    = round(prem * 2.0,  2),
-                bid    = opt.get("bid", "-"),
-                ask    = opt.get("ask", "-"))
-        else:
-            opt_html = ("<div style='background:#0d1117;border-radius:6px;padding:8px 10px;"
-                        "border:1px solid #30363d;font-size:11px;color:#8b949e;"
-                        "margin-bottom:8px'>No options data &mdash; "
-                        "check broker for this-week {dir} expiry</div>").format(dir=direction)
-
-        # RS badge
-        rs     = s.get("spy_rs") or 0
-        rs_col = "#3fb950" if rs > 0 else "#f85149"
-        rs_txt = "{:+.1f}% vs SPY".format(rs)
-
-        # R:R badge
-        rr1    = s.get("rr1") or 0
-        rr_col = "#3fb950" if rr1 >= 2 else "#e3b341" if rr1 >= 1 else "#8b949e"
-
-        cards_html += """
-<div style='background:#161b22;border:1px solid #30363d;border-radius:10px;
-            margin-bottom:14px;padding:14px'>
-  <div style='display:flex;justify-content:space-between;align-items:flex-start;
-              margin-bottom:10px'>
-    <div>
-      <span style='font-size:20px;font-weight:800;letter-spacing:-.3px'>{sym}</span>
-      <span style='color:{dc};font-size:13px;font-weight:700;margin-left:8px'>
-        {darrow} {direction}
-      </span>
-      <div style='margin-top:6px;display:flex;flex-wrap:wrap;gap:3px;align-items:center'>
-        {badges}
-        {stage_badge}
-      </div>
-    </div>
-    <div style='text-align:right'>
-      <div style='font-size:26px;font-weight:800;color:{pc};line-height:1'>{prob}%</div>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px'>probability</div>
-      <div style='font-size:10px;margin-top:3px'>
-        <span style='color:{rrc}'>{rr:.1f}:1 R:R</span>
-        &nbsp; <span style='color:{rsc}'>{rs_txt}</span>
-      </div>
-    </div>
-  </div>
-
-  <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px'>
-    <div style='background:#0d1117;border-radius:6px;padding:8px'>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Price</div>
-      <div style='font-size:15px;font-weight:700;font-family:monospace'>${price}</div>
-      <div style='font-size:10px;color:#f85149;margin-top:2px'>Stop ${stop}</div>
-    </div>
-    <div style='background:#0d1117;border-radius:6px;padding:8px'>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Targets ({basis})</div>
-      <div style='font-size:11px;line-height:1.7'>
-        <span style='color:#8b949e'>T1 </span>
-        <span style='color:#58a6ff;font-family:monospace'>${t1}</span>
-        <span style='color:#6e7681'>{t1p}</span><br>
-        <span style='color:#8b949e'>T2 </span>
-        <span style='color:#a371f7;font-family:monospace'>${t2}</span>
-        <span style='color:#6e7681'>{t2p}</span><br>
-        <span style='color:#8b949e'>T3 </span>
-        <span style='color:#3fb950;font-family:monospace'>${t3}</span>
-      </div>
-    </div>
-    <div style='background:#0d1117;border-radius:6px;padding:8px'>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Vol / Near Fib</div>
-      <div style='font-size:12px;font-weight:700;color:#e3b341'>
-        {vol}x avg
-      </div>
-      <div style='font-size:10px;color:#8b949e;margin-top:2px'>
-        {nfr} level &nbsp; {nfd}% away
-      </div>
-    </div>
-  </div>
-
-  {fib_html}
-  {opt_html}
-
-  <div style='font-size:10px;color:#8b949e;border-top:1px solid #21262d;padding-top:8px'>
-    {notes}
-  </div>
-</div>""".format(
-            sym        = symbol,
-            dc         = dir_color,
-            darrow     = dir_arrow,
-            direction  = direction,
-            badges     = badges,
-            stage_badge= stage_badge,
-            prob       = prob,
-            pc         = prob_color,
-            rr         = rr1,
-            rrc        = rr_col,
-            rs_txt     = rs_txt,
-            rsc        = rs_col,
-            price      = price,
-            stop       = s.get("stop", "?"),
-            t1         = s.get("t1") or "-",
-            t2         = s.get("t2") or "-",
-            t3         = s.get("t3") or "-",
-            t1p        = "({}%)".format(s.get("t1_prob")) if s.get("t1_prob") is not None else "",
-            t2p        = "({}%)".format(s.get("t2_prob")) if s.get("t2_prob") is not None else "",
-            basis      = s.get("target_basis") or "FIB",
-            vol        = s.get("vol_vs_avg") or "-",
-            nfr        = s.get("near_fib_r") or "-",
-            nfd        = s.get("fib_dist")   or "-",
-            fib_html   = fib_html,
-            opt_html   = opt_html,
-            notes      = notes,
-        )
-        t1_cards += cards_html
-
-    t2_cards = ""
-    for s in tier2_render:
-        cards_html = ""
-        prob      = s["prob"]
-        direction = s["direction"]
-        price     = s["price"]
-        symbol    = s["symbol"]
-        sig_type  = s.get("signal_type", "")
-        sig_label = s.get("signal_label", sig_type)
-        notes     = s.get("notes", "")
-        stage     = s.get("stage")
-        opt       = s.get("option") or {}
-
-        # Probability color
-        if prob >= 70:
-            prob_color = "#3fb950"
-        elif prob >= 55:
-            prob_color = "#e3b341"
-        else:
-            prob_color = "#f85149"
-
-        dir_color = "#3fb950" if direction == "CALL" else "#f85149"
-        dir_arrow = "&#9650;" if direction == "CALL" else "&#9660;"
-
-        # Signal type badge (primary)
-        lbl, bg, fg = type_labels.get(sig_type, (sig_type, "#21262d", "#8b949e"))
-        badges = ("<span style='background:{};color:{};font-size:9px;font-weight:700;"
-                  "text-transform:uppercase;letter-spacing:.6px;padding:2px 7px;"
-                  "border-radius:3px;margin-right:4px'>{}</span>").format(bg, fg, lbl)
-
-        # Additional signal badges
-        for extra_type in s.get("all_types", []):
-            if extra_type == sig_type:
-                continue
-            el, ebg, efg = type_labels.get(extra_type, (extra_type, "#21262d", "#8b949e"))
-            badges += ("<span style='background:{};color:{};font-size:9px;font-weight:600;"
-                       "padding:2px 6px;border-radius:3px;margin-right:3px;opacity:.7'>{}</span>"
-                       ).format(ebg, efg, el)
-
-        # Stage badge
-        stage_badge = ""
-        if stage:
-            sc = "#3fb950" if stage == 2 else "#e3b341" if stage == 1 else "#f85149"
-            stage_badge = ("<span style='background:#0d1117;color:{};font-size:9px;"
-                           "font-weight:700;padding:2px 7px;border-radius:3px;"
-                           "border:1px solid {};margin-right:4px'>STAGE {}</span>"
-                           ).format(sc, sc, stage)
-
-        # Horizon / product-class / conviction / target-basis badges
-        _hz   = s.get("horizon", "WEEKLY")
-        _pc   = s.get("product_class", "")
-        _conv = s.get("conviction")
-        _basis = s.get("target_basis")
-        stage_badge += ("<span style='background:#0d1117;color:#58a6ff;font-size:9px;"
-                        "font-weight:700;padding:2px 7px;border-radius:3px;"
-                        "border:1px solid #1f3d5c;margin-right:4px'>{} {}</span>"
-                        ).format(_hz, _pc).replace("  ", " ")
-        if _conv is not None:
-            _cc = "#3fb950" if _conv >= 1.0 else "#e3b341" if _conv >= 0.7 else "#f85149"
-            stage_badge += ("<span style='background:#0d1117;color:{};font-size:9px;"
-                            "font-weight:700;padding:2px 7px;border-radius:3px;"
-                            "border:1px solid {};margin-right:4px'>conv x{:.2f}</span>"
-                            ).format(_cc, _cc, _conv)
-        if _basis:
-            stage_badge += ("<span style='background:#0d1117;color:#a371f7;font-size:9px;"
-                            "font-weight:700;padding:2px 7px;border-radius:3px;"
-                            "border:1px solid #2d1b69;margin-right:4px'>{}</span>"
-                            ).format(_basis)
-        _vo = s.get("vol_oi")
-        if _vo and _vo.get("flag") in ("ELEVATED", "UNUSUAL"):
-            _voc = "#f0883e" if _vo["flag"] == "UNUSUAL" else "#e3b341"
-            stage_badge += ("<span style='background:#0d1117;color:{c};font-size:9px;"
-                            "font-weight:700;padding:2px 7px;border-radius:3px;"
-                            "border:1px solid {c};margin-right:4px' "
-                            "title='Alpaca volume vs Databento OI'>VOL/OI {r} {f}</span>"
-                            ).format(c=_voc, r=_vo.get("ratio"), f=_vo["flag"])
-
-        # Fib extensions block
-        extend = s.get("extend", {})
-        fib_html = ""
-        if extend:
-            if direction == "CALL":
-                ext_items = sorted([(k, v) for k, v in extend.items() if v > price],
-                                   key=lambda x: x[1])[:3]
-            else:
-                ext_items = sorted([(k, v) for k, v in extend.items() if v < price],
-                                   key=lambda x: x[1], reverse=True)[:3]
-            if ext_items:
-                fib_lines = "".join(
-                    "<div style='display:flex;justify-content:space-between'>"
-                    "<span style='color:#8b949e'>{} ext</span>"
-                    "<span style='color:#e6edf3;font-family:monospace'>${:.2f}</span></div>"
-                    .format(k, v) for k, v in ext_items)
-                fib_html = """
-<div style='background:#0d1117;border-radius:6px;padding:8px 10px;margin-bottom:8px'>
-  <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-              letter-spacing:.6px;margin-bottom:5px'>Fibonacci Extension Targets</div>
-  <div style='font-size:11px'>{fib_lines}</div>
-  <div style='font-size:10px;color:#8b949e;margin-top:4px'>
-    Base: ${low:.2f} &ndash; ${high:.2f}
-  </div>
-</div>""".format(
-                    fib_lines = fib_lines,
-                    low       = s.get("swing_low")  or 0,
-                    high      = s.get("swing_high") or 0)
-
-        # Option section
-        opt_html = ""
-        if opt.get("premium"):
-            exp_short = (opt.get("expiry") or "")[-5:].replace("-", "/")
-            prem      = opt["premium"]
-            opt_html = """
-<div style='background:#0d1117;border-radius:6px;padding:8px 10px;
-            border:1px solid #238636;margin-bottom:8px'>
-  <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-              letter-spacing:.6px;margin-bottom:4px'>
-    Recommended Option &nbsp;
-    <span style='color:#e3b341'>{dte} DTE &nbsp; exp {exp}</span>
-  </div>
-  <div style='display:flex;justify-content:space-between;align-items:center'>
-    <div>
-      <span style='font-size:16px;font-weight:700;font-family:monospace'>${prem:.2f}</span>
-      <span style='font-size:10px;color:#8b949e;margin-left:6px'>premium</span>
-    </div>
-    <div style='text-align:right;font-size:11px'>
-      <div style='color:#e6edf3'>Strike ${strike} {dir}</div>
-      <div style='color:#8b949e'>Delta {delta:.2f} &nbsp; IV {iv}%</div>
-    </div>
-  </div>
-  <div style='font-size:10px;color:#8b949e;margin-top:4px'>
-    Stop if premium &lt; <span style='color:#f85149'>${stp:.2f}</span>
-    &nbsp;&nbsp; Target 2x <span style='color:#3fb950'>${tgt:.2f}</span>
-    &nbsp;&nbsp; Bid/Ask ${bid}/{ask}
-  </div>
-</div>""".format(
-                dte    = opt.get("dte", "?"),
-                exp    = exp_short,
-                prem   = prem,
-                strike = opt.get("strike", "?"),
-                dir    = direction,
-                delta  = opt.get("delta") or 0,
-                iv     = opt.get("iv") or 0,
-                stp    = round(prem * 0.45, 2),
-                tgt    = round(prem * 2.0,  2),
-                bid    = opt.get("bid", "-"),
-                ask    = opt.get("ask", "-"))
-        else:
-            opt_html = ("<div style='background:#0d1117;border-radius:6px;padding:8px 10px;"
-                        "border:1px solid #30363d;font-size:11px;color:#8b949e;"
-                        "margin-bottom:8px'>No options data &mdash; "
-                        "check broker for this-week {dir} expiry</div>").format(dir=direction)
-
-        # RS badge
-        rs     = s.get("spy_rs") or 0
-        rs_col = "#3fb950" if rs > 0 else "#f85149"
-        rs_txt = "{:+.1f}% vs SPY".format(rs)
-
-        # R:R badge
-        rr1    = s.get("rr1") or 0
-        rr_col = "#3fb950" if rr1 >= 2 else "#e3b341" if rr1 >= 1 else "#8b949e"
-
-        cards_html += """
-<div style='background:#161b22;border:1px solid #30363d;border-radius:10px;
-            margin-bottom:14px;padding:14px'>
-  <div style='display:flex;justify-content:space-between;align-items:flex-start;
-              margin-bottom:10px'>
-    <div>
-      <span style='font-size:20px;font-weight:800;letter-spacing:-.3px'>{sym}</span>
-      <span style='color:{dc};font-size:13px;font-weight:700;margin-left:8px'>
-        {darrow} {direction}
-      </span>
-      <div style='margin-top:6px;display:flex;flex-wrap:wrap;gap:3px;align-items:center'>
-        {badges}
-        {stage_badge}
-      </div>
-    </div>
-    <div style='text-align:right'>
-      <div style='font-size:26px;font-weight:800;color:{pc};line-height:1'>{prob}%</div>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px'>probability</div>
-      <div style='font-size:10px;margin-top:3px'>
-        <span style='color:{rrc}'>{rr:.1f}:1 R:R</span>
-        &nbsp; <span style='color:{rsc}'>{rs_txt}</span>
-      </div>
-    </div>
-  </div>
-
-  <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px'>
-    <div style='background:#0d1117;border-radius:6px;padding:8px'>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Price</div>
-      <div style='font-size:15px;font-weight:700;font-family:monospace'>${price}</div>
-      <div style='font-size:10px;color:#f85149;margin-top:2px'>Stop ${stop}</div>
-    </div>
-    <div style='background:#0d1117;border-radius:6px;padding:8px'>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Targets ({basis})</div>
-      <div style='font-size:11px;line-height:1.7'>
-        <span style='color:#8b949e'>T1 </span>
-        <span style='color:#58a6ff;font-family:monospace'>${t1}</span>
-        <span style='color:#6e7681'>{t1p}</span><br>
-        <span style='color:#8b949e'>T2 </span>
-        <span style='color:#a371f7;font-family:monospace'>${t2}</span>
-        <span style='color:#6e7681'>{t2p}</span><br>
-        <span style='color:#8b949e'>T3 </span>
-        <span style='color:#3fb950;font-family:monospace'>${t3}</span>
-      </div>
-    </div>
-    <div style='background:#0d1117;border-radius:6px;padding:8px'>
-      <div style='font-size:9px;color:#8b949e;text-transform:uppercase;
-                  letter-spacing:.5px;margin-bottom:3px'>Vol / Near Fib</div>
-      <div style='font-size:12px;font-weight:700;color:#e3b341'>
-        {vol}x avg
-      </div>
-      <div style='font-size:10px;color:#8b949e;margin-top:2px'>
-        {nfr} level &nbsp; {nfd}% away
-      </div>
-    </div>
-  </div>
-
-  {fib_html}
-  {opt_html}
-
-  <div style='font-size:10px;color:#8b949e;border-top:1px solid #21262d;padding-top:8px'>
-    {notes}
-  </div>
-</div>""".format(
-            sym        = symbol,
-            dc         = dir_color,
-            darrow     = dir_arrow,
-            direction  = direction,
-            badges     = badges,
-            stage_badge= stage_badge,
-            prob       = prob,
-            pc         = prob_color,
-            rr         = rr1,
-            rrc        = rr_col,
-            rs_txt     = rs_txt,
-            rsc        = rs_col,
-            price      = price,
-            stop       = s.get("stop", "?"),
-            t1         = s.get("t1") or "-",
-            t2         = s.get("t2") or "-",
-            t3         = s.get("t3") or "-",
-            t1p        = "({}%)".format(s.get("t1_prob")) if s.get("t1_prob") is not None else "",
-            t2p        = "({}%)".format(s.get("t2_prob")) if s.get("t2_prob") is not None else "",
-            basis      = s.get("target_basis") or "FIB",
-            vol        = s.get("vol_vs_avg") or "-",
-            nfr        = s.get("near_fib_r") or "-",
-            nfd        = s.get("fib_dist")   or "-",
-            fib_html   = fib_html,
-            opt_html   = opt_html,
-            notes      = notes,
-        )
-        t2_cards += cards_html
-
-    t2_section = ""
-    if t2_cards:
-        t2_section = (
-            "<div style='margin-top:24px'>"
-            "<div style='font-size:10px;font-weight:700;color:#8b949e;"
-            "text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px'>"
-            "WATCHLIST &mdash; {n} PATTERNS FORMING"
-            "</div>"
-            "<div style='font-size:10px;color:#8b949e;margin-bottom:10px'>"
-            "Not yet triggered &mdash; wait for the breakout / spring before entering."
-            "</div><div style='opacity:.82'>{body}</div></div>"
-        ).format(n=len(tier2_render), body=t2_cards)
-
-    cards_html = t1_cards + t2_section
-
-    if not cards_html:
-        cards_html = ("<div style='padding:28px;text-align:center;color:#8b949e;font-size:13px'>"
-                      "Weekly scan running... check back in a moment.<br>"
-                      "<a href='/' style='color:#58a6ff;font-size:11px;margin-top:8px;"
-                      "display:block'>Refresh</a></div>")
-
-    next_str = "{}s".format(secs) if secs > 0 else "running now"
-
-    return """
-<div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;
-            letter-spacing:.8px;margin-bottom:4px;margin-top:4px'>
-  PRIMARY &mdash; WEEKLY ({nsig} SETUP{pl}, SPY/QQQ + RS-RANKED STOCKS)
-  <span style='color:#6e7681;font-weight:400;text-transform:none'>
-    &nbsp;|&nbsp; next scan {next}</span>
-</div>
-<div style='font-size:10px;color:#8b949e;margin-bottom:10px'>
-  <span style='color:#a371f7'>&#9632; O'Neil Pivot</span> &nbsp;
-  <span style='color:#3fb950'>&#9632; Wyckoff Spring</span> &nbsp;
-  <span style='color:#58a6ff'>&#9632; 52-Week Breakout</span> &nbsp;
-  <span style='color:#e3b341'>&#9632; Earnings Cont.</span>
-  &nbsp;&nbsp;|&nbsp;&nbsp; Stage 1/2 filtered &nbsp;|&nbsp;&nbsp;
-  Stops at 0.618 fib &nbsp;|&nbsp;&nbsp; Current-week Friday settlement (rides to 0DTE)
-</div>
-{cards}""".format(
-        nsig  = len(sigs),
-        next  = next_str,
-        pl    = "S" if len(sigs) != 1 else "",
-        cards = cards_html,
-    )
-
-
-# =============================================
-# END SWING SCANNER
-# =============================================
-
 def _refresh_market_state():
     """
     Refresh regime, premarket brief, and GEX bias.
@@ -7277,7 +4838,7 @@ def _refresh_volume_profiles():
     if not HAS_VOLUME_TRUTH:
         return
     try:
-        all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
+        all_syms = list(SYMBOLS)
         built, failed = volume_truth.refresh_all(all_syms)
         log("Volume profiles refreshed for {} symbols".format(len(built)))
         if failed:
@@ -7288,28 +4849,6 @@ def _refresh_volume_profiles():
                 len(failed), ", ".join(sorted(failed))))
     except Exception as e:
         log("volume profile refresh error: {}".format(e))
-
-
-def _refresh_earnings_calendar():
-    """Once-daily refresh of upcoming earnings dates via yfinance."""
-    if not HAS_SAFETY_GATES:
-        return
-    try:
-        all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
-        ok_count = 0
-        for s in all_syms:
-            if safety_gates.update_earnings_calendar(s):
-                ok_count += 1
-        msg = "Earnings calendar refreshed for {}/{} symbols".format(
-            ok_count, len(all_syms))
-        # A 0/N run means the provider (Yahoo/yfinance) is failing for every
-        # symbol -- surface the captured reason instead of a silent zero.
-        last_err = getattr(safety_gates, "LAST_EARNINGS_ERROR", None)
-        if ok_count == 0 and last_err:
-            msg += " | last_error={}".format(last_err)
-        log(msg)
-    except Exception as e:
-        log("earnings calendar refresh error: {}".format(e))
 
 
 def _sweep_marker_get(key):
@@ -7481,7 +5020,7 @@ def _refresh_oi_snapshots():
                   until=_da.billing_status().get("blocked_until"))
         return
 
-    all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
+    all_syms = list(SYMBOLS)
     ok_count      = 0
     empty_count   = 0   # chain pull returned nothing
     save_fails    = 0   # chain arrived but no rows persisted
@@ -7586,7 +5125,7 @@ def _refresh_iv_snapshots():
     if not HAS_IV_RANK:
         return
     try:
-        all_syms = list(set(SYMBOLS + SWING_SYMBOLS))
+        all_syms = list(SYMBOLS)
         ok = 0
         no_spot = []
         no_iv   = []
@@ -7643,7 +5182,7 @@ def _run_iv_backfill_once():
         pytz.timezone("America/New_York")).date().isoformat()
 
     need = []
-    for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
+    for sym in sorted(SYMBOLS):
         # Structural no-data names (no OPRA history despite a paid pull)
         # carry a per-symbol marker so retries don't re-bill dead queries.
         if _sweep_marker_get("ivbf_nodata_" + sym):
@@ -7710,7 +5249,7 @@ def _run_iv_backfill_once():
 #   - Overnight ES/NQ range + inventory classification
 #   - VIX previous close → regime classification
 #   - GEX snapshot from yesterday's close
-#   - High-IVR watchlist (earnings setups)
+#   - High-IVR flags on the SPY/QQQ products (VRP read)
 #   - Strategy-enable matrix for today
 #
 # Cost: roughly 1 MB of historical data per run = under $0.10/day.
@@ -7736,13 +5275,13 @@ def run_premarket_brief():
         gex_bias       = _market_state.get("gex_bias")
         index_insights = _market_state.get("index_insights") or {}
 
-    # Top high-IVR names for earnings IV crush watchlist. Each entry is
+    # High-IVR flags on the tradeable products. Each entry is
     # (symbol, iv_rank, iv_rv_ratio, vrp_favorable). VRP-favorable names
     # bubble to the top of the brief.
     high_ivr = []
     if HAS_IV_RANK:
         try:
-            for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
+            for sym in sorted(SYMBOLS):
                 d = iv_rank.compute_iv_rank(sym)
                 if d and d["iv_rank"] >= 70:
                     high_ivr.append((
@@ -7850,9 +5389,9 @@ def run_premarket_brief():
     # Strategy matrix for today
     if regime and regime.get("rules"):
         rules = regime["rules"]
-        enabled  = [k for k in ("orb","vwap_trend","vwap_mr","ib_extension","swing_breakout")
+        enabled  = [k for k in ("orb","vwap_trend","vwap_mr","ib_extension")
                     if rules.get(k)]
-        disabled = [k for k in ("orb","vwap_trend","vwap_mr","ib_extension","swing_breakout")
+        disabled = [k for k in ("orb","vwap_trend","vwap_mr","ib_extension")
                     if not rules.get(k)]
         msg_lines.append("STRATEGIES TODAY:")
         if enabled:
@@ -7862,9 +5401,9 @@ def run_premarket_brief():
         msg_lines.append("  Conviction: x{:.2f}".format(rules.get("conviction_multiplier", 1.0)))
         msg_lines.append("")
 
-    # Top IVR for earnings IV crush. Tag with VRP ratio so we can see at a
-    # glance whether IV is actually rich vs realized -- a 70 IVR with a 1.0
-    # ratio is a trap (vol earned what it priced).
+    # Tag high IVR with the VRP ratio so we can see at a glance whether IV
+    # is actually rich vs realized -- a 70 IVR with a 1.0 ratio is a trap
+    # (vol earned what it priced).
     if high_ivr:
         msg_lines.append("HIGH IV RANK (>70):")
         for sym, ivr, ratio, vrp_ok in high_ivr:
@@ -8030,8 +5569,7 @@ def _intraday_regime_recheck():
 
       * De-risk (escalate): a sharp intraday vol expansion that implies a more
         hostile regime than the live label force-flips UP to ELEVATED (mean
-        reversion off, conviction trimmed) or CRISIS (also swing breakouts
-        off). Strictly monotonic -- we only escalate intraday, never relax, and
+        reversion off, conviction trimmed) or CRISIS. Strictly monotonic -- we only escalate intraday, never relax, and
         never re-fire for a regime already reached today. This is the gap the
         old once-at-10:30 unlock left open: a NORMAL/LOW_VOL morning that turns
         violent used to keep trading mean reversion into the spike.
@@ -8072,13 +5610,12 @@ def _intraday_regime_recheck():
         target_rank = regime_filter.regime_rank(target)
         if (target_rank > cur_rank
                 and target_rank > _regime_recheck_done.get("escalated_rank", -1)):
-            extra = " Swing breakouts halted." if target == "CRISIS" else ""
             _apply_intraday_regime(
                 target, rv_intra, rv20,
                 "INTRADAY_DERISK to {}.".format(target),
                 ("Intraday vol spiking ({:.1f}% vs RV20 {:.1f}%).\n"
                  "Mean reversion disabled, conviction trimmed for the rest of "
-                 "the session.{}").format(rv_intra, rv20, extra))
+                 "the session.").format(rv_intra, rv20))
             _regime_recheck_done["escalated_rank"] = target_rank
         return
 
@@ -8137,7 +5674,7 @@ def _check_overnight_gamma_reversal():
         log("overnight gamma check error: {}".format(e))
 
 
-_daily_refresh_done = {"date": None, "vol": False, "earnings": False}
+_daily_refresh_done = {"date": None, "vol": False}
 _premarket_done     = {"date": None}
 _overnight_done     = {"date": None}
 
@@ -8160,6 +5697,58 @@ _ib_unlock_lock = threading.Lock()
 _regime_recheck_done = {"date": None, "unlocked": False, "escalated_rank": -1}
 
 
+def vol1d_updater_loop():
+    """Dedicated fast loop (~vol1d.update_secs, default 15s) computing the
+    VIX1D proxy state through RTH and publishing it into _market_state.
+
+    This is the only fast-cadence component in the engine — the 5-min scan
+    and the nightly GEX build stay untouched. The chain source is CBOE's
+    free delayed-quotes CDN, so cadence costs bandwidth, not money. Outside
+    RTH (or on holidays) the loop idles; the last state of the session
+    stays readable until the next open.
+    """
+    if not HAS_VOL1D:
+        return
+    log("vol1d updater started (interval {}s, enforce={})".format(
+        vol1d_config.get_config()["update_secs"],
+        vol1d_config.get_config()["enforce"]))
+    updater = None
+    et = pytz.timezone("America/New_York")
+    while True:
+        interval = vol1d_config.get_config()["update_secs"]
+        try:
+            now = datetime.now(et)
+            et_hour = now.hour + now.minute / 60.0
+            if is_trading_day() and 9.5 <= et_hour < 16.05:
+                if updater is None:
+                    updater = vol1d_state.Vol1DUpdater()
+                with _market_state_lock:
+                    gex = _market_state.get("gex_bias")
+                st = updater.compute_once(gex_bias=gex)
+                if st is not None:
+                    with _market_state_lock:
+                        _market_state["vol1d"]    = st
+                        _market_state["vol1d_ts"] = time.time()
+                        # Intraday index GEX rides the same pass. Published
+                        # separately — the nightly gex_bias and its
+                        # consumers stay untouched.
+                        _market_state["gex_live"] = updater.gex_live
+            else:
+                # Fresh accumulators next session; idle at a slow tick.
+                updater = None
+                interval = max(interval, 60)
+        except Exception as e:
+            log("vol1d updater error: {}".format(e))
+        time.sleep(interval)
+
+
+def get_vol1d_state():
+    """Latest Vol1DState (or None). The single read-side accessor the rest
+    of the engine uses."""
+    with _market_state_lock:
+        return _market_state.get("vol1d")
+
+
 def background_scheduler():
     global _ai_last_run_date
     log("Background scheduler started")
@@ -8175,8 +5764,6 @@ def background_scheduler():
 
     log("Boot-time bootstrap @ {:.2f} ET (mode: {})".format(boot_hour, OPERATING_MODE))
     threading.Thread(target=_refresh_market_state, daemon=True).start()
-    if boot_hour >= 6.0:
-        threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
     if boot_hour >= 8.0:
         threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
         # Build yesterday's Market Profile (needed for today's opening classification)
@@ -8221,7 +5808,6 @@ def background_scheduler():
 
     # Mark today's refreshes as done so we don't double-run
     _daily_refresh_done["date"]       = today_str
-    _daily_refresh_done["earnings"]   = boot_hour >= 6.0
     _daily_refresh_done["vol"]        = boot_hour >= 8.0
     _daily_refresh_done["mprofile"]   = boot_hour >= 8.0
     # flow stays False on boot: _pull_opening_flow sets it on success and the
@@ -8232,21 +5818,18 @@ def background_scheduler():
     # throttle (see _sweep_retry_due), not this in-memory done-flag.
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
     _daily_refresh_done["paper"]      = boot_hour >= 16.05
+    # vol1d EOD (baseline rebuild + official reconcile) runs at 16:30; on a
+    # later boot mark it done — there are no fresh ticks to rebuild from.
+    _daily_refresh_done["vol1d_eod"]  = boot_hour >= 16.5
     # Only relevant on Fridays; pre-mark on non-Fridays so it never fires.
     _is_friday = datetime.now(et).weekday() == 4
     _daily_refresh_done["friday_digest"] = (not _is_friday) or (boot_hour >= 16.25)
     _premarket_done["date"]           = today_str if boot_hour >= 9.4 else None
     _overnight_done["date"]           = today_str if boot_hour >= 15.93 else None
 
-    # Kick off first swing scan immediately in background (daily bars, non-blocking)
-    threading.Thread(target=run_swing_scan, daemon=True).start()
     while True:
         try:
             run_signal_scan()
-
-            # --- Swing scan (every 15 min) ---
-            if time.time() >= next_swing_scan:
-                threading.Thread(target=run_swing_scan, daemon=True).start()
 
             # --- AI improvement triggers ---
             et      = pytz.timezone("America/New_York")
@@ -8255,16 +5838,16 @@ def background_scheduler():
             et_hour = now_et.hour + now_et.minute / 60.0
 
             # --- Daily maintenance tasks ---
-            # Pre-market (6 AM ET): refresh earnings + volume profiles
+            # Pre-market (6 AM ET): reset the daily refresh flags
             if et_hour >= 6.0 and _daily_refresh_done.get("date") != today:
                 _daily_refresh_done["date"] = today
-                _daily_refresh_done["earnings"]  = False
                 _daily_refresh_done["vol"]       = False
                 _daily_refresh_done["iv"]        = False
                 _daily_refresh_done["premarket"] = False
                 _daily_refresh_done["mprofile"]  = False
                 _daily_refresh_done["flow"]      = False
                 _daily_refresh_done["paper"]     = False
+                _daily_refresh_done["vol1d_eod"] = False
                 # Pre-mark non-Fridays so the digest never fires on Mon-Thu.
                 _daily_refresh_done["friday_digest"] = (
                     datetime.now(et).weekday() != 4
@@ -8274,9 +5857,6 @@ def background_scheduler():
             # market is closed. Cached per-day, so this is one cheap call.
             _session = is_trading_day()
 
-            if et_hour >= 6.0 and not _daily_refresh_done.get("earnings"):
-                threading.Thread(target=_refresh_earnings_calendar, daemon=True).start()
-                _daily_refresh_done["earnings"] = True
             if et_hour >= 8.0 and not _daily_refresh_done.get("vol"):
                 threading.Thread(target=_refresh_volume_profiles, daemon=True).start()
                 _daily_refresh_done["vol"] = True
@@ -8352,6 +5932,20 @@ def background_scheduler():
                 threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
 
             # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
+            # 4:30 PM ET: vol1d EOD — reconcile today's proxy close vs the
+            # official VIX1D print and rebuild the minute-of-day baseline
+            # with today's ticks included.
+            if (_session and HAS_VOL1D and et_hour >= 16.5
+                    and not _daily_refresh_done.get("vol1d_eod")):
+                _daily_refresh_done["vol1d_eod"] = True
+                def _vol1d_eod():
+                    try:
+                        summary = vol1d_state.run_nightly_jobs()
+                        log("vol1d EOD: {}".format(summary))
+                    except Exception as _e:
+                        log("vol1d EOD error: {}".format(_e))
+                threading.Thread(target=_vol1d_eod, daemon=True).start()
+
             if _session and et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
                 threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
                 _daily_refresh_done["iv"] = True
@@ -9042,14 +6636,11 @@ def render_dashboard(toast=""):
 <!-- INDEX CONTEXT -->
 <div style="padding:12px 14px 0">{index_strip}</div>
 
-<!-- WEEKLY / PRIMARY TIER (merged from the former Swing page) -->
-<div style="padding:12px 14px 0">{weekly_section}</div>
-
 <!-- SIGNAL CARDS -->
 <div style="padding:12px 14px 0">
   <div style="font-size:10px;font-weight:700;color:#8b949e;
               text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">
-    SECONDARY &mdash; INTRADAY (SPY/QQQ 0DTE + liquid stock weeklies) &mdash; {nsig} setup{pl_s} found
+    INTRADAY (SPY/QQQ 0DTE) &mdash; {nsig} setup{pl_s} found
   </div>
   {signal_cards}
   {no_sig_msg}
@@ -9123,7 +6714,6 @@ def render_dashboard(toast=""):
             "<div class='empty'>No closed trades today</div>"
         ),
         log_lines="<br>".join(logs) if logs else "No log entries yet",
-        weekly_section=_build_weekly_section(),
     )
     return html
 
@@ -9670,25 +7260,16 @@ def ai_dismiss_proposal():
     return redirect("/ai")
 
 
-@app.route("/swing")
-def swing_page():
-    # The swing/weekly tier is now merged into the single unified dashboard at
-    # "/". Keep the route as a redirect so old bookmarks / links still land.
-    return redirect("/")
-
-
-@app.route("/swing/scan")
-def swing_scan_now():
-    """Manually trigger the weekly pass of the unified scan."""
-    threading.Thread(target=run_unified_scan, kwargs={"do_weekly": True},
-                     daemon=True).start()
-    return redirect("/")
-
-
 @app.route("/scan/unified")
 def scan_unified():
-    """JSON view of the merged tiered payload (weekly + intraday + context)."""
-    return jsonify(run_unified_scan())
+    """JSON view of the tiered signal payload (intraday + context)."""
+    with state_lock:
+        intraday = [r for r in all_signals
+                    if r.get("status") in ("SIGNAL", "SIGNAL (no options)")]
+    context = {"index": index_context()}
+    if HAS_SCANNER_CORE:
+        return jsonify(scanner_core.merge_and_rank(intraday, [], context))
+    return jsonify({"intraday": intraday, "context": context})
 
 
 def _build_scanner_context():
@@ -9720,25 +7301,6 @@ def _build_scanner_context():
                 hr=s.get("trend_1hr","?"),
                 vol=s.get("time_vol_lbl","?"),
                 rank=s.get("rank_score",0)
-            ))
-
-    # Swing signals
-    with swing_lock:
-        sw_sigs = list(all_swing_signals)
-
-    sw_lines = []
-    for s in sw_sigs[:20]:  # top 20
-        opt = s.get("option") or {}
-        sw_lines.append(
-            "  {sym} {d} | {stype} | Prob:{prob}% | Price:{p} | "
-            "T1:{t1} T2:{t2} T3:{t3} | Stop:{stp} | "
-            "RS:{rs:+.1f}%".format(
-                sym=s.get("symbol","?"), d=s.get("direction","?"),
-                stype=s.get("signal_type","?"), prob=s.get("prob",0),
-                p=s.get("price",0),
-                t1=s.get("t1") or "-", t2=s.get("t2") or "-", t3=s.get("t3") or "-",
-                stp=s.get("stop","-"),
-                rs=float(s.get("spy_rs") or 0),
             ))
 
     # Today's trades
@@ -9788,11 +7350,8 @@ INDEX CONTEXT (proxy levels, context only):
 0DTE ACTIVE SIGNALS ({nact} setups):
 {dte_active}
 
-0DTE WATCHING ({nwatch} stocks):
+0DTE WATCHING ({nwatch} symbols):
 {dte_watch}
-
-SWING SETUPS (top 20 of {nsw} found):
-{sw}
 
 OPEN TRADES ({nopen}):
 {open_t}
@@ -9810,8 +7369,6 @@ AI CONFIG: v{ver} | Insight: {insight} | Focus: {focus}
         dte_active = "\n".join(dte_lines) or "  (none)",
         nwatch  = len(watching),
         dte_watch  = "  " + ", ".join(s["symbol"] for s in watching) if watching else "  (none)",
-        nsw     = len(sw_sigs),
-        sw      = "\n".join(sw_lines) or "  (none yet -- scan running)",
         nopen   = len(open_t),
         open_t  = "\n".join(open_lines) or "  (none)",
         pnl     = total_pnl,
@@ -9880,15 +7437,13 @@ body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,Arial,sans-seri
 <div id='msgs'>
   <div class='msg-system'>Context is refreshed each message with live scanner data.</div>
   <div class='msg-ai'><strong>Scanner AI</strong>
-I have full access to your live 0DTE signals, swing setups, open trades, P&L, and scanner config. Ask me anything:
+I have full access to your live 0DTE signals, open trades, P&L, and scanner config. Ask me anything:
 
 <div style='margin-top:10px'>
 <span class='chip' onclick='ask(this)'>What's the best setup right now?</span>
 <span class='chip' onclick='ask(this)'>Explain the top 0DTE signal</span>
-<span class='chip' onclick='ask(this)'>Any swing trades worth taking today?</span>
 <span class='chip' onclick='ask(this)'>Should I be bullish or bearish today?</span>
 <span class='chip' onclick='ask(this)'>What are my open positions?</span>
-<span class='chip' onclick='ask(this)'>Compare the top 3 swing setups</span>
 </div></div>
 </div>
 
@@ -9990,20 +7545,18 @@ def chat_send():
         # Build live context
         ctx = _build_scanner_context()
 
-        system_prompt = """You are an expert trading assistant embedded inside a live 0DTE and swing options scanner. You have direct access to the scanner's current state shown below.
+        system_prompt = """You are an expert trading assistant embedded inside a live 0DTE options scanner focused on SPX/NDX exposure via SPY/QQQ. You have direct access to the scanner's current state shown below.
 
 You help the trader:
 - Interpret and rank the current signals
 - Explain what the scanner is seeing and why
-- Discuss individual stocks and option setups
 - Give conviction ratings on specific trades
-- Compare 0DTE vs swing opportunities
 - Flag risks (counter-trend, low volume, extended moves)
 - Answer general questions about options, technical analysis, and market structure
 
 Be concise and direct -- this is a trading app on mobile. Use short paragraphs. Lead with the most actionable insight. Use dollar signs and percentages as shown in the data.
 
-When discussing options: always mention the DTE, the delta, and whether the setup is 0DTE or swing (multi-day hold).
+When discussing options: always mention the DTE and the delta.
 
 --- LIVE SCANNER DATA ---
 {ctx}
@@ -10015,9 +7568,7 @@ You have full knowledge of this scanner's methodology:
 - VWAP Mean Reversion signals fire when price touches VWAP deviation bands and reverses back toward the mean (best on range-bound days)
 - IB Extension signals fire after 10:30 AM when price moves beyond the Initial Balance range (Market Profile methodology)
 - VWAP Reclaim signals detect when price reclaims VWAP after being on the wrong side, with volume confirmation
-- Swing signals use O'Neil Pivot Breakout, Wyckoff Spring, 52-Week Breakout, and Post-Earnings Continuation
-- Fibonacci extensions (1.272 / 1.618 / 2.0) are price targets; 0.618 retrace is the stop level
-- Swing options target delta ~0.55, 2-week expiry; 0DTE options target delta ~0.40""".format(ctx=ctx)
+- 0DTE options target delta ~0.40""".format(ctx=ctx)
 
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -10109,6 +7660,33 @@ def debug_route():
 # QUANT EDGE DASHBOARD ENDPOINTS
 # =============================================
 
+@app.route("/vol1d")
+def vol1d_endpoint():
+    """Latest VIX1D proxy state (shadow-mode diagnostics)."""
+    if not HAS_VOL1D:
+        return jsonify({"status": "unavailable", "module_loaded": False})
+    st = get_vol1d_state()
+    with _market_state_lock:
+        ts = _market_state.get("vol1d_ts", 0)
+        gex_live = _market_state.get("gex_live")
+    try:
+        from vol1d import baseline as _bl
+        from vol1d import qa as _qa
+        banked = _bl.sessions_banked()
+        resid_date, resid = _qa.latest_residual()
+    except Exception:
+        banked, resid_date, resid = None, None, None
+    return jsonify({
+        "status":           "ok" if st else "no_data",
+        "state":            st.to_dict() if st else None,
+        "age_secs":         round(time.time() - ts, 1) if ts else None,
+        "enforce":          vol1d_config.get_config()["enforce"],
+        "baseline_sessions": banked,
+        "last_residual":    {"date": resid_date, "value": resid},
+        "gex_live":         gex_live,
+    })
+
+
 @app.route("/regime")
 def regime_endpoint():
     """Current vol regime + strategy rules."""
@@ -10188,7 +7766,7 @@ def iv_endpoint():
     if not HAS_IV_RANK:
         return jsonify({"status": "no_module", "note": "iv_rank module not loaded"})
     out = []
-    for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
+    for sym in sorted(SYMBOLS):
         try:
             data = iv_rank.compute_iv_rank(sym)
             if data:
@@ -10256,7 +7834,7 @@ def edge_endpoint():
     top_iv = []
     if HAS_IV_RANK:
         try:
-            for sym in sorted(set(SYMBOLS + SWING_SYMBOLS)):
+            for sym in sorted(SYMBOLS):
                 d = iv_rank.compute_iv_rank(sym)
                 if d and d["iv_rank"] >= 60:
                     top_iv.append({
@@ -10304,7 +7882,6 @@ def edge_endpoint():
             "bars_source":      "alpaca",
             "options_iv_source":"alpaca",
             "vix_source":       "yahoo_finance",
-            "earnings_source":  "yahoo_finance",
             "futures_source":   "databento" if databento_available else "alpaca_etf",
             "gex_source":       "databento" if databento_available else "disabled",
         },
@@ -10692,6 +8269,7 @@ def token_check():
 # =============================================
 
 init_db()
+init_vol1d_journal_columns()
 try:
     import paper_trader
     paper_trader.init_paper_columns(DB_FILE)
@@ -10707,6 +8285,8 @@ db_load_latest_config()   # restore AI config from last session
 _maybe_reset_ai_baseline()  # one-time wipe of pre-reset drifted tuning
 threading.Thread(target=background_scheduler, daemon=True).start()
 threading.Thread(target=telegram_poller,      daemon=True).start()
+if HAS_VOL1D:
+    threading.Thread(target=vol1d_updater_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

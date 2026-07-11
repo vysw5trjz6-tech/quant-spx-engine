@@ -231,36 +231,3 @@ def test_scan_computes_and_passes_vol_data_ok(main_src):
         "scan must derive vol_data_ok from the N/A volume label"
     assert main_src.count("vol_data_ok=vol_data_ok") >= 3, \
         "all three volume strategies must receive vol_data_ok"
-
-
-# ---------------------------------------------------------------------------
-# #1 -- swing fetch resilience (structural)
-# ---------------------------------------------------------------------------
-
-def test_fetch_bars_helper_exists(main_tree):
-    assert _find_func(main_tree, "_fetch_bars") is not None
-    assert _find_func(main_tree, "_bars_cache_get") is not None
-    assert _find_func(main_tree, "_bars_cache_set") is not None
-
-
-def test_fetch_bars_has_rate_limit_handling(main_src, main_tree):
-    fn = _find_func(main_tree, "_fetch_bars")
-    body = ast.get_source_segment(main_src, fn)
-    assert "429" in body, "must special-case the rate-limit status"
-    assert "time.sleep(backoff)" in body, "must back off between retries"
-    assert "http_{}" in body, "must record HTTP status into swing stats"
-    assert "stale" in body.lower(), "must fall back to stale cache on failure"
-
-
-def test_getters_delegate_to_fetch_bars(main_src, main_tree):
-    for name, tf in [("get_daily_extended", "1Day"), ("get_weekly_bars", "1Week")]:
-        fn = _find_func(main_tree, name)
-        body = ast.get_source_segment(main_src, fn)
-        assert "_fetch_bars(symbol, \"{}\"".format(tf) in body, \
-            "{} should delegate to _fetch_bars".format(name)
-
-
-def test_swing_scan_reports_outage(main_src):
-    assert "OUTAGE" in main_src, "0/N swing scan must log a loud outage line"
-    assert "dominant status" in main_src, \
-        "outage line should name the dominant HTTP status"

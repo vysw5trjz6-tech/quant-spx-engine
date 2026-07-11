@@ -45,7 +45,6 @@ def test_module_db_paths_are_absolute():
     wiped on every redeploy. Every module store must resolve absolutely."""
     import iv_rank
     import market_profile
-    import safety_gates
     import volume_truth
 
     for path in (
@@ -54,7 +53,6 @@ def test_module_db_paths_are_absolute():
         volume_truth.VOL_CACHE_DB,
         market_profile.PROFILE_DB,
         options_flow.FLOW_DB,
-        safety_gates.EARNINGS_CACHE_DB,
         da._DB_CACHE,
     ):
         assert os.path.isabs(path), path

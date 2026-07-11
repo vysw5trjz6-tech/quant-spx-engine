@@ -61,10 +61,6 @@ def test_by_horizon_split_present():
     assert stats["by_horizon"]["WEEKLY"]["losses"] == 1
 
 
-def test_weekly_rs_override_in_baseline_config():
-    assert main.DEFAULT_CONFIG.get("weekly_rs_override") == 5.0
-
-
 def test_training_floor_covers_labeling_fix():
     # Trades logged before the labeling fixes carry fabricated buckets and
     # must stay out of AI tuning.

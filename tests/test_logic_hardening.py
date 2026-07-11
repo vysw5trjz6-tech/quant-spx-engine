@@ -61,35 +61,11 @@ def test_learning_epoch_later_than_floor_wins(monkeypatch):
     assert rows[0]["ts"] == kept
 
 
-def test_market_trend_up_down_flat(monkeypatch):
-    def _bars(seq):
-        return [{"c": c} for c in seq]
-
-    # Rising series, price above a rising 50DMA -> UP
-    main._market_trend_cache.update({"ts": 0, "trend": None})
-    monkeypatch.setattr(main, "get_daily_extended",
-                        lambda s, limit=80: _bars([100 + i for i in range(80)]))
-    assert main.market_trend() == "UP"
-
-    # Falling series -> DOWN
-    main._market_trend_cache.update({"ts": 0, "trend": None})
-    monkeypatch.setattr(main, "get_daily_extended",
-                        lambda s, limit=80: _bars([200 - i for i in range(80)]))
-    assert main.market_trend() == "DOWN"
-
-    # Too little data -> FLAT (safe default)
-    main._market_trend_cache.update({"ts": 0, "trend": None})
-    monkeypatch.setattr(main, "get_daily_extended",
-                        lambda s, limit=80: _bars([100, 101, 102]))
-    assert main.market_trend() == "FLAT"
-
-
 def test_policy_defaults():
     cfg = main.DEFAULT_CONFIG
-    # Trade with the tape, alert only A/B, weekly needs the broad tape onside.
+    # Trade with the tape, alert only A/B.
     assert cfg["counter_trend_allowed"] is False
     assert cfg["alert_min_grade"] == "B"
-    assert cfg["weekly_require_uptrend"] is True
     assert 0 < cfg["max_breakout_extension"] <= 1.0
     # ORB stop widened to a full ORB range (was 0.5x).
     assert cfg["orb_stop_mult"] == 1.0
