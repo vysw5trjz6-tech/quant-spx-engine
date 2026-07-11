@@ -70,7 +70,10 @@ class CboeDelayedChainSource(ChainSource):
         cfg = vol1d_config.get_config()
         self.url     = url or cfg["chain_source"]["cboe_url"]
         self.timeout = timeout or cfg["chain_source"]["timeout_secs"]
-        self.roots   = set(roots if roots is not None else cfg["proxy"]["roots"])
+        # Snapshot-level root set (union of every consumer's needs). The
+        # proxy narrows to proxy.roots itself; gex_live to gex_live.roots.
+        self.roots   = set(roots if roots is not None
+                           else cfg["chain_source"]["roots"])
         self._session = session or requests
 
     def get_snapshot(self):
@@ -114,6 +117,18 @@ class CboeDelayedChainSource(ChainSource):
                 continue
             parsed["bid"] = bid
             parsed["ask"] = ask
+            # OI + IV ride along for the intraday GEX consumer; absent or
+            # unparsable values degrade to 0/None rather than dropping the
+            # quote (the proxy still needs its bid/ask).
+            try:
+                parsed["open_interest"] = int(o.get("open_interest") or 0)
+            except (TypeError, ValueError):
+                parsed["open_interest"] = 0
+            try:
+                iv = o.get("iv")
+                parsed["iv"] = float(iv) if iv is not None else None
+            except (TypeError, ValueError):
+                parsed["iv"] = None
             quotes.append(parsed)
 
         if not quotes:

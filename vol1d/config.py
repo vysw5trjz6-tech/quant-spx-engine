@@ -86,6 +86,33 @@ DEFAULTS = {
         "rv_window_min": 30,
     },
 
+    "gex_live": {
+        # Intraday dealer-GEX recomputed from the same delayed CBOE chain
+        # the proxy reads. This re-prices YESTERDAY'S book (OI is a daily
+        # OCC print) at live spot/IV — it captures flip-point crossings and
+        # intraday gamma migration, not positions opened today.
+        "enabled": True,
+        # SPX (AM-settled monthlies) + SPXW (daily PM) — the full index
+        # book, unlike the proxy strips which are SPXW-only.
+        "roots": ["SPXW", "SPX"],
+        # Only expiries within this many calendar days contribute (front
+        # book dominates dealer hedging; matches the nightly build's
+        # expiries_ahead spirit).
+        "max_days_ahead": 7,
+        # Refuse a read from a suspiciously thin chain.
+        "min_contracts": 100,
+        # Recompute throttle: GEX moves slower than the proxy level and
+        # sums the whole book, so don't pay for it every 15s pass.
+        "min_interval_secs": 60,
+        # Beyond this age the live read is discarded and the grid falls
+        # back to the nightly snapshot.
+        "max_age_secs": 900,
+        # |GEX $B| below this maps to no grid column (UNKNOWN). CALIBRATE:
+        # index-chain dollar gamma runs far larger than the SPY-chain
+        # numbers the nightly bias buckets with +/-1B.
+        "neutral_band_b": 2.0,
+    },
+
     "gating": {
         # What the module WOULD do to a signal (spec §4). Shadow-only until
         # `enforce` above is flipped; every knob here is CALIBRATE-against-
@@ -115,6 +142,7 @@ DEFAULTS = {
         "no_baseline_mult":     0.3,   # no baseline at all (day-1 warmup)
         "residual_breach_mult": 0.5,   # proxy-vs-official residual over tolerance
         "no_gex_mult":          0.8,   # GEX column unknown -> grid unconfirmed
+        "snapshot_gex_mult":    0.9,   # grid crossed a prior-close GEX (no live read)
         "no_rv_mult":           0.9,   # intraday RV not yet computable
     },
 
@@ -127,11 +155,15 @@ DEFAULTS = {
     },
 
     "chain_source": {
-        # Free, key-less delayed SPX/SPXW chain (includes bid/ask + spot).
-        # ~15-min delayed — fine for the detrended regime read; only the
-        # spike ROC sees the delay.
+        # Free, key-less delayed SPX/SPXW chain (includes bid/ask, OI, IV
+        # and spot). ~15-min delayed — fine for the detrended regime read;
+        # only the spike ROC sees the delay.
         "cboe_url": "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json",
         "timeout_secs": 20,
+        # Roots kept in the parsed snapshot. One fetch serves BOTH
+        # consumers: the proxy filters down to proxy.roots (SPXW strips),
+        # gex_live uses its own root set over the full index book.
+        "roots": ["SPXW", "SPX"],
     },
 }
 

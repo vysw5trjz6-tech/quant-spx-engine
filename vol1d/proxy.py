@@ -185,7 +185,15 @@ def compute_vix1d(snapshot, now_et=None, cfg=None, holidays=frozenset()):
     if now_et is None:
         return None
 
-    near, nxt = select_term_expiries(snapshot["quotes"], now_et, p, holidays)
+    # The snapshot may carry more roots than the strips use (gex_live reads
+    # the full index book). The strips are PM-settled SPXW only — an
+    # AM-settled SPX monthly landing on the same date must never mix in.
+    allowed = set(p["roots"])
+    quotes = [q for q in snapshot["quotes"] if q.get("root") in allowed]
+    if not quotes:
+        return None
+
+    near, nxt = select_term_expiries(quotes, now_et, p, holidays)
     if near is None or nxt is None:
         print("[vol1d] proxy: need two live expiries, got near={} next={}".format(near, nxt))
         return None
@@ -197,7 +205,7 @@ def compute_vix1d(snapshot, now_et=None, cfg=None, holidays=frozenset()):
             now_et, exp, business_day_year=p["business_day_year"],
             settle_hour_et=p["settle_hour_et"], holidays=holidays)
         table = build_strike_table(
-            [q for q in snapshot["quotes"] if q["expiry"] == exp])
+            [q for q in quotes if q["expiry"] == exp])
         tv = term_variance(table, r, t,
                            consecutive_no_bid_stop=p["consecutive_no_bid_stop"])
         if tv is None:

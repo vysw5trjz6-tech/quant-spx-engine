@@ -205,6 +205,22 @@ def test_proxy_refuses_single_expiry():
     assert proxy.compute_vix1d(_snapshot(quotes), now_et=NOW, cfg=_cfg(r=0.0)) is None
 
 
+def test_spx_root_quotes_never_enter_the_strips():
+    # The snapshot now carries the SPX root for the live-GEX consumer. An
+    # AM-settled SPX monthly landing on the strip dates must not move the
+    # PM-settled SPXW calc — garbage SPX quotes at the same expiries must
+    # leave the level unchanged.
+    quotes = _synthetic_quotes(TODAY) + _synthetic_quotes(NEXT)
+    clean = proxy.compute_vix1d(_snapshot(quotes), now_et=NOW, cfg=_cfg(r=0.0))
+    polluted = quotes + [
+        {"root": "SPX", "expiry": e, "type": t, "strike": 6300.0,
+         "bid": 500.0, "ask": 600.0}
+        for e in (TODAY, NEXT) for t in ("call", "put")
+    ]
+    out = proxy.compute_vix1d(_snapshot(polluted), now_et=NOW, cfg=_cfg(r=0.0))
+    assert out["vix1d"] == clean["vix1d"]
+
+
 # ---------------------------------------------------------------------------
 # Chain source payload parsing (offline)
 # ---------------------------------------------------------------------------

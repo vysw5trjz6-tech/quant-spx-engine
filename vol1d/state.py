@@ -14,6 +14,7 @@ import pytz
 from vol1d import baseline as vol1d_baseline
 from vol1d import config as vol1d_config
 from vol1d import features as vol1d_features
+from vol1d import gex_live as vol1d_gex_live
 from vol1d import proxy as vol1d_proxy
 from vol1d import qa as vol1d_qa
 from vol1d import regime as vol1d_regime
@@ -40,6 +41,7 @@ class Vol1DState:
     spot: float
     baseline_sessions: int
     qa_residual: float          # latest proxy-vs-official residual (or None)
+    gex_source: str = "none"    # live | snapshot | none — what the grid crossed
 
     def to_dict(self):
         d = asdict(self)
@@ -48,7 +50,7 @@ class Vol1DState:
 
 
 def compute_confidence(tod_z, n_sessions, residual, gex_label, iv_rv_spread,
-                       cfg):
+                       cfg, gex_source="live"):
     """Multiplicative downgrade stack, floor 0."""
     c = cfg["confidence"]
     conf = 1.0
@@ -60,6 +62,10 @@ def compute_confidence(tod_z, n_sessions, residual, gex_label, iv_rv_spread,
         conf *= c["residual_breach_mult"]
     if gex_label == vol1d_regime.UNKNOWN_GEX:
         conf *= c["no_gex_mult"]
+    elif gex_source == "snapshot":
+        # The grid crossed a prior-close GEX read — mechanism may have
+        # migrated intraday without us seeing it.
+        conf *= c["snapshot_gex_mult"]
     if iv_rv_spread is None:
         conf *= c["no_rv_mult"]
     return round(conf, 3)
@@ -78,6 +84,9 @@ class Vol1DUpdater(object):
         self.db_path = db_path                       # None -> default store
         self._holidays = frozenset(self.cfg["proxy"].get("holidays") or ())
         self._residual_cache = {"date": None, "value": None}
+        # Latest intraday GEX read (published by main next to gex_bias).
+        self.gex_live = None
+        self._gex_live_at = None
 
     def _latest_residual(self, today_iso):
         """Yesterday's reconcile result, fetched once per session."""
@@ -117,13 +126,14 @@ class Vol1DUpdater(object):
         tod_z, n_sessions = vol1d_baseline.tod_z(now_et, level, cfg=self.cfg,
                                                  db_path=self.db_path)
 
+        grid_gex, gex_source = self._grid_gex(snap, now_et, gex_bias)
         reg = self.tracker.update(tod_z, feats["iv_rv_spread"],
-                                  feats["vix1d_roc"], gex_bias=gex_bias)
+                                  feats["vix1d_roc"], gex_bias=grid_gex)
 
         residual = self._latest_residual(now_et.strftime("%Y-%m-%d"))
         conf = compute_confidence(tod_z, n_sessions, residual,
                                   reg["gex_label"], feats["iv_rv_spread"],
-                                  self.cfg)
+                                  self.cfg, gex_source=gex_source)
 
         return Vol1DState(
             ts=now_et,
@@ -141,7 +151,40 @@ class Vol1DUpdater(object):
             spot=spot,
             baseline_sessions=n_sessions,
             qa_residual=residual,
+            gex_source=gex_source,
         )
+
+    def _grid_gex(self, snap, now_et, snapshot_bias):
+        """(gex_dict, source) the grid crosses against: the intraday read
+        recomputed from this chain when fresh, else the nightly snapshot.
+
+        The live compute is throttled (min_interval_secs) — dealer gamma
+        migrates on minutes, not seconds — and discarded past max_age_secs
+        so a stalled chain can't pin an old mechanism read."""
+        g = self.cfg["gex_live"]
+        if g["enabled"]:
+            due = (self._gex_live_at is None
+                   or (now_et - self._gex_live_at).total_seconds()
+                   >= g["min_interval_secs"])
+            if due:
+                try:
+                    live = vol1d_gex_live.compute_bias(snap, cfg=self.cfg,
+                                                       today=now_et.date())
+                except Exception as e:
+                    print("[vol1d] gex_live compute failed: {}".format(e))
+                    live = None
+                if live is not None:
+                    self.gex_live = live
+                    self._gex_live_at = now_et
+            fresh = (self.gex_live is not None
+                     and self._gex_live_at is not None
+                     and (now_et - self._gex_live_at).total_seconds()
+                     <= g["max_age_secs"])
+            if fresh:
+                return self.gex_live, "live"
+        if snapshot_bias:
+            return snapshot_bias, "snapshot"
+        return None, "none"
 
 
 def session_close_level(session_date_iso, db_path=None):
