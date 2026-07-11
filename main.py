@@ -932,6 +932,67 @@ def db_get_all_closed_trades():
         return []
 
 
+# --- vol1d journaling (spec §6) ---------------------------------------------
+# Entry/exit rows carry the vol regime they fired into so P&L can later be
+# bucketed by combined_regime and the fade/trend routing checked. Columns
+# are added via the same idempotent ALTER TABLE migration pattern
+# paper_trader uses.
+
+_VOL1D_ENTRY_COLS = ("vix1d", "vix1d_tod_z", "exp_move_adj", "iv_rv_spread",
+                     "vol_state", "combined_regime", "vol1d_spiking",
+                     "vol1d_residual", "vol1d_confidence")
+_VOL1D_EXIT_COLS  = ("exit_vix1d", "exit_vix1d_tod_z", "exit_vol_state",
+                     "exit_combined_regime", "exit_vol1d_spiking")
+
+
+def init_vol1d_journal_columns():
+    """Idempotent migration: vol1d entry fields on signals + trades, exit
+    fields on trades."""
+    conn = db_utils.connect(DB_FILE)
+    types = {"vol_state": "TEXT", "combined_regime": "TEXT",
+             "exit_vol_state": "TEXT", "exit_combined_regime": "TEXT",
+             "vol1d_spiking": "INTEGER", "exit_vol1d_spiking": "INTEGER"}
+    for table, cols in (("signals", _VOL1D_ENTRY_COLS),
+                        ("trades",  _VOL1D_ENTRY_COLS + _VOL1D_EXIT_COLS)):
+        for col in cols:
+            try:
+                conn.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
+                    table, col, types.get(col, "REAL")))
+            except Exception:
+                pass   # column already exists
+    conn.commit()
+    conn.close()
+
+
+def _vol1d_entry_fields():
+    """Current Vol1DState flattened onto the entry journal columns, or {}
+    when the module is off/warming — journaling must never block a trade."""
+    if not HAS_VOL1D:
+        return {}
+    st = get_vol1d_state()
+    if st is None:
+        return {}
+    return {
+        "vix1d":            st.vix1d,
+        "vix1d_tod_z":      st.vix1d_tod_z,
+        "exp_move_adj":     st.exp_move_adj,
+        "iv_rv_spread":     st.iv_rv_spread,
+        "vol_state":        st.vol_state,
+        "combined_regime":  st.combined_regime,
+        "vol1d_spiking":    1 if st.spiking else 0,
+        "vol1d_residual":   st.qa_residual,
+        "vol1d_confidence": st.confidence,
+    }
+
+
+def _vol1d_stamp_row(conn, table, row_id, fields):
+    if not fields or row_id is None:
+        return
+    sets = ", ".join("{}=?".format(k) for k in fields)
+    conn.execute("UPDATE {} SET {} WHERE id=?".format(table, sets),
+                 list(fields.values()) + [row_id])
+
+
 def db_log_signal(sig):
     try:
         # Pick the underlying stop / targets the scanner already computed
@@ -980,6 +1041,7 @@ def db_log_signal(sig):
             sig.get("horizon"), sig.get("tier"), sig.get("product_class"),
             sig.get("conviction"), rationale_json,
         ))
+        _vol1d_stamp_row(conn, "signals", c.lastrowid, _vol1d_entry_fields())
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1014,6 +1076,11 @@ def db_log_trade(symbol, direction, premium, contracts=None, stop=None, target=N
             und_stop, und_target_t1, und_target_t2, horizon, mode
         ))
         trade_id = c.lastrowid
+        # Live entries carry the vol regime they fired into. Paper-replay
+        # rows are inserted at EOD when the state no longer reflects entry
+        # time — they inherit entry-time fields from their signal row.
+        if mode != "paper" and mode != "paper_t2":
+            _vol1d_stamp_row(conn, "trades", trade_id, _vol1d_entry_fields())
         conn.commit()
         conn.close()
         return trade_id
@@ -1046,6 +1113,16 @@ def db_close_trade(trade_id, exit_price, outcome):
             UPDATE trades SET outcome=?, exit_price=?, pnl=?, r_mult=?
             WHERE id=?
         """, (outcome, exit_price, pnl, r_mult, trade_id))
+        # Exit-time vol regime (spec §6: log at entry AND exit).
+        entry = _vol1d_entry_fields()
+        if entry:
+            _vol1d_stamp_row(conn, "trades", trade_id, {
+                "exit_vix1d":            entry["vix1d"],
+                "exit_vix1d_tod_z":      entry["vix1d_tod_z"],
+                "exit_vol_state":        entry["vol_state"],
+                "exit_combined_regime":  entry["combined_regime"],
+                "exit_vol1d_spiking":    entry["vol1d_spiking"],
+            })
         conn.commit()
         conn.close()
         log("Trade {} closed: {} pnl={}".format(trade_id, outcome, pnl))
@@ -8169,6 +8246,7 @@ def token_check():
 # =============================================
 
 init_db()
+init_vol1d_journal_columns()
 try:
     import paper_trader
     paper_trader.init_paper_columns(DB_FILE)
