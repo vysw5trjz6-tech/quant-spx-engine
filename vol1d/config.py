@@ -70,6 +70,9 @@ DEFAULTS = {
         # Below this many banked sessions the tod_z is low-confidence and
         # the state's confidence field is downgraded.
         "min_sessions": 20,
+        # Floor on the per-minute SD so a freakishly-quiet training window
+        # can't turn ordinary wiggle into a huge |z|.
+        "min_sd": 0.25,
     },
 
     "features": {
