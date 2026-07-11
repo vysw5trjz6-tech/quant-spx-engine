@@ -50,6 +50,10 @@ DEFAULTS = {
         # Sanity bounds on the resulting level (annualized vol, %).
         "level_lo": 2.0,
         "level_hi": 200.0,
+        # Market holidays (ISO dates) the business-time day count must
+        # skip. Weekends are automatic; keep this list current or accept
+        # a mis-scaled T across holiday gaps.
+        "holidays": [],
     },
 
     "regime": {
@@ -80,6 +84,15 @@ DEFAULTS = {
         "rp_factor": 0.85,
         # Rolling window (minutes) for intraday realized vol.
         "rv_window_min": 30,
+    },
+
+    "confidence": {
+        # Multiplicative downgrades on Vol1DState.confidence (base 1.0).
+        "baseline_warmup_mult": 0.6,   # tod_z from < min_sessions of history
+        "no_baseline_mult":     0.3,   # no baseline at all (day-1 warmup)
+        "residual_breach_mult": 0.5,   # proxy-vs-official residual over tolerance
+        "no_gex_mult":          0.8,   # GEX column unknown -> grid unconfirmed
+        "no_rv_mult":           0.9,   # intraday RV not yet computable
     },
 
     "qa": {

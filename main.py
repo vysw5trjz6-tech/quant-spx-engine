@@ -122,6 +122,14 @@ except ImportError as _e:
     HAS_INDEX_OPTIONS = False
     print("[init] index_options unavailable: {}".format(_e))
 
+try:
+    from vol1d import config as vol1d_config
+    from vol1d import state as vol1d_state
+    HAS_VOL1D = True
+except ImportError as _e:
+    HAS_VOL1D = False
+    print("[init] vol1d unavailable: {}".format(_e))
+
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
 # Default is premarket since most users only need a morning brief.
@@ -137,6 +145,8 @@ _market_state = {
     "gex_bias":         None,   # output of gamma_exposure.get_gex_bias()
     "index_insights":   None,   # {"date", "SPX": {...}, "NDX": {...}} from index_options
     "regime_ts":        0,      # epoch when regime was last refreshed
+    "vol1d":            None,   # latest vol1d.state.Vol1DState (updater thread)
+    "vol1d_ts":         0,      # epoch when vol1d last computed
 }
 _market_state_lock = threading.Lock()
 
@@ -5593,6 +5603,54 @@ _ib_unlock_lock = threading.Lock()
 _regime_recheck_done = {"date": None, "unlocked": False, "escalated_rank": -1}
 
 
+def vol1d_updater_loop():
+    """Dedicated fast loop (~vol1d.update_secs, default 15s) computing the
+    VIX1D proxy state through RTH and publishing it into _market_state.
+
+    This is the only fast-cadence component in the engine — the 5-min scan
+    and the nightly GEX build stay untouched. The chain source is CBOE's
+    free delayed-quotes CDN, so cadence costs bandwidth, not money. Outside
+    RTH (or on holidays) the loop idles; the last state of the session
+    stays readable until the next open.
+    """
+    if not HAS_VOL1D:
+        return
+    log("vol1d updater started (interval {}s, enforce={})".format(
+        vol1d_config.get_config()["update_secs"],
+        vol1d_config.get_config()["enforce"]))
+    updater = None
+    et = pytz.timezone("America/New_York")
+    while True:
+        interval = vol1d_config.get_config()["update_secs"]
+        try:
+            now = datetime.now(et)
+            et_hour = now.hour + now.minute / 60.0
+            if is_trading_day() and 9.5 <= et_hour < 16.05:
+                if updater is None:
+                    updater = vol1d_state.Vol1DUpdater()
+                with _market_state_lock:
+                    gex = _market_state.get("gex_bias")
+                st = updater.compute_once(gex_bias=gex)
+                if st is not None:
+                    with _market_state_lock:
+                        _market_state["vol1d"]    = st
+                        _market_state["vol1d_ts"] = time.time()
+            else:
+                # Fresh accumulators next session; idle at a slow tick.
+                updater = None
+                interval = max(interval, 60)
+        except Exception as e:
+            log("vol1d updater error: {}".format(e))
+        time.sleep(interval)
+
+
+def get_vol1d_state():
+    """Latest Vol1DState (or None). The single read-side accessor the rest
+    of the engine uses."""
+    with _market_state_lock:
+        return _market_state.get("vol1d")
+
+
 def background_scheduler():
     global _ai_last_run_date
     log("Background scheduler started")
@@ -5662,6 +5720,9 @@ def background_scheduler():
     # throttle (see _sweep_retry_due), not this in-memory done-flag.
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
     _daily_refresh_done["paper"]      = boot_hour >= 16.05
+    # vol1d EOD (baseline rebuild + official reconcile) runs at 16:30; on a
+    # later boot mark it done — there are no fresh ticks to rebuild from.
+    _daily_refresh_done["vol1d_eod"]  = boot_hour >= 16.5
     # Only relevant on Fridays; pre-mark on non-Fridays so it never fires.
     _is_friday = datetime.now(et).weekday() == 4
     _daily_refresh_done["friday_digest"] = (not _is_friday) or (boot_hour >= 16.25)
@@ -5688,6 +5749,7 @@ def background_scheduler():
                 _daily_refresh_done["mprofile"]  = False
                 _daily_refresh_done["flow"]      = False
                 _daily_refresh_done["paper"]     = False
+                _daily_refresh_done["vol1d_eod"] = False
                 # Pre-mark non-Fridays so the digest never fires on Mon-Thu.
                 _daily_refresh_done["friday_digest"] = (
                     datetime.now(et).weekday() != 4
@@ -5772,6 +5834,20 @@ def background_scheduler():
                 threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
 
             # 4:15 PM ET: daily IV snapshot (both modes — builds rolling history)
+            # 4:30 PM ET: vol1d EOD — reconcile today's proxy close vs the
+            # official VIX1D print and rebuild the minute-of-day baseline
+            # with today's ticks included.
+            if (_session and HAS_VOL1D and et_hour >= 16.5
+                    and not _daily_refresh_done.get("vol1d_eod")):
+                _daily_refresh_done["vol1d_eod"] = True
+                def _vol1d_eod():
+                    try:
+                        summary = vol1d_state.run_nightly_jobs()
+                        log("vol1d EOD: {}".format(summary))
+                    except Exception as _e:
+                        log("vol1d EOD error: {}".format(_e))
+                threading.Thread(target=_vol1d_eod, daemon=True).start()
+
             if _session and et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
                 threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
                 _daily_refresh_done["iv"] = True
@@ -7486,6 +7562,31 @@ def debug_route():
 # QUANT EDGE DASHBOARD ENDPOINTS
 # =============================================
 
+@app.route("/vol1d")
+def vol1d_endpoint():
+    """Latest VIX1D proxy state (shadow-mode diagnostics)."""
+    if not HAS_VOL1D:
+        return jsonify({"status": "unavailable", "module_loaded": False})
+    st = get_vol1d_state()
+    with _market_state_lock:
+        ts = _market_state.get("vol1d_ts", 0)
+    try:
+        from vol1d import baseline as _bl
+        from vol1d import qa as _qa
+        banked = _bl.sessions_banked()
+        resid_date, resid = _qa.latest_residual()
+    except Exception:
+        banked, resid_date, resid = None, None, None
+    return jsonify({
+        "status":           "ok" if st else "no_data",
+        "state":            st.to_dict() if st else None,
+        "age_secs":         round(time.time() - ts, 1) if ts else None,
+        "enforce":          vol1d_config.get_config()["enforce"],
+        "baseline_sessions": banked,
+        "last_residual":    {"date": resid_date, "value": resid},
+    })
+
+
 @app.route("/regime")
 def regime_endpoint():
     """Current vol regime + strategy rules."""
@@ -8083,6 +8184,8 @@ db_load_latest_config()   # restore AI config from last session
 _maybe_reset_ai_baseline()  # one-time wipe of pre-reset drifted tuning
 threading.Thread(target=background_scheduler, daemon=True).start()
 threading.Thread(target=telegram_poller,      daemon=True).start()
+if HAS_VOL1D:
+    threading.Thread(target=vol1d_updater_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
