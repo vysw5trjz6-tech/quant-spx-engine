@@ -86,6 +86,29 @@ DEFAULTS = {
         "rv_window_min": 30,
     },
 
+    "gating": {
+        # What the module WOULD do to a signal (spec §4). Shadow-only until
+        # `enforce` above is flipped; every knob here is CALIBRATE-against-
+        # shadow-logs material.
+        #
+        # Expected-move guardrail: veto when the target sits beyond this
+        # many exp_move_adj sigmas in a FADE (COMPRESSED/POS_GEX) tape...
+        "exp_move_target_cap": 1.0,
+        # ...or when the stop is tighter than this fraction of expected
+        # noise (it will be hit by wiggle, not by being wrong).
+        "stop_noise_floor": 0.25,
+        # Judas/liquidity-grab window: minutes after the open during which
+        # the level is not actionable.
+        "open_grab_min": 15,
+        # Sizing: size_mult = 1 - sizing_slope * vix1d_tod_z, clamped.
+        # Bigger when quiet/compressed, smaller when expansive.
+        "sizing_slope": 0.25,
+        "size_min": 0.5,
+        "size_max": 1.25,
+        # Below this confidence the module abstains (no veto authority).
+        "min_confidence": 0.5,
+    },
+
     "confidence": {
         # Multiplicative downgrades on Vol1DState.confidence (base 1.0).
         "baseline_warmup_mult": 0.6,   # tod_z from < min_sessions of history

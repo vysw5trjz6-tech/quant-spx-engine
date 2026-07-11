@@ -124,6 +124,7 @@ except ImportError as _e:
 
 try:
     from vol1d import config as vol1d_config
+    from vol1d import shadow as vol1d_shadow
     from vol1d import state as vol1d_state
     HAS_VOL1D = True
 except ImportError as _e:
@@ -3980,6 +3981,21 @@ def run_signal_scan():
     intraday_locked = tier_has_open_position("INTRADAY")
     if intraday_locked:
         log("INTRADAY tier locked -- live position open, suppressing alerts")
+
+    # vol1d SHADOW hook: evaluate + log what the vol module WOULD do to
+    # each alertable signal (veto/stand-aside/downweight/size). It filters
+    # NOTHING until vol1d config enforce=True is flipped after reviewing
+    # the vol1d_shadow logs.
+    if HAS_VOL1D and alertable:
+        try:
+            _vcfg = vol1d_config.get_config()
+            alertable = vol1d_shadow.process_signals(
+                alertable, get_vol1d_state(), cfg=_vcfg,
+                has_open_position=intraday_locked)
+            if _vcfg.get("enforce"):
+                log_event("vol1d.enforce_active", allowed=len(alertable))
+        except Exception as _e:
+            log("vol1d shadow error: {}".format(_e))
 
     # Telegram: alert on confirmed signals
     for sig in (alertable if not intraday_locked else []):
