@@ -5,10 +5,7 @@
 #      dealers are short gamma. Documented ~55-58% win rate, very low
 #      correlation with intraday momentum strategies.
 #
-#   2. EARNINGS IV CRUSH         - sell premium 1 day pre-earnings on names
-#      where IVR is high AND historical post-earnings move < implied move.
-#
-#   3. OPENING DRIVE (ES/NQ)     - first 30 min RTH continuation when
+#   2. OPENING DRIVE (ES/NQ)     - first 30 min RTH continuation when
 #      overnight inventory aligns with gap direction.
 
 import math
@@ -101,119 +98,7 @@ def detect_overnight_gamma_reversal(spy_close_price, current_time_et,
 
 
 # =============================================
-# 2. EARNINGS IV CRUSH
-# =============================================
-#
-# Setup: 1 day before earnings, sell a short strangle (or iron condor for
-# defined risk) when:
-#   - IV Rank > 70 (premium is rich vs the stock's own history)
-#   - Historical post-earnings move < implied move (the market overpaid
-#     for the move 60% of the time historically — this is well documented)
-#   - Stock has reported >= 8 prior quarters of data
-#
-# Exit: morning after earnings, on IV crush. Don't hold for the move.
-# Expected: ~65% win rate, defined risk via condor.
-
-def historical_earnings_move(daily_bars, earnings_dates, lookback_quarters=8):
-    """
-    Compute the average abs(% move) on prior earnings days.
-
-    Args:
-      daily_bars: list of {t, o, h, l, c, v} sorted ascending
-      earnings_dates: list of date strings (YYYY-MM-DD) for past earnings
-      lookback_quarters: how many earnings to average
-
-    Returns avg_pct_move (e.g. 4.2 for 4.2%) or None if insufficient data.
-    """
-    if not daily_bars or not earnings_dates:
-        return None
-
-    moves = []
-    bar_by_date = {b["t"][:10]: b for b in daily_bars}
-
-    sorted_earnings = sorted(earnings_dates, reverse=True)[:lookback_quarters]
-
-    for earn_date in sorted_earnings:
-        bar = bar_by_date.get(earn_date)
-        if not bar:
-            continue
-        # Find prior trading day's close
-        prior_date = (datetime.strptime(earn_date, "%Y-%m-%d").date()
-                      - timedelta(days=1))
-        # Walk back to a trading day
-        for _ in range(5):
-            ds = prior_date.strftime("%Y-%m-%d")
-            if ds in bar_by_date:
-                prior_close = bar_by_date[ds]["c"]
-                move_pct = abs(bar["c"] - prior_close) / prior_close * 100
-                moves.append(move_pct)
-                break
-            prior_date -= timedelta(days=1)
-
-    if len(moves) < 4:
-        return None
-
-    return round(statistics.mean(moves), 2)
-
-
-def implied_earnings_move(atm_call_price, atm_put_price, spot):
-    """
-    The classic earnings 'implied move' formula:
-      (ATM call + ATM put) / spot * 100 = expected % move
-    """
-    if not all([atm_call_price, atm_put_price, spot]) or spot <= 0:
-        return None
-    straddle = atm_call_price + atm_put_price
-    return round(straddle / spot * 100, 2)
-
-
-def detect_earnings_iv_crush(symbol, spot, atm_call, atm_put, iv_rank,
-                                daily_bars, prior_earnings_dates,
-                                days_to_earnings):
-    """
-    Returns signal dict for short-premium earnings play, or None.
-    """
-    if days_to_earnings != 1:  # only fires day before
-        return None
-    if iv_rank is None or iv_rank < 70:
-        return None
-
-    implied = implied_earnings_move(atm_call, atm_put, spot)
-    historic = historical_earnings_move(daily_bars, prior_earnings_dates)
-
-    if implied is None or historic is None:
-        return None
-
-    # Edge: market is overpricing the move. Need a meaningful gap.
-    edge_pct = implied - historic
-    if edge_pct < 1.0:
-        return None
-
-    # Iron condor: short ATM straddle + long wings 1 std dev out
-    # Strike width = 1 implied std dev
-    one_sd = spot * implied / 100.0
-
-    return {
-        "signal_type":     "EARNINGS_IV_CRUSH",
-        "direction":       "SHORT_PREMIUM",
-        "symbol":          symbol,
-        "structure":       "iron_condor",
-        "short_call_k":    round(spot + one_sd * 0.5, 2),
-        "long_call_k":     round(spot + one_sd * 1.5, 2),
-        "short_put_k":     round(spot - one_sd * 0.5, 2),
-        "long_put_k":      round(spot - one_sd * 1.5, 2),
-        "implied_move":    implied,
-        "historical_move": historic,
-        "edge_pct":        round(edge_pct, 2),
-        "iv_rank":         iv_rank,
-        "exit_when":       "morning after earnings, on IV crush",
-        "expected_win_rate": 0.65,
-        "score":           min(95, 50 + int(edge_pct * 8) + int((iv_rank - 70) / 2)),
-    }
-
-
-# =============================================
-# 3. OPENING DRIVE (continuation in direction of overnight)
+# 2. OPENING DRIVE (continuation in direction of overnight)
 # =============================================
 #
 # Setup: in first 30 min of RTH, when overnight inventory aligns with

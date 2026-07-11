@@ -390,13 +390,13 @@ def backfill_universe(symbols, days=252):
 
 
 def _default_universe():
-    """Mirrors main.SYMBOLS + main.SWING_UNIVERSE; computed lazily so we
+    """Mirrors main.SYMBOLS (the SPY/QQQ product set); computed lazily so we
     don't have to import all of main.py just to discover symbols."""
     try:
         import main
-        return sorted(set(main.SYMBOLS + main.SWING_UNIVERSE))
+        return sorted(set(main.SYMBOLS))
     except Exception:
-        return ["SPY", "QQQ", "IWM"]
+        return ["SPY", "QQQ"]
 
 
 def main():

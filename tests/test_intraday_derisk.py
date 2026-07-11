@@ -58,7 +58,6 @@ def test_extreme_vol_spike_escalates_to_crisis(monkeypatch):
     reg = _live_regime()
     assert reg["regime"] == "CRISIS"
     assert reg["rules"]["vwap_mr"] is False
-    assert reg["rules"]["swing_breakout"] is False    # swings halted at CRISIS
 
 
 def test_escalation_is_monotonic_no_downgrade(monkeypatch):

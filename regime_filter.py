@@ -70,7 +70,6 @@ REGIME_STRATEGY_RULES = {
         "vwap_trend":       True,
         "vwap_mr":          True,    # range-bound days favor MR
         "ib_extension":     True,
-        "swing_breakout":   False,
         "conviction_multiplier":  0.5,     # low conviction — premium bleeds in low IV
         # Raise the bar for trend signals to fire while in COMPRESSED.
         # Scanner subtracts this from grade_pts before letter assignment.
@@ -81,7 +80,6 @@ REGIME_STRATEGY_RULES = {
         "vwap_trend":       True,
         "vwap_mr":          True,
         "ib_extension":     True,
-        "swing_breakout":   True,
         "conviction_multiplier":  0.85,
     },
     "NORMAL": {
@@ -89,7 +87,6 @@ REGIME_STRATEGY_RULES = {
         "vwap_trend":       True,
         "vwap_mr":          True,
         "ib_extension":     True,
-        "swing_breakout":   True,
         "conviction_multiplier":  1.0,
     },
     "ELEVATED": {
@@ -97,7 +94,6 @@ REGIME_STRATEGY_RULES = {
         "vwap_trend":       True,
         "vwap_mr":          False,   # bands break in high vol
         "ib_extension":     True,
-        "swing_breakout":   True,
         "conviction_multiplier":  0.85,    # higher option prices, lower conviction
     },
     "CRISIS": {
@@ -105,7 +101,6 @@ REGIME_STRATEGY_RULES = {
         "vwap_trend":       True,
         "vwap_mr":          False,
         "ib_extension":     True,
-        "swing_breakout":   False,   # gaps gap; swings get blown up
         "conviction_multiplier":  0.5,     # lowest conviction, wider stops
     },
 }
