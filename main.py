@@ -8110,6 +8110,7 @@ def diag_endpoint():
         import databento_adapter
         db_test["sdk_installed"] = databento_adapter._SDK_AVAILABLE
         db_test["available"]     = databento_adapter.is_available()
+        db_test["billing"]       = databento_adapter.billing_status()
 
         if databento_adapter.is_available():
             # VIX

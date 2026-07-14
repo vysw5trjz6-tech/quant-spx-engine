@@ -167,27 +167,42 @@ def _emit_error(event, **fields):
             pass
 
 
-def _trip_billing_breaker(context):
-    global _billing_blocked_until
+# Last breaker trip, kept for diagnostics: the breaker itself only stores
+# "blocked until", so once tripped there was no way to see WHY from the
+# /databento or /diag endpoints — the root cause lived in a stderr line that
+# rotates out of the debug-log ring. In-memory only; a redeploy clears it.
+_last_billing_trip = None   # {"at", "context", "detail"} or None
+
+
+def _trip_billing_breaker(context, exc=None):
+    global _billing_blocked_until, _last_billing_trip
     first_trip = not _billing_blocked()
     _billing_blocked_until = _utcnow() + timedelta(
         seconds=_BILLING_COOLDOWN_SECS
     )
+    _last_billing_trip = {
+        "at":      _utcnow().isoformat() + "Z",
+        "context": context,
+        "detail":  str(exc)[:300] if exc is not None else None,
+    }
     if first_trip:
         _emit_error(
             "databento.billing_blocked",
             context=context,
             cooldown_min=_BILLING_COOLDOWN_SECS // 60,
             until=_billing_blocked_until.isoformat() + "Z",
+            detail=(str(exc)[:200] if exc is not None else ""),
         )
 
 
 def billing_status():
-    """Returns dict with breaker state for the /diagnostic endpoint."""
+    """Returns dict with breaker state for the /databento and /diag
+    endpoints, including why the breaker last opened (this process only)."""
     return {
         "blocked":       _billing_blocked(),
         "blocked_until": (_billing_blocked_until.isoformat() + "Z")
                          if _billing_blocked_until else None,
+        "last_trip":     _last_billing_trip,
     }
 
 
@@ -273,7 +288,7 @@ def get_historical_daily_options(symbol, start_date, end_date,
         ).to_df()
     except Exception as e:
         if _is_billing_error(e):
-            _trip_billing_breaker("{} definitions".format(symbol))
+            _trip_billing_breaker("{} definitions".format(symbol), e)
         else:
             _emit_error("databento.fetch_failed", source="definitions",
                         symbol=symbol, exc=type(e).__name__)
@@ -325,7 +340,7 @@ def get_historical_daily_options(symbol, start_date, end_date,
         ).to_df()
     except Exception as e:
         if _is_billing_error(e):
-            _trip_billing_breaker("{} ohlcv-1d".format(symbol))
+            _trip_billing_breaker("{} ohlcv-1d".format(symbol), e)
         else:
             _emit_error("databento.fetch_failed", source="ohlcv-1d",
                         symbol=symbol, exc=type(e).__name__)
@@ -538,7 +553,7 @@ def get_equity_bars(symbol, start, end, schema="ohlcv-1d"):
         ).to_df())
     except Exception as e:
         if _is_insufficient_funds(e):
-            _trip_billing_breaker("equity bars")
+            _trip_billing_breaker("equity bars", e)
         else:
             # Surface the actual Databento detail, not just the class name.
             # `BentoClientError` alone is undiagnosable -- the SDK carries the
@@ -691,7 +706,7 @@ def get_vix_proxy(target_date_et=None):
         # open the breaker here; a 403/entitlement error negative-caches and
         # falls through to the Yahoo/VIXY VIX sources instead.
         if _is_insufficient_funds(e):
-            _trip_billing_breaker("vix proxy")
+            _trip_billing_breaker("vix proxy", e)
         else:
             _emit_error("databento.fetch_failed", source="vix_proxy",
                         exc=type(e).__name__, detail=str(e)[:300])
@@ -767,7 +782,7 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 
     except Exception as e:
         if _is_billing_error(e):
-            _trip_billing_breaker("{} overnight".format(contract))
+            _trip_billing_breaker("{} overnight".format(contract), e)
         else:
             _emit_error("databento.fetch_failed", source="overnight",
                         symbol=contract, exc=type(e).__name__)
@@ -931,7 +946,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
             stats_df = _pull_with_retry(lambda: _pull_stats(stats_start))
     except Exception as e:
         if _is_billing_error(e):
-            _trip_billing_breaker("{} statistics".format(underlying))
+            _trip_billing_breaker("{} statistics".format(underlying), e)
         else:
             _emit_error("databento.fetch_failed", source="statistics",
                         symbol=underlying, exc=type(e).__name__,
@@ -1018,7 +1033,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                     continue
     except Exception as e:
         if _is_billing_error(e):
-            _trip_billing_breaker("{} resolve".format(underlying))
+            _trip_billing_breaker("{} resolve".format(underlying), e)
         else:
             _emit_error("databento.fetch_failed", source="resolve",
                         symbol=underlying, exc=type(e).__name__,
@@ -1054,7 +1069,7 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
                         continue
         except Exception as e:
             if _is_billing_error(e):
-                _trip_billing_breaker("{} ohlcv-1d".format(underlying))
+                _trip_billing_breaker("{} ohlcv-1d".format(underlying), e)
                 return []
             _emit_error("databento.fetch_failed", source="ohlcv-1d-px",
                         symbol=underlying, exc=type(e).__name__,
@@ -1134,12 +1149,16 @@ def diagnostic():
         "sdk_installed": _SDK_AVAILABLE,
         "key_set":       bool(DATABENTO_KEY),
         "available":     is_available(),
+        "billing":       billing_status(),
     }
     if not is_available():
         if not _SDK_AVAILABLE:
             out["note"] = "Install databento SDK: pip install databento"
         elif not DATABENTO_KEY:
             out["note"] = "Set DATABENTO_API_KEY env var."
+        elif _billing_blocked():
+            out["note"] = ("Billing breaker open — see billing.last_trip "
+                           "for the failing call and error detail.")
         return out
 
     out["accessible_datasets"] = list_available_datasets()

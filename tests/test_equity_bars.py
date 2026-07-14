@@ -69,3 +69,26 @@ def test_vix_proxy_402_does_trip_shared_breaker(monkeypatch):
     assert dba.get_vix_proxy() is None
     assert dba._billing_blocked()       # breaker opened
     _reset_breaker()
+
+
+def test_billing_status_reports_last_trip_reason(monkeypatch):
+    # Diagnostics must show WHY the breaker opened, not just that it did:
+    # the root-cause stderr line rotates out of the debug ring, and
+    # /databento used to report available=false with no explanation.
+    _reset_breaker()
+    monkeypatch.setattr(dba, "_last_billing_trip", None)
+    monkeypatch.setattr(
+        dba, "_get_client",
+        lambda: _RaisingClient(Exception("402 account_insufficient_funds")))
+    monkeypatch.setattr(dba, "_cache_get", lambda *a, **k: None)
+    monkeypatch.setattr(dba, "_neg_cached", lambda *a, **k: False)
+    monkeypatch.setattr(dba, "_neg_cache_set", lambda *a, **k: None)
+
+    dba.get_vix_proxy()
+    status = dba.billing_status()
+    assert status["blocked"]
+    trip = status["last_trip"]
+    assert trip["context"] == "vix proxy"
+    assert "account_insufficient_funds" in trip["detail"]
+    assert trip["at"]
+    _reset_breaker()
