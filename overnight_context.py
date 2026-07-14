@@ -8,8 +8,14 @@
 #   3. Gap classification: where does today's RTH open sit relative to the
 #      overnight range? Each class has a distinct base rate.
 #
-# Provider: Databento for real CME futures (preferred); Alpaca ETF
-# extended-hours bars (SPY/QQQ/IWM) as the no-license fallback.
+# Provider priority:
+#   1. Databento (real CME futures — best)
+#   2. Yahoo Finance continuous futures (ES=F/NQ=F — free, full Globex session)
+#   3. Alpaca ETF extended-hours bars (SPY/QQQ/IWM) as the last-ditch proxy.
+#      NOTE: the ETF proxy only prints during the 4:00-9:30 AM ET premarket,
+#      so it structurally MISSES the actual overnight high/low. It exists only
+#      so the brief degrades instead of vanishing when both futures sources
+#      are down.
 
 import os
 import statistics
@@ -50,6 +56,78 @@ def _fetch_alpaca_extended_hours(symbol, start_iso, end_iso):
         return []
 
 
+_YAHOO_FUTURES = {"ES": "ES=F", "NQ": "NQ=F", "RTY": "RTY=F", "YM": "YM=F"}
+
+# Sanity bounds (futures points): reject mis-scaled or garbage prints before
+# they poison the overnight range/inventory read. Same idea as
+# index_data._LEVEL_BOUNDS.
+_FUTURES_BOUNDS = {
+    "ES":  (1500,  30000),
+    "NQ":  (5000,  80000),
+    "RTY": (800,   10000),
+    "YM":  (10000, 100000),
+}
+
+
+def _fetch_yahoo_futures(contract, start_iso, end_iso):
+    """
+    Continuous front-month futures bars from Yahoo Finance (ES=F, NQ=F, ...).
+
+    Free, key-less, and covers the FULL Globex session — unlike the SPY/QQQ
+    extended-hours proxy, which only prints during the 4:00-9:30 AM ET
+    premarket and structurally misses the real overnight high/low.
+
+    Returns an ascending list of {t, o, h, l, c, v} dicts in futures points,
+    clipped to [start_iso, end_iso), or [] on any failure (yfinance missing,
+    Yahoo blocked on the host, empty frame).
+    """
+    ticker = _YAHOO_FUTURES.get(contract)
+    if not ticker:
+        return []
+    try:
+        import yfinance as yf
+    except ImportError:
+        return []
+
+    lo, hi = _FUTURES_BOUNDS.get(contract, (0.0, float("inf")))
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt   = datetime.fromisoformat(end_iso)
+        hist = yf.Ticker(ticker).history(
+            start=start_dt, end=end_dt, interval="5m", auto_adjust=False)
+        if hist is None or hist.empty:
+            return []
+        bars = []
+        for ts, row in hist.iterrows():
+            try:
+                if ts.tzinfo is None:
+                    continue  # can't place a naive stamp in the window safely
+                if ts < start_dt or ts >= end_dt:
+                    continue
+                o = float(row["Open"])
+                h = float(row["High"])
+                l = float(row["Low"])
+                c = float(row["Close"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if h < l or not all(lo <= v <= hi for v in (o, h, l, c)):
+                continue
+            try:
+                vol = int(row.get("Volume") or 0)
+            except (TypeError, ValueError):
+                vol = 0
+            bars.append({
+                "t": ts.isoformat(),
+                "o": o, "h": h, "l": l, "c": c,
+                "v": max(vol, 0),
+            })
+        return bars
+    except Exception as e:
+        print("[overnight] Yahoo {} futures fetch failed: {}".format(
+            contract, e))
+        return []
+
+
 # =============================================
 # OVERNIGHT SESSION DEFINITION
 # =============================================
@@ -80,7 +158,8 @@ def _get_overnight_bars(target_date_et, contract="ES"):
     """
     Get overnight bars. Provider priority:
       1. Databento (real CME futures — best)
-      2. Alpaca ETF proxy (SPY/QQQ/IWM extended hours — fallback)
+      2. Yahoo Finance continuous futures (ES=F/NQ=F — free, full Globex)
+      3. Alpaca ETF proxy (SPY/QQQ/IWM extended hours — premarket only)
     Returns (bars, source) where bars is a list of {t, o, h, l, c, v} dicts
     and source is 'futures' or 'etf_proxy'. The source matters downstream:
     futures bars are in futures points, proxy bars in ETF dollars, and the
@@ -101,8 +180,14 @@ def _get_overnight_bars(target_date_et, contract="ES"):
     except Exception:
         pass
 
-    # --- Path 2: Alpaca ETF proxy fallback ---
     start_iso, end_iso = overnight_window(target_date_et)
+
+    # --- Path 2: Yahoo continuous futures (real overnight, futures points) ---
+    bars = _fetch_yahoo_futures(contract, start_iso, end_iso)
+    if bars:
+        return bars, "futures"
+
+    # --- Path 3: Alpaca ETF proxy fallback (premarket coverage only) ---
     proxy_map = {"ES": "SPY", "NQ": "QQQ", "RTY": "IWM"}
     proxy = proxy_map.get(contract, "SPY")
     return _fetch_alpaca_extended_hours(proxy, start_iso, end_iso), "etf_proxy"
