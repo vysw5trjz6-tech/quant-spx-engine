@@ -5310,14 +5310,22 @@ def run_premarket_brief():
             msg_lines.append("  {}".format(regime["note"]))
         msg_lines.append("")
 
-    # Overnight context
+    # Overnight context. The heading must say what units the numbers are in:
+    # real futures points on the Databento/Yahoo paths, SPY dollars on the
+    # ETF-proxy path (which only covers the 4:00-9:30 AM premarket and misses
+    # the true overnight extremes — flag it so the range isn't trusted).
     if premarket:
         es = premarket.get("es_overnight") or {}
         if es:
-            msg_lines.append("ES OVERNIGHT:")
-            msg_lines.append("  Range: {} – {}".format(es.get("low"), es.get("high")))
-            msg_lines.append("  Close: {} ({:.0%} of range)".format(
-                es.get("last_print"), es.get("close_loc", 0)))
+            if es.get("source") == "futures":
+                msg_lines.append("ES OVERNIGHT (futures pts):")
+            else:
+                msg_lines.append("ES OVERNIGHT (⚠ SPY proxy $ — premarket "
+                                 "only, misses true ON range):")
+            msg_lines.append("  Range: {:,.2f} – {:,.2f}".format(
+                es.get("low", 0), es.get("high", 0)))
+            msg_lines.append("  Close: {:,.2f} ({:.0%} of range)".format(
+                es.get("last_print", 0), es.get("close_loc", 0)))
         inv = premarket.get("es_inventory") or {}
         if inv:
             msg_lines.append("  Inventory: {} → bias {}".format(
