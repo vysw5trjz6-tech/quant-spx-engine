@@ -938,6 +938,17 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     #    active contract, so a 1d window captures the full chain. Widen
     #    to 4d only if the first pull is empty (long weekend / holiday).
     #    Transient 5xx/timeouts retry; only genuine 402s trip the breaker.
+    #
+    #    WINDOW SEMANTICS (why the sweeps run in the MORNING): get_range's
+    #    `end` is EXCLUSIVE and bare dates resolve to midnight UTC, so with
+    #    target=today this window is [today-1d 00:00Z, today 00:00Z) — it
+    #    can only return records disseminated on the UTC day BEFORE today.
+    #    An evening run therefore fetches the day-old batch (yesterday's
+    #    settlements, OI as of two closes ago). A morning run lands the
+    #    same window exactly on yesterday's full batch: yesterday's
+    #    settlements + the OI print reflecting positions after the prior
+    #    close — one session fresher on both, and the freshest thing the
+    #    historical API reliably has premarket.
     try:
         stats_start = (target_date_et - timedelta(days=1)).isoformat()
         stats_df = _pull_with_retry(lambda: _pull_stats(stats_start))

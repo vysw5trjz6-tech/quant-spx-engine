@@ -1529,9 +1529,10 @@ def is_trading_day():
     True if today (ET) is a US equity trading session — holiday-aware.
 
     Time-of-day independent: still True on a session day after the close,
-    so EOD jobs (GEX/OI/IV/AI) fire on Friday afternoon but NOT on the
-    weekend or on market holidays. Source is Alpaca's calendar endpoint;
-    falls back to a weekday check only if the API is unreachable.
+    so scheduled jobs (morning GEX/OI sweeps, EOD IV/AI) fire on Friday
+    but NOT on the weekend or on market holidays. Source is Alpaca's
+    calendar endpoint; falls back to a weekday check only if the API is
+    unreachable.
     """
     et    = pytz.timezone("America/New_York")
     today = datetime.now(et).strftime("%Y-%m-%d")
@@ -5017,8 +5018,9 @@ def _sweep_retry_due(key, gap_min=30):
 
 def _refresh_gex_snapshots():
     """
-    End-of-day chain snapshot: builds GEX, saves OI history for delta tracking.
-    Uses Databento (or Polygon fallback).
+    Morning chain snapshot (7:45 AM ET): builds GEX from yesterday's full
+    OPRA statistics batch — settlements + the freshest OI print historical
+    Databento can serve premarket — so the 9:10 brief prices the right book.
     """
     if not HAS_GEX:
         return
@@ -5952,11 +5954,15 @@ def background_scheduler():
             except Exception as _e:
                 log("paper trader (boot) error: {}".format(_e))
         threading.Thread(target=_paper_boot_run, daemon=True).start()
-    # GEX/OI read OPRA's EOD statistics batch (published well after the close),
-    # so they start at 5:30 PM ET. On a late boot, kick them once here too --
-    # the persistent success marker and the retry throttle keep the recurring
-    # scheduler from launching a duplicate run on its first iteration.
-    if _is_session and boot_hour >= 17.5:
+    # GEX/OI sweeps run in the MORNING (7:45 AM ET): with the adapter's
+    # end-exclusive [target-1d, target) window, a run on day T can only
+    # return the batch disseminated on T-1 — which in the morning is
+    # yesterday's full batch (settlements + the freshest available OI
+    # print), the exact book the 9:10 brief should price. On a later boot,
+    # kick them once here too -- the persistent success marker and the
+    # retry throttle keep the recurring scheduler from launching a
+    # duplicate run on its first iteration.
+    if _is_session and boot_hour >= 7.75:
         if not _sweep_already_done_today("gex") and _sweep_retry_due("gex"):
             threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
         if not _sweep_already_done_today("oi") and _sweep_retry_due("oi"):
@@ -6086,22 +6092,27 @@ def background_scheduler():
                     _overnight_done["date"] = today
                     threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
 
-            # Post-close GEX + OI snapshots (feed tomorrow's brief / OI-delta
-            # tracking). Both read OPRA's EOD `statistics` schema, whose
-            # open-interest batch is not published until well after the close,
-            # so the old 4:30 PM sweep returned empty chains (chain_len=0) and
-            # the fire-and-forget done-flag then lost the data until the next
-            # process restart. Start at 5:30 PM ET and retry on a throttle
-            # through ~8 PM, gating on the persistent success marker so we stop
-            # the moment a pull lands (and never re-run a sweep already paid
-            # for). IV stays earlier -- it pulls live Alpaca snapshots, not the
-            # Databento EOD batch, so it is available right after the close.
-            if (_session and 17.5 <= et_hour < 20.0
+            # Morning GEX + OI snapshots (feed today's brief / OI-delta
+            # tracking). Both read OPRA's `statistics` schema through a
+            # [target-1d, target) window with an EXCLUSIVE end (see the
+            # adapter), so a pull can only ever return the batch disseminated
+            # on the UTC day BEFORE the target date. Run in the evening this
+            # captured the day-old batch (OI two sessions stale by brief
+            # time); run in the morning the same window lands exactly on
+            # yesterday's full batch — yesterday's settlements plus the OI
+            # print reflecting positions after the prior close, one session
+            # fresher on both inputs and the freshest historical Databento
+            # can serve premarket. Start at 7:45 AM ET so the 9:10 brief has
+            # it, and keep retrying on the throttle through the evening
+            # (same target batch all day), gating on the persistent success
+            # marker so we stop the moment a pull lands (and never re-run a
+            # sweep already paid for).
+            if (_session and 7.75 <= et_hour < 20.0
                     and not _sweep_already_done_today("gex")
                     and _sweep_retry_due("gex")):
                 threading.Thread(target=_refresh_gex_snapshots, daemon=True).start()
 
-            if (_session and 17.58 <= et_hour < 20.0
+            if (_session and 7.83 <= et_hour < 20.0
                     and not _sweep_already_done_today("oi")
                     and _sweep_retry_due("oi")):
                 threading.Thread(target=_refresh_oi_snapshots, daemon=True).start()
@@ -7934,7 +7945,7 @@ def gex_endpoint():
     if not bias:
         return jsonify({
             "status":        "no_data",
-            "note":          "GEX not yet built. Requires DATABENTO_API_KEY and post-close refresh.",
+            "note":          "GEX not yet built. Requires DATABENTO_API_KEY and the 7:45 AM morning refresh.",
             "module_loaded": HAS_GEX,
             "databento_key": bool(os.getenv("DATABENTO_API_KEY", "").strip()),
         })
