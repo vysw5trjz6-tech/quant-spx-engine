@@ -131,6 +131,13 @@ except ImportError as _e:
     HAS_VOL1D = False
     print("[init] vol1d unavailable: {}".format(_e))
 
+try:
+    import index_alerts
+    HAS_INDEX_ALERTS = True
+except ImportError as _e:
+    HAS_INDEX_ALERTS = False
+    print("[init] index_alerts unavailable: {}".format(_e))
+
 # Operating mode: 'premarket' = single morning brief only (cheap, ~$2/mo)
 #                 'continuous' = refresh regime/GEX throughout the day (~$80/mo)
 # Default is premarket since most users only need a morning brief.
@@ -149,6 +156,7 @@ _market_state = {
     "vol1d":            None,   # latest vol1d.state.Vol1DState (updater thread)
     "vol1d_ts":         0,      # epoch when vol1d last computed
     "gex_live":         None,   # intraday index GEX (vol1d.gex_live), ~60s cadence
+    "gex_update":       None,   # 10:30 AM SPX/NDX GEX revision (run_gex_update)
 }
 _market_state_lock = threading.Lock()
 
@@ -164,11 +172,15 @@ ORB_BARS      = 6       # 30 min ORB (6 x 5min bars) - institutional standard
 
 # =============================================
 # PRODUCT TIERING
-#   INDEX (SPX/NDX)  -> context only, no signal cards (no cash-index options)
-#   ETF   (SPY/QQQ)  -> intraday/0DTE (the tradeable SPX/NDX proxies)
+#   ETF   (SPY/QQQ)  -> the DATA + tracking feed (Alpaca carries ETF bars
+#                       and option chains only; detection and position
+#                       monitoring stay proxy-denominated)
+#   INDEX (SPX/NDX)  -> the TRADED product: alerts and cards are
+#                       denominated in real index points / SPXW-NDXP
+#                       contracts via index_alerts
 # =============================================
-ETF_PRODUCTS   = ["SPY", "QQQ"]            # intraday/0DTE
-INDEX_PRODUCTS = ["SPX", "NDX"]            # context only (display level + RS)
+ETF_PRODUCTS   = ["SPY", "QQQ"]            # intraday/0DTE data feed
+INDEX_PRODUCTS = ["SPX", "NDX"]            # alert denomination + context
 
 # Intraday / 0DTE tradeable universe. The engine is focused on 0DTE SPX/NDX
 # exposure, traded through the daily-expiry ETF proxies.
@@ -1644,6 +1656,42 @@ def _index_anchor_level(idx, proxy, proxy_last):
         return round(prev["c"] * (proxy_last / p_prev), 2), True
     except Exception:
         return None, False
+
+
+def _attach_index_view(result):
+    """Denominate a proxy signal row in real index terms (SPY->SPX,
+    QQQ->NDX): entry/stop/targets in index points via the anchored ratio,
+    plus a real index contract (strike + premium off the delayed chain when
+    reachable, grid + scaled estimate otherwise). Merges idx_* fields into
+    the row in place; the proxy fields stay untouched because detection,
+    dedupe, and position monitoring remain proxy-denominated."""
+    if not HAS_INDEX_ALERTS:
+        return
+    symbol = result.get("symbol")
+    idx    = index_alerts.PROXY_TO_INDEX.get(symbol)
+    price  = result.get("price")
+    if not idx or not price:
+        return
+    try:
+        level, anchored = _index_anchor_level(idx, symbol, price)
+        if level is None:
+            _proxy, factor = INDEX_PROXY.get(idx, (None, None))
+            if not factor:
+                return
+            level = price * factor
+        fields = index_alerts.translate_signal(
+            result, idx, level / price, anchored=anchored)
+        if not fields:
+            return
+        # Chain refinement only for rows that can actually fire an alert --
+        # the delayed-chain pull is TTL-cached but still not free in latency.
+        if result.get("status") == "SIGNAL":
+            snap = index_alerts.fetch_chain(idx)
+            index_alerts.refine_with_chain(fields, snap,
+                                           result.get("direction"))
+        result.update(fields)
+    except Exception as e:
+        log("index view error for {}: {}".format(symbol, e))
 
 
 def index_context():
@@ -3900,6 +3948,12 @@ def scan_all_symbols():
             symbol, direction, grade, grade_pts,
             result["aligned"], clear_air["clear_to_t1"], clear_air["context"]))
 
+    # Denominate actionable rows in real index terms (SPX/NDX) before they
+    # reach the alert path and the dashboard cards.
+    for r in results:
+        if r.get("status") in ("SIGNAL", "SIGNAL (no options)", "WATCHING"):
+            _attach_index_view(r)
+
     # Compute composite rank score for every confirmed signal
     for r in results:
         if r.get("status") in ("SIGNAL", "SIGNAL (no options)"):
@@ -3928,6 +3982,85 @@ def scan_all_symbols():
 # =============================================
 # MAIN SCAN RUNNER
 # =============================================
+
+def _format_signal_alert(sig, context_line=""):
+    """Telegram body for a confirmed signal.
+
+    Rows carrying an index view (idx_* fields from _attach_index_view) are
+    denominated as the real SPX/NDX trade — index-point levels and the
+    SPXW/NDXP contract — with the proxy shown only as provenance. Rows
+    without one fall back to the proxy-denominated legacy format.
+    """
+    ctx  = "\n\n" + context_line if context_line else ""
+    conv = sig.get("conviction", 1.0) or 1.0
+    head = "{sig_type} {horizon} SIGNAL — {grade} ({gpts}pts)\n\n".format(
+        sig_type = sig.get("signal_type", "ORB"),
+        horizon  = sig.get("horizon", "INTRADAY"),
+        grade    = sig.get("grade", "?"),
+        gpts     = sig.get("grade_pts", "?"))
+    tail = ("Gap: {gap}%  •  RS vs SPY: {rs}%\n"
+            "Vol: {vol_lbl}{ctx}").format(
+        gap     = sig.get("gap_pct", "?"),
+        rs      = sig.get("rs", "?"),
+        vol_lbl = sig.get("vol_ratio") or "?",
+        ctx     = ctx)
+
+    if sig.get("idx_symbol") and sig.get("idx_price"):
+        cp   = "C" if sig.get("direction") == "CALL" else "P"
+        dte  = sig.get("idx_dte")
+        dte_lbl = ("{}DTE".format(dte) if dte is not None
+                   else sig.get("dte_label", "0DTE"))
+        prem = sig.get("idx_premium")
+        live = sig.get("idx_premium_src") == "chain_mid"
+        prem_str = ("{}${} ({})".format("" if live else "~", prem,
+                                        "chain mid" if live else "est")
+                    if prem is not None else "see chain")
+        approx = "" if sig.get("idx_anchored") else "  (≈ proxy-scaled)"
+        strike = sig.get("idx_strike")
+        body = (
+            "{idx} {dirn}  •  {ipx:,.2f}{approx}\n"
+            "Contract: {root} {dte} {strike}{cp}  •  {prem}\n"
+            "Und stop {ustop}  •  T1 {ut1}  •  T2 {ut2}\n"
+            "Opt stop ${ostop}  •  target ${otgt}  •  conv x{conv:.2f}\n"
+            "(signal + tracking via {proxy} ${price})\n\n"
+        ).format(
+            idx    = sig["idx_symbol"],
+            dirn   = sig.get("direction", "?"),
+            ipx    = sig["idx_price"],
+            approx = approx,
+            root   = sig.get("idx_root") or sig["idx_symbol"],
+            dte    = dte_lbl,
+            strike = ("{:,.0f}".format(strike) if strike is not None else "?"),
+            cp     = cp,
+            prem   = prem_str,
+            ustop  = ("{:,.2f}".format(sig["idx_und_stop"])
+                      if sig.get("idx_und_stop") is not None else "?"),
+            ut1    = ("{:,.2f}".format(sig["idx_und_t1"])
+                      if sig.get("idx_und_t1") is not None else "?"),
+            ut2    = ("{:,.2f}".format(sig["idx_und_t2"])
+                      if sig.get("idx_und_t2") is not None else "?"),
+            ostop  = sig.get("idx_opt_stop", "?"),
+            otgt   = sig.get("idx_opt_target", "?"),
+            conv   = conv,
+            proxy  = sig["symbol"],
+            price  = sig["price"])
+        return head + body + tail
+
+    body = (
+        "{sym} {dirn}  •  ${price}\n"
+        "Strike: {strike}  •  Premium: ${prem}\n"
+        "Stop ${stop}  •  Target ${target}  •  conv x{conv:.2f}\n\n"
+    ).format(
+        sym    = sig["symbol"],
+        dirn   = sig["direction"],
+        price  = sig["price"],
+        strike = sig["strike"],
+        prem   = sig["premium"],
+        stop   = sig["stop"],
+        target = sig["target"],
+        conv   = conv)
+    return head + body + tail
+
 
 def run_signal_scan():
     global all_signals, next_scan_at
@@ -4023,31 +4156,7 @@ def run_signal_scan():
                 context_line += "GEX: ${}B {}".format(
                     _g["gex_b"], _g.get("tape_bias", ""))
 
-            msg = (
-                "{sig_type} {horizon} SIGNAL — {grade} ({gpts}pts)\n\n"
-                "{sym} {dirn}  •  ${price}\n"
-                "Strike: {strike}  •  Premium: ${prem}\n"
-                "Stop ${stop}  •  Target ${target}  •  conv x{conv:.2f}\n\n"
-                "Gap: {gap}%  •  RS vs SPY: {rs}%\n"
-                "Vol: {vol_lbl}{ctx}"
-            ).format(
-                sig_type   = sig.get("signal_type", "ORB"),
-                horizon    = sig.get("horizon", "INTRADAY"),
-                grade      = sig.get("grade", "?"),
-                gpts       = sig.get("grade_pts", "?"),
-                sym        = sig["symbol"],
-                dirn       = sig["direction"],
-                price      = sig["price"],
-                strike     = sig["strike"],
-                prem       = sig["premium"],
-                stop       = sig["stop"],
-                target     = sig["target"],
-                conv       = sig.get("conviction", 1.0) or 1.0,
-                gap        = sig.get("gap_pct", "?"),
-                rs         = sig.get("rs", "?"),
-                vol_lbl    = sig.get("vol_ratio") or "?",
-                ctx        = "\n\n" + context_line if context_line else "",
-            )
+            msg = _format_signal_alert(sig, context_line)
             send_telegram(msg)
             # Auto-open the tracked position so this tier is now locked until
             # the underlying hits T1 (win) or stop (loss).
@@ -4067,7 +4176,7 @@ def run_signal_scan():
             lines = []
             for w in top3:
                 lines.append("{} {} | Score:{} | {}ORB | {}VWAP".format(
-                    w["symbol"], w.get("direction","?"),
+                    w.get("idx_symbol") or w["symbol"], w.get("direction","?"),
                     w.get("score","?"),
                     w.get("vs_orb","?"), w.get("vs_vwap","?")))
             send_telegram(
@@ -5433,6 +5542,51 @@ def run_premarket_brief():
     log("Premarket brief sent ({} chars)".format(len(msg)))
 
 
+def run_gex_update():
+    """Intraday GEX revision, ~1 hour into the session (10:30 AM ET).
+
+    The premarket brief freezes the gamma picture as of last night's OI +
+    settlement; by 10:30 the open auction has repriced spot and IV, walls
+    migrate, and the flip point may already have been crossed. This
+    recomputes SPX/NDX dealer GEX from the free CBOE delayed chain (zero
+    Databento spend, so it runs in premarket mode too) and sends the deltas
+    vs the morning read.
+    """
+    if not HAS_INDEX_ALERTS:
+        return
+    et    = pytz.timezone("America/New_York")
+    today = datetime.now(et).date().isoformat()
+    log("=== Intraday GEX update generating ({}) ===".format(today))
+
+    reads = {}
+    for idx in INDEX_PRODUCTS:
+        try:
+            reads[idx] = index_alerts.compute_index_gex(idx)
+        except Exception as e:
+            log("gex update {} error: {}".format(idx, e))
+            reads[idx] = None
+
+    with _market_state_lock:
+        ins = _market_state.get("index_insights") or {}
+    baselines = {idx: ins.get(idx) for idx in INDEX_PRODUCTS}
+
+    msg = index_alerts.build_gex_update_message(reads, baselines)
+    if not msg:
+        log_event("gex.update_skipped", level="warn",
+                  reason="no live chain read for SPX or NDX")
+        return
+
+    with _market_state_lock:
+        _market_state["gex_update"] = {
+            "date":  today,
+            "ts":    time.time(),
+            "reads": reads,
+        }
+    send_telegram(msg)
+    log_event("gex.update_sent",
+              spx=bool(reads.get("SPX")), ndx=bool(reads.get("NDX")))
+
+
 import plan_summary as _plan_summary
 
 
@@ -5822,6 +5976,8 @@ def background_scheduler():
     # scheduler retries through the session (OPRA availability lags intraday).
     _daily_refresh_done["flow"]       = False
     _daily_refresh_done["premarket"]  = (boot_hour >= 8.5)
+    # 10:30 GEX update: only mark done when booting after its firing window.
+    _daily_refresh_done["gex_1030"]   = boot_hour >= 11.5
     # gex/oi are governed by their own persistent success marker + retry
     # throttle (see _sweep_retry_due), not this in-memory done-flag.
     _daily_refresh_done["iv"]         = boot_hour >= 16.25
@@ -5852,6 +6008,7 @@ def background_scheduler():
                 _daily_refresh_done["vol"]       = False
                 _daily_refresh_done["iv"]        = False
                 _daily_refresh_done["premarket"] = False
+                _daily_refresh_done["gex_1030"]  = False
                 _daily_refresh_done["mprofile"]  = False
                 _daily_refresh_done["flow"]      = False
                 _daily_refresh_done["paper"]     = False
@@ -5894,6 +6051,16 @@ def background_scheduler():
                     > 1800):
                 _daily_refresh_done["flow_attempt"] = time.time()
                 threading.Thread(target=_pull_opening_flow, daemon=True).start()
+
+            # --- INTRADAY GEX UPDATE (10:30 AM ET, once daily) ---
+            # One hour into the session: SPX/NDX dealer GEX recomputed at
+            # live spot/IV off the free CBOE delayed chain. No Databento
+            # spend, so it fires in BOTH operating modes — in premarket
+            # mode it's the one intraday revision of the morning read.
+            if (_session and 10.5 <= et_hour < 11.5
+                    and not _daily_refresh_done.get("gex_1030")):
+                _daily_refresh_done["gex_1030"] = True
+                threading.Thread(target=run_gex_update, daemon=True).start()
 
             # Re-classify regime against intraday RV every scan from ~10:00 AM
             # to just before the close. The recheck is monotonic + idempotent
@@ -6093,6 +6260,20 @@ def render_dashboard(toast=""):
         d      = s.get("direction", "")
         status = s.get("status", "")
 
+        # Index denomination (SPX/NDX) — the traded product leads the card;
+        # the proxy feed stays visible as provenance.
+        idx_sym = s.get("idx_symbol")
+        if idx_sym:
+            sym_disp = ("{idx} <span style='font-size:11px;color:#8b949e;"
+                        "font-weight:600'>via {sym}</span>").format(
+                            idx=idx_sym, sym=sym)
+            idx_line = ("<div style='font-size:11px;color:#79c0ff;"
+                        "margin-top:3px;font-family:monospace'>{} {:,.2f}"
+                        "</div>").format(idx_sym, s.get("idx_price") or 0)
+        else:
+            sym_disp = sym
+            idx_line = ""
+
         grade       = s.get("grade") or "-"
         grade_pts   = float(s.get("grade_pts") or 0)
         grade_color = s.get("grade_color") or "#8b949e"
@@ -6209,6 +6390,23 @@ def render_dashboard(toast=""):
         dte_lbl     = str(s.get("dte_label") or "0DTE")
         dte_color   = "#3fb950" if dte_lbl == "0DTE" else "#e3b341"
 
+        idx_contract = ""
+        if idx_sym and s.get("idx_strike") is not None:
+            _prem = s.get("idx_premium")
+            _live = s.get("idx_premium_src") == "chain_mid"
+            idx_contract = (
+                "<div style='font-size:11px;color:#79c0ff;margin-top:4px;"
+                "font-family:monospace'>{root} {strike:,.0f}{cp}"
+                " {tilde}${prem} <span style='color:#8b949e'>({src})</span>"
+                "</div>"
+            ).format(
+                root   = s.get("idx_root") or idx_sym,
+                strike = s["idx_strike"],
+                cp     = "C" if d == "CALL" else "P",
+                tilde  = "" if _live else "~",
+                prem   = _prem if _prem is not None else "?",
+                src    = "chain mid" if _live else "est")
+
         if has_options:
             prem     = s.get("premium", "-")
             stp_opt  = s.get("stop", "-")
@@ -6232,13 +6430,15 @@ def render_dashboard(toast=""):
           <div style='font-size:10px;color:#8b949e;margin-top:2px'>
             Stop ${sopt} &nbsp;|&nbsp; Target ${topt}
           </div>
+          {idx_contract}
         </div>
         <a href='{url}' style='background:#238636;color:#fff;padding:10px 20px;
            border-radius:6px;text-decoration:none;font-size:13px;font-weight:700;
            letter-spacing:.3px;white-space:nowrap'>LOG TRADE</a>
       </div>""".format(
                 prem=prem, sopt=stp_opt, topt=tgt_opt,
-                url=take_url, dte_lbl=dte_lbl, dte_color=dte_color)
+                url=take_url, dte_lbl=dte_lbl, dte_color=dte_color,
+                idx_contract=idx_contract)
         else:
             option_section = """
       <div style='background:#0d1117;border-radius:6px;padding:10px 12px;
@@ -6256,7 +6456,7 @@ def render_dashboard(toast=""):
               align-items:center;justify-content:space-between;
               border-bottom:1px solid {dborder}'>
     <div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap'>
-      <span style='font-size:18px;font-weight:800;letter-spacing:.5px'>{sym}</span>
+      <span style='font-size:18px;font-weight:800;letter-spacing:.5px'>{sym_disp}</span>
       <span style='color:{dc};font-size:14px;font-weight:700'>{arr} {d}</span>
       {sig_type_badge}{primary_badge}{late_badge}{ct_badge}
     </div>
@@ -6283,6 +6483,7 @@ def render_dashboard(toast=""):
         <div style='font-size:10px;color:#8b949e;text-transform:uppercase;
                     letter-spacing:.5px;margin-bottom:4px'>Underlying</div>
         <div style='font-size:22px;font-weight:700;font-family:monospace'>${price}</div>
+        {idx_line}
         <div style='font-size:10px;color:#8b949e;margin-top:3px'>
           VWAP ${vwap} &nbsp;|&nbsp; {vs_vwap}
         </div>
@@ -6360,7 +6561,7 @@ def render_dashboard(toast=""):
     {option_section}
   </div>
 </div>""".format(
-            sym=sym, d=d, arr=arr, dc=dc,
+            sym_disp=sym_disp, idx_line=idx_line, d=d, arr=arr, dc=dc,
             dbg=dir_bg, dborder=dir_border,
             grade=grade, gpts=grade_pts, gc=grade_color,
             primary_badge=primary_badge, late_badge=late_badge, ct_badge=ct_badge,
@@ -6386,21 +6587,27 @@ def render_dashboard(toast=""):
     # - WATCHING compact rows -
     watch_rows = ""
     for s in watching_list:
-        sym  = s["symbol"]
+        sym  = s.get("idx_symbol") or s["symbol"]
         d    = s.get("direction","")
         dc   = "#3fb950" if d=="CALL" else "#f85149"
-        p    = s.get("price","-")
+        # Index points (no $) when translated; proxy dollars otherwise.
+        _ip  = s.get("idx_price")
+        p    = "{:,.2f}".format(_ip) if _ip else "${}".format(s.get("price","-"))
         rs   = s.get("rs") or 0
         rsc  = "#3fb950" if rs >= 0 else "#f85149"
         gap  = s.get("gap_pct") or 0
         gapc = "#3fb950" if (s.get("gap_dir")=="UP") else "#f85149" if (s.get("gap_dir")=="DOWN") else "#8b949e"
         orb  = s.get("orb_high","-") if d=="CALL" else s.get("orb_low","-")
-        brk  = "above ${}" .format(orb) if d=="CALL" else "below ${}".format(orb)
+        # Break level in index points when the row carries an index view.
+        _ratio = s.get("idx_ratio")
+        if _ratio and isinstance(orb, (int, float)):
+            orb = round(orb * _ratio, 2)
+        brk  = "above {}" .format(orb) if d=="CALL" else "below {}".format(orb)
         watch_rows += (
             "<tr style='border-bottom:1px solid #21262d'>"
             "<td style='padding:8px 10px;font-weight:700;font-size:13px'>{sym}</td>"
             "<td style='padding:8px 6px;color:{dc};font-size:12px;font-weight:600'>{d}</td>"
-            "<td style='padding:8px 6px;font-family:monospace;font-size:12px'>${p}</td>"
+            "<td style='padding:8px 6px;font-family:monospace;font-size:12px'>{p}</td>"
             "<td style='padding:8px 6px;font-size:11px;color:#e3b341'>Break {brk}</td>"
             "<td style='padding:8px 6px;font-size:11px'>"
             "  Gap <span style='color:{gapc}'>{gap:+.2f}%</span>"
@@ -7740,11 +7947,14 @@ def gex_endpoint():
             raw_qqq = gamma_exposure.load_latest_gex("QQQ")
         except Exception:
             pass
+    with _market_state_lock:
+        intraday_update = _market_state.get("gex_update")
     return jsonify({
-        "status":     "ok",
-        "bias":       bias,
-        "spy_latest": raw_spy,
-        "qqq_latest": raw_qqq,
+        "status":          "ok",
+        "bias":            bias,
+        "spy_latest":      raw_spy,
+        "qqq_latest":      raw_qqq,
+        "intraday_update": intraday_update,
     })
 
 
@@ -7919,6 +8129,19 @@ def brief_endpoint():
         "status":         "queued",
         "operating_mode": OPERATING_MODE,
         "note":           "Premarket brief queued. Check Telegram in ~30s.",
+    })
+
+
+@app.route("/gexupdate")
+def gex_update_trigger_endpoint():
+    """
+    Manually trigger the intraday SPX/NDX GEX update (normally fires at
+    10:30 AM ET). Free CBOE delayed-chain read; no Databento spend.
+    """
+    threading.Thread(target=run_gex_update, daemon=True).start()
+    return jsonify({
+        "status": "queued",
+        "note":   "Intraday GEX update queued. Check Telegram in ~30s.",
     })
 
 
