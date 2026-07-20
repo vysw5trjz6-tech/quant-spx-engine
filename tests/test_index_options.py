@@ -2,12 +2,16 @@
 # expected move from the ATM straddle, front-expiry OI structure, gamma
 # walls, and the AM/PM duplicate-root handling.
 
-from datetime import date
+from datetime import date, timedelta
 
 import index_options
 
 
-TODAY = date(2026, 7, 9)
+# Real today, not a pinned date: the gamma-wall path delegates to
+# gamma_exposure.compute_gex_from_chain, which dates contracts off the
+# actual wall clock — a pinned TODAY turns every expiry stale (dte < 0)
+# once that date passes and the walls silently compute to None.
+TODAY = date.today()
 
 
 def _c(strike, expiry, typ, oi, price, iv=0.18):
@@ -24,7 +28,7 @@ def _c(strike, expiry, typ, oi, price, iv=0.18):
 def _chain():
     """SPX-like chain: today's 0DTE expiry plus one more."""
     t = TODAY.isoformat()
-    nxt = "2026-07-10"
+    nxt = (TODAY + timedelta(days=1)).isoformat()
     return [
         # 0DTE strikes around spot 6300
         _c(6250, t, "put",  20000, 6.0),
@@ -89,9 +93,10 @@ def test_duplicate_am_pm_roots_prefer_higher_oi():
 
 
 def test_next_expiry_used_when_no_0dte():
+    nxt = (TODAY + timedelta(days=1)).isoformat()
     chain = [
-        _c(6300, "2026-07-10", "call", 5000, 32.0),
-        _c(6300, "2026-07-10", "put",  5000, 30.0),
+        _c(6300, nxt, "call", 5000, 32.0),
+        _c(6300, nxt, "put",  5000, 30.0),
     ]
     ins = index_options.compute_insights_from_chain(
         chain, spot=6300.0, index="SPX", today=TODAY)
