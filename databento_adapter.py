@@ -9,6 +9,7 @@
 # Auth: set DATABENTO_API_KEY env var.
 
 import os
+import re
 import sys
 import json
 import time
@@ -62,7 +63,16 @@ def _is_billing_error(exc):
         so re-hitting a locked account across 72 symbols on every scan both
         burns money and floods the logs with 403s. Classify it here so the
         breaker opens on the first occurrence.
+
+    Window/licensing rejections (422 data_end_after_available_end, 403
+    license_not_found_unauthorized) are NOT account-state errors: they mean
+    "this query's end reaches into a period this account can't read", the
+    account itself is fine, and clamping the window fixes the query. They
+    used to match the blanket 403 test below and open the shared breaker,
+    blanking OI/GEX/IV for 30 minutes over a single mis-sized window.
     """
+    if _is_window_error(exc):
+        return False
     s = "{} {}".format(type(exc).__name__, exc).lower()
     return (
         "account_insufficient_funds" in s
@@ -105,6 +115,133 @@ def _is_transient_error(exc):
         return False
     s = "{} {}".format(type(exc).__name__, exc).lower()
     return any(m in s for m in _TRANSIENT_MARKERS)
+
+
+# =============================================
+# AVAILABILITY / LICENSING HORIZON
+# =============================================
+#
+# The historical API rejects windows that reach past what the account can
+# read, in two flavors:
+#   * 422 data_end_after_available_end -- `end` is beyond the dataset's
+#     published range (e.g. asking EQUS.MINI for "tomorrow" to capture
+#     today's bar before today has settled).
+#   * 403 license_not_found_unauthorized -- the window reaches into the
+#     recent period (roughly the current/last session) that Databento only
+#     serves to accounts holding a LIVE data license for that dataset
+#     ("A live data license is required to access OPRA.PILLAR data after
+#     <cutoff>").
+# Both messages carry the exact cutoff timestamp, so instead of failing the
+# fetch (and, for the 403, tripping the shared billing breaker), we parse
+# the cutoff, remember it per dataset, clamp `end` to it and retry once.
+# Later calls clamp preemptively while the learned cutoff is fresh, so
+# steady state doesn't pay for a rejected probe first.
+
+_WINDOW_ERROR_MARKERS = (
+    "data_end_after_available_end",
+    "data_start_after_available_end",
+    "license_not_found",
+    "live data license",
+)
+
+# "has data available up to '2026-07-21 00:00:00+00:00'"  (422)
+# "access OPRA.PILLAR data after 2026-07-20T13:30:00.000000000Z"  (403)
+_CUTOFF_RES = (
+    re.compile(r"available up to '([^']+)'"),
+    re.compile(r"data after\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"),
+)
+
+_HORIZON_TTL_SECS = 4 * 3600
+_avail_horizon = {}   # dataset -> {"end": naive-UTC datetime, "learned_at": float}
+
+
+def _is_window_error(exc):
+    s = "{} {}".format(type(exc).__name__, exc).lower()
+    return any(m in s for m in _WINDOW_ERROR_MARKERS)
+
+
+def _parse_when(value):
+    """'YYYY-MM-DD[ T]HH:MM:SS...' or bare 'YYYY-MM-DD' -> naive-UTC
+    datetime (bare dates are midnight UTC, matching Databento semantics).
+    Returns None when unparseable."""
+    try:
+        return datetime.fromisoformat(str(value).replace(" ", "T")[:19])
+    except (ValueError, TypeError):
+        return None
+
+
+def _availability_cutoff(exc):
+    """Extract the server-reported cutoff from a window/licensing rejection.
+    Returns a naive-UTC datetime, or None when the message carries none."""
+    s = str(exc)
+    for rx in _CUTOFF_RES:
+        m = rx.search(s)
+        if m:
+            return _parse_when(m.group(1))
+    return None
+
+
+def _learn_horizon(dataset, cutoff):
+    _avail_horizon[dataset] = {"end": cutoff, "learned_at": time.time()}
+
+
+def _horizon_end(dataset):
+    h = _avail_horizon.get(dataset)
+    if not h or time.time() - h["learned_at"] > _HORIZON_TTL_SECS:
+        return None
+    return h["end"]
+
+
+def _clamp_end(dataset, end):
+    """Clamp a get_range `end` to the dataset's learned horizon. Returns the
+    (possibly unchanged) end as an ISO string usable in the API call."""
+    horizon = _horizon_end(dataset)
+    if horizon is None:
+        return end
+    end_dt = _parse_when(end)
+    if end_dt is None or end_dt <= horizon:
+        return end
+    return horizon.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _get_range_clamped(client, dataset, start, end, **kwargs):
+    """timeseries.get_range with window/licensing-horizon handling.
+
+    Preemptively clamps `end` to the learned horizon for `dataset`; when the
+    server still rejects the window, learns the reported cutoff and retries
+    once with the clamped end. Returns a DataFrame, or None when the clamped
+    window is empty (start >= usable end -- the whole window sits in the
+    live-license-only period). Errors that aren't window/licensing problems
+    propagate to the caller unchanged.
+    """
+    def _pull(end_value):
+        return _pull_with_retry(lambda: client.timeseries.get_range(
+            dataset=dataset, start=start, end=end_value, **kwargs
+        ).to_df())
+
+    start_dt = _parse_when(start)
+
+    def _empty(end_value):
+        end_dt = _parse_when(end_value)
+        return (start_dt is not None and end_dt is not None
+                and end_dt <= start_dt)
+
+    first_end = _clamp_end(dataset, end)
+    if _empty(first_end):
+        return None
+    try:
+        return _pull(first_end)
+    except Exception as e:
+        cutoff = _availability_cutoff(e) if _is_window_error(e) else None
+        if cutoff is None:
+            raise
+        _learn_horizon(dataset, cutoff)
+        retry_end = _clamp_end(dataset, end)
+        if retry_end == first_end:
+            raise
+        if _empty(retry_end):
+            return None
+        return _pull(retry_end)
 
 
 def _pull_with_retry(fn, retries=2, backoff=1.5):
@@ -278,20 +415,19 @@ def get_historical_daily_options(symbol, start_date, end_date,
     end_iso   = end_date.isoformat()
 
     try:
-        def_df = client.timeseries.get_range(
-            dataset  = "OPRA.PILLAR",
+        def_df = _get_range_clamped(
+            client, "OPRA.PILLAR", start_iso, end_iso,
             symbols  = [parent],
             stype_in = "parent",
             schema   = "definition",
-            start    = start_iso,
-            end      = end_iso,
-        ).to_df()
+        )
     except Exception as e:
         if _is_billing_error(e):
             _trip_billing_breaker("{} definitions".format(symbol), e)
         else:
             _emit_error("databento.fetch_failed", source="definitions",
-                        symbol=symbol, exc=type(e).__name__)
+                        symbol=symbol, exc=type(e).__name__,
+                        detail=str(e)[:300])
         return []
 
     if def_df is None or def_df.empty:
@@ -330,20 +466,19 @@ def get_historical_daily_options(symbol, start_date, end_date,
         return []
 
     try:
-        ohlcv_df = client.timeseries.get_range(
-            dataset  = "OPRA.PILLAR",
+        ohlcv_df = _get_range_clamped(
+            client, "OPRA.PILLAR", start_iso, end_iso,
             symbols  = [parent],
             stype_in = "parent",
             schema   = "ohlcv-1d",
-            start    = start_iso,
-            end      = end_iso,
-        ).to_df()
+        )
     except Exception as e:
         if _is_billing_error(e):
             _trip_billing_breaker("{} ohlcv-1d".format(symbol), e)
         else:
             _emit_error("databento.fetch_failed", source="ohlcv-1d",
-                        symbol=symbol, exc=type(e).__name__)
+                        symbol=symbol, exc=type(e).__name__,
+                        detail=str(e)[:300])
         return []
 
     if ohlcv_df is None or ohlcv_df.empty:
@@ -543,14 +678,12 @@ def get_equity_bars(symbol, start, end, schema="ohlcv-1d"):
         return []
 
     try:
-        df = _pull_with_retry(lambda: client.timeseries.get_range(
-            dataset  = EQUITY_DATASET,
+        df = _get_range_clamped(
+            client, EQUITY_DATASET, start, end,
             symbols  = [symbol],
             stype_in = "raw_symbol",
             schema   = schema,
-            start    = start,
-            end      = end,
-        ).to_df())
+        )
     except Exception as e:
         if _is_insufficient_funds(e):
             _trip_billing_breaker("equity bars", e)
@@ -649,14 +782,12 @@ def get_vix_proxy(target_date_et=None):
     start_iso = (target_date_et - timedelta(days=7)).isoformat()
     end_iso   = target_date_et.isoformat()
     try:
-        df = client.timeseries.get_range(
-            dataset  = "XCBF.PITCH",
+        df = _get_range_clamped(
+            client, "XCBF.PITCH", start_iso, end_iso,
             symbols  = ["VX.c.0", "VX.c.1"],
             stype_in = "continuous",
             schema   = "ohlcv-1d",
-            start    = start_iso,
-            end      = end_iso,
-        ).to_df()
+        )
         if df is None or df.empty:
             print("[databento] VX proxy empty. Window: {} -> {}".format(
                 start_iso, end_iso))
@@ -751,14 +882,12 @@ def get_overnight_bars(contract="ES", target_date_et=None):
 
     symbol = CONTRACT_MAP.get(contract, "ES.n.0")
     try:
-        df = client.timeseries.get_range(
-            dataset  = "GLBX.MDP3",
+        df = _get_range_clamped(
+            client, "GLBX.MDP3", start_iso, end_iso,
             symbols  = [symbol],
             stype_in = "continuous",
             schema   = "ohlcv-1h",
-            start    = start_iso,
-            end      = end_iso,
-        ).to_df()
+        )
 
         if df is None or df.empty:
             print("[databento] {} overnight empty. Window: {} -> {}".format(
@@ -785,7 +914,8 @@ def get_overnight_bars(contract="ES", target_date_et=None):
             _trip_billing_breaker("{} overnight".format(contract), e)
         else:
             _emit_error("databento.fetch_failed", source="overnight",
-                        symbol=contract, exc=type(e).__name__)
+                        symbol=contract, exc=type(e).__name__,
+                        detail=str(e)[:300])
             _neg_cache_set(cache_key)
         return []
 
@@ -925,14 +1055,12 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     parents = [r + ".OPT" for r in root_list]
 
     def _pull_stats(start):
-        return client.timeseries.get_range(
-            dataset  = "OPRA.PILLAR",
+        return _get_range_clamped(
+            client, "OPRA.PILLAR", start, end_iso,
             symbols  = parents,
             stype_in = "parent",
             schema   = "statistics",
-            start    = start,
-            end      = end_iso,
-        ).to_df()
+        )
 
     # 1) Statistics: stat_type=9 (OpenInterest) is published daily per
     #    active contract, so a 1d window captures the full chain. Widen
@@ -951,10 +1079,10 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     #    historical API reliably has premarket.
     try:
         stats_start = (target_date_et - timedelta(days=1)).isoformat()
-        stats_df = _pull_with_retry(lambda: _pull_stats(stats_start))
+        stats_df = _pull_stats(stats_start)
         if stats_df is None or stats_df.empty:
             stats_start = (target_date_et - timedelta(days=4)).isoformat()
-            stats_df = _pull_with_retry(lambda: _pull_stats(stats_start))
+            stats_df = _pull_stats(stats_start)
     except Exception as e:
         if _is_billing_error(e):
             _trip_billing_breaker("{} statistics".format(underlying), e)
@@ -1021,16 +1149,39 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     iids = list(oi_by_inst.keys())
     raw_by_iid = {}
     CHUNK = 2000
+
+    def _resolve(batch, on_date):
+        return _pull_with_retry(lambda: client.symbology.resolve(
+            dataset    = "OPRA.PILLAR",
+            symbols    = [str(x) for x in batch],
+            stype_in   = "instrument_id",
+            stype_out  = "raw_symbol",
+            start_date = on_date,
+        ))
+
+    # resolve's implied range is [start_date, start_date + 1d), so a
+    # start_date of "today" reaches into the live-license-only period and
+    # 403s (license_not_found_unauthorized) even though the OI stats we're
+    # resolving were disseminated a day earlier. Back the date off to a day
+    # the license horizon fully covers; option instrument_id -> OSI symbol
+    # mappings are stable day-over-day, so a day-old resolve is equivalent.
+    resolve_date = end_iso
+    horizon = _horizon_end("OPRA.PILLAR")
+    if horizon is not None:
+        resolve_date = min(resolve_date,
+                           (horizon - timedelta(days=1)).date().isoformat())
     try:
         for i in range(0, len(iids), CHUNK):
             batch = iids[i:i + CHUNK]
-            resp = _pull_with_retry(lambda b=batch: client.symbology.resolve(
-                dataset    = "OPRA.PILLAR",
-                symbols    = [str(x) for x in b],
-                stype_in   = "instrument_id",
-                stype_out  = "raw_symbol",
-                start_date = end_iso,
-            ))
+            try:
+                resp = _resolve(batch, resolve_date)
+            except Exception as e:
+                cutoff = _availability_cutoff(e) if _is_window_error(e) else None
+                if cutoff is None:
+                    raise
+                _learn_horizon("OPRA.PILLAR", cutoff)
+                resolve_date = (cutoff - timedelta(days=1)).date().isoformat()
+                resp = _resolve(batch, resolve_date)
             result = (resp or {}).get("result") or {}
             for iid_str, mappings in result.items():
                 if not mappings:
@@ -1057,14 +1208,13 @@ def get_options_chain_snapshot(underlying, target_date_et=None,
     #     the with_price (GEX) path so the OI sweep stays free.
     if with_price and not px_by_inst:
         try:
-            ohlcv_df = _pull_with_retry(lambda: client.timeseries.get_range(
-                dataset  = "OPRA.PILLAR",
+            ohlcv_df = _get_range_clamped(
+                client, "OPRA.PILLAR",
+                (target_date_et - timedelta(days=1)).isoformat(), end_iso,
                 symbols  = parents,
                 stype_in = "parent",
                 schema   = "ohlcv-1d",
-                start    = (target_date_et - timedelta(days=1)).isoformat(),
-                end      = end_iso,
-            ).to_df())
+            )
             if ohlcv_df is not None and not ohlcv_df.empty:
                 # Latest close + volume per instrument (df is time-ordered).
                 for _, row in ohlcv_df.iterrows():
