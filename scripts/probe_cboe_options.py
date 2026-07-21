@@ -48,6 +48,25 @@ def main():
         print("  XX  every quote is no-bid (closed session or stale file)")
         return 1
 
+    # gex_intraday (v2) needs per-option volume for the flow layer and the
+    # chain's own timestamp for staleness. Both degrade gracefully when
+    # absent (baseline-only GEX, fetch-time staleness) — but verify here
+    # before trusting the flow layer on this host.
+    n_vol = sum(1 for q in snap["quotes"] if q.get("volume"))
+    n_oi = sum(1 for q in snap["quotes"] if q.get("open_interest"))
+    ts_src = snap.get("chain_ts_source")
+    print("  {}  gex_intraday fields: volume>0 on {}/{} quotes, oi>0 on {}, "
+          "chain_ts={} (source={})".format(
+              "OK" if (n_vol and ts_src == "payload") else "!!",
+              n_vol, len(snap["quotes"]), n_oi,
+              snap.get("chain_ts"), ts_src))
+    if not n_vol:
+        print("      volume absent/zero -> flow layer contributes nothing "
+              "(baseline-only GEX). Fine off-hours; investigate during RTH.")
+    if ts_src != "payload":
+        print("      payload carries no parseable timestamp -> staleness "
+              "falls back to fetch time.")
+
     now_et = datetime.now(pytz.timezone("America/New_York")).replace(tzinfo=None)
     out = proxy.compute_vix1d(snap, now_et=now_et)
     if out is None:

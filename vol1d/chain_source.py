@@ -12,6 +12,9 @@
 # A snapshot is a plain dict (repo style):
 #   {
 #     "ts":    datetime (ET, naive),
+#     "chain_ts": datetime (ET, naive),  # the CHAIN's own timestamp when the
+#                  payload carries one, else fetch time (see chain_ts_source)
+#     "chain_ts_source": "payload" | "fetch",
 #     "spot":  float,          # underlying index level
 #     "quotes": [ {"root","expiry" (date),"type" ("call"/"put"),
 #                  "strike" (float), "bid" (float), "ask" (float)}, ... ],
@@ -35,6 +38,26 @@ ET = pytz.timezone("America/New_York")
 # strike in 1/1000ths (e.g. "SPXW260711P06250000"). Same layout
 # databento_adapter parses for OPRA raw symbols.
 _OSI_RE = re.compile(r"^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+
+# Timestamp formats seen on cdn.cboe.com payloads ("timestamp" field).
+_TS_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
+
+
+def parse_chain_timestamp(payload):
+    """The chain's OWN timestamp (naive ET datetime) from the payload, or
+    None. gex_intraday's staleness handling needs the data's age, not the
+    fetch time — a CDN serving a frozen file looks fresh by fetch time."""
+    raw = (payload or {}).get("timestamp") or (
+        (payload or {}).get("data") or {}).get("timestamp")
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    for fmt in _TS_FORMATS:
+        try:
+            return datetime.strptime(raw[:19], fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def parse_option_symbol(sym):
@@ -129,13 +152,24 @@ class CboeDelayedChainSource(ChainSource):
                 parsed["iv"] = float(iv) if iv is not None else None
             except (TypeError, ValueError):
                 parsed["iv"] = None
+            # Session-cumulative volume for gex_intraday's flow layer.
+            # Absent volume degrades to 0 → flow layer contributes nothing
+            # (baseline-only GEX), it never drops the quote.
+            try:
+                parsed["volume"] = int(o.get("volume") or 0)
+            except (TypeError, ValueError):
+                parsed["volume"] = 0
             quotes.append(parsed)
 
         if not quotes:
             return None
+        now = datetime.now(ET).replace(tzinfo=None)
+        chain_ts = parse_chain_timestamp(payload)
         return {
-            "ts":     datetime.now(ET).replace(tzinfo=None),
-            "spot":   spot,
-            "quotes": quotes,
-            "source": "cboe_delayed",
+            "ts":              now,
+            "chain_ts":        chain_ts or now,
+            "chain_ts_source": "payload" if chain_ts else "fetch",
+            "spot":            spot,
+            "quotes":          quotes,
+            "source":          "cboe_delayed",
         }

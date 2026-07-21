@@ -14,11 +14,27 @@ import pytz
 from vol1d import baseline as vol1d_baseline
 from vol1d import config as vol1d_config
 from vol1d import features as vol1d_features
+from vol1d import gex_intraday as vol1d_gex_intraday
 from vol1d import gex_live as vol1d_gex_live
 from vol1d import proxy as vol1d_proxy
 from vol1d import qa as vol1d_qa
 from vol1d import regime as vol1d_regime
 from vol1d.chain_source import CboeDelayedChainSource
+
+
+def _default_spy_price():
+    """Live SPY from the engine's Alpaca snapshot path; None when the
+    freshest read is too old to call live. Lazy import keeps vol1d
+    importable in offline tests."""
+    try:
+        import data_fetcher
+        price, age, _src = data_fetcher.get_price_with_freshness("SPY")
+    except Exception:
+        return None
+    max_age = vol1d_config.get_config()["gex_intraday"]["spy_max_age_secs"]
+    if price is None or age is None or age > max_age:
+        return None
+    return price
 
 ET = pytz.timezone("America/New_York")
 
@@ -76,7 +92,8 @@ class Vol1DUpdater(object):
     runs one instance on a dedicated ~update_secs thread and publishes the
     returned Vol1DState into _market_state under its lock."""
 
-    def __init__(self, chain_source=None, cfg=None, db_path=None):
+    def __init__(self, chain_source=None, cfg=None, db_path=None,
+                 spy_price_fn=None):
         self.cfg = cfg or vol1d_config.get_config()
         self.source = chain_source or CboeDelayedChainSource()
         self.features = vol1d_features.IntradayFeatures(self.cfg)
@@ -87,6 +104,21 @@ class Vol1DUpdater(object):
         # Latest intraday GEX read (published by main next to gex_bias).
         self.gex_live = None
         self._gex_live_at = None
+        # v2 intraday GEX (gex_intraday spec): slow-loop positioning curve
+        # + fast-loop live-spot evaluation. Owns the session accumulators;
+        # the updater being recreated each session resets the flow layer.
+        gi = self.cfg["gex_intraday"]
+        self.spy_price_fn = spy_price_fn or _default_spy_price
+        self.gex_intraday = None                     # latest output contract
+        self._gi_engine = None
+        self._gi_built_at = None
+        if gi["enabled"]:
+            self._gi_engine = vol1d_gex_intraday.DelayedGEX(
+                cfg=self.cfg, db_path=db_path)
+            self._gi_proxy = vol1d_gex_intraday.SpotProxy(
+                alpha=gi["basis_ema_alpha"],
+                pair_tolerance_secs=gi["basis_pair_tolerance_secs"])
+            self._gi_machine = vol1d_gex_intraday.RegimeMachine(gi)
 
     def _latest_residual(self, today_iso):
         """Yesterday's reconcile result, fetched once per session."""
@@ -126,6 +158,11 @@ class Vol1DUpdater(object):
         tod_z, n_sessions = vol1d_baseline.tod_z(now_et, level, cfg=self.cfg,
                                                  db_path=self.db_path)
 
+        try:
+            self._gex_intraday_pass(snap, now_et)
+        except Exception as e:
+            print("[vol1d] gex_intraday pass failed: {}".format(e))
+
         grid_gex, gex_source = self._grid_gex(snap, now_et, gex_bias)
         reg = self.tracker.update(tod_z, feats["iv_rv_spread"],
                                   feats["vix1d_roc"], gex_bias=grid_gex)
@@ -154,13 +191,76 @@ class Vol1DUpdater(object):
             gex_source=gex_source,
         )
 
+    def _gex_intraday_pass(self, snap, now_et):
+        """gex_intraday's two loops, riding the updater cadence.
+
+        SLOW (profile_interval_secs throttle): ingest the chain into the
+        positioning book (OI baseline + volume-diff flow), pair the delayed
+        SPX spot with the buffered SPY sample at chain_ts (basis), rebuild
+        the reusable curve, feed the regime machine, persist the snapshot.
+
+        FAST (every pass): live SPY -> spot_est via the ratio basis, demote
+        the machine on live flip crossings, and publish the evaluated
+        output contract on self.gex_intraday."""
+        if self._gi_engine is None:
+            return
+        gi = self.cfg["gex_intraday"]
+        chain_ts = snap.get("chain_ts") or snap.get("ts") or now_et
+
+        spy = None
+        try:
+            spy = self.spy_price_fn()
+        except Exception:
+            pass
+        if spy:
+            self._gi_proxy.record_live(now_et, spy)
+
+        due = (self._gi_built_at is None
+               or (now_et - self._gi_built_at).total_seconds()
+               >= gi["profile_interval_secs"])
+        stale = (now_et - chain_ts).total_seconds() > gi["stale_secs"]
+        if due:
+            self._gi_engine.on_snapshot(snap, now_et=now_et)
+            self._gi_proxy.update_basis(snap.get("spot"), chain_ts)
+            profile = self._gi_engine.build_profile(snap.get("spot"),
+                                                    now_et=now_et)
+            if profile is not None:
+                self._gi_built_at = now_et
+                spot_slow = self._gi_proxy.spot(spy) or snap.get("spot")
+                try:
+                    low = self._gi_engine.low_gex_threshold()
+                except Exception:
+                    low = None
+                self._gi_machine.on_profile(profile, spot_slow,
+                                            low_gex_threshold=low,
+                                            stale=stale)
+                try:
+                    self._gi_engine.persist_snapshot(now_et=now_et)
+                except Exception as e:
+                    print("[vol1d] gex_intraday persist failed: {}".format(e))
+
+        profile = self._gi_engine.profile
+        if profile is None:
+            return
+        spot_est = self._gi_proxy.spot(spy)
+        self._gi_machine.on_fast(profile, spot_est or snap.get("spot"),
+                                 stale=stale)
+        self.gex_intraday = vol1d_gex_intraday.evaluate(
+            profile, spot_est, self._gi_machine, now_et=now_et,
+            chain_ts=self._gi_engine.chain_ts, cfg_gi=gi)
+
     def _grid_gex(self, snap, now_et, snapshot_bias):
-        """(gex_dict, source) the grid crosses against: the intraday read
-        recomputed from this chain when fresh, else the nightly snapshot.
+        """(gex_dict, source) the grid crosses against, in preference
+        order: the v2 gex_intraday read (damped regime machine; its
+        `transitional` deliberately maps to UNKNOWN_GEX -> stand aside),
+        else the v1 gex_live recompute, else the nightly snapshot.
 
         The live compute is throttled (min_interval_secs) — dealer gamma
         migrates on minutes, not seconds — and discarded past max_age_secs
         so a stalled chain can't pin an old mechanism read."""
+        gi_out = self.gex_intraday
+        if gi_out is not None and not gi_out.get("stale"):
+            return vol1d_gex_intraday.to_grid_bias(gi_out), "intraday"
         g = self.cfg["gex_live"]
         if g["enabled"]:
             due = (self._gex_live_at is None

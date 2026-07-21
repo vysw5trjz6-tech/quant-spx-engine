@@ -156,6 +156,7 @@ _market_state = {
     "vol1d":            None,   # latest vol1d.state.Vol1DState (updater thread)
     "vol1d_ts":         0,      # epoch when vol1d last computed
     "gex_live":         None,   # intraday index GEX (vol1d.gex_live), ~60s cadence
+    "gex_intraday":     None,   # v2 delayed-feed GEX (vol1d.gex_intraday) output contract
     "gex_update":       None,   # 10:30 AM SPX/NDX GEX revision (run_gex_update)
 }
 _market_state_lock = threading.Lock()
@@ -5897,6 +5898,7 @@ def vol1d_updater_loop():
                         # separately — the nightly gex_bias and its
                         # consumers stay untouched.
                         _market_state["gex_live"] = updater.gex_live
+                        _market_state["gex_intraday"] = updater.gex_intraday
             else:
                 # Fresh accumulators next session; idle at a slow tick.
                 updater = None
@@ -7895,6 +7897,7 @@ def vol1d_endpoint():
     with _market_state_lock:
         ts = _market_state.get("vol1d_ts", 0)
         gex_live = _market_state.get("gex_live")
+        gex_intraday = _market_state.get("gex_intraday")
     try:
         from vol1d import baseline as _bl
         from vol1d import qa as _qa
@@ -7910,6 +7913,7 @@ def vol1d_endpoint():
         "baseline_sessions": banked,
         "last_residual":    {"date": resid_date, "value": resid},
         "gex_live":         gex_live,
+        "gex_intraday":     gex_intraday,
     })
 
 
