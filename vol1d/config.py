@@ -113,6 +113,56 @@ DEFAULTS = {
         "neutral_band_b": 2.0,
     },
 
+    "gex_intraday": {
+        # v2 intraday GEX (delayed-feed spec): slow-loop positioning
+        # profile from the delayed chain (OI baseline + unsigned volume-diff
+        # flow), evaluated continuously at a live spot proxy. When enabled
+        # and producing output it takes over the grid's GEX column from
+        # gex_live (which stays as the fallback).
+        "enabled": True,
+        "roots": ["SPXW", "SPX"],
+        # Expiries within this many calendar days feed net_gex_all (0DTE is
+        # also published separately).
+        "max_dte": 5,
+        # Unsigned volume-diff flow weight vs the OI baseline (spec: 0.5;
+        # validation step 3 decides whether the layer stays at all).
+        "flow_weight": 0.5,
+        # Slow-loop cadence: profile rebuild + snapshot persist throttle.
+        # The chain fetch itself rides the existing ~15s updater pass.
+        "profile_interval_secs": 300,
+        # Chain age beyond which the read is flagged stale and the regime
+        # machine freezes (no new flips).
+        "stale_secs": 1200,
+        # Regime machine: |spot - flip| band (percent of spot) inside which
+        # the state is transitional, and how many consecutive slow-loop
+        # profiles must agree on sign before positive/negative is emitted.
+        "flip_band_pct": 0.15,
+        "confirm_profiles": 2,
+        # IV wing clamp for the per-strike mid IV.
+        "iv_lo": 0.03,
+        "iv_hi": 3.0,
+        # Floor on T (minutes) so 0DTE gamma stays finite into settlement.
+        "min_t_minutes": 15.0,
+        # Refuse to publish a profile built from fewer strikes than this.
+        "min_strikes": 20,
+        # Spot proxy (SPY route): ratio = spx_delayed / (spy_at_chain_ts *
+        # 10), EMA'd; live sample paired to chain_ts within tolerance.
+        "basis_ema_alpha": 0.3,
+        "basis_pair_tolerance_secs": 420,
+        # Live SPY price older than this is not a live spot (fast loop
+        # falls back to the delayed chain spot).
+        "spy_max_age_secs": 90,
+        # |net_gex_all| below its trailing p25 reads transitional. Skipped
+        # (None) until min_sessions of history are banked.
+        "pctile_lookback_sessions": 20,
+        "pctile_min_sessions": 5,
+        "pctile": 25,
+        # Persist per-slow-tick compact snapshots (the free historical
+        # dataset) and prune beyond this many days.
+        "persist_snapshots": True,
+        "persist_days": 30,
+    },
+
     "gating": {
         # What the module WOULD do to a signal (spec §4). Shadow-only until
         # `enforce` above is flipped; every knob here is CALIBRATE-against-

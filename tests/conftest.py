@@ -31,3 +31,15 @@ def _isolate_cache_dir():
     os.chdir(_TMP)
     yield _TMP
     os.chdir(cwd)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_spy(monkeypatch):
+    """Vol1DUpdater's gex_intraday fast loop pulls live SPY through
+    data_fetcher (Alpaca) by default; tests must never touch the network.
+    Individual tests inject spy_price_fn explicitly when they need one."""
+    try:
+        from vol1d import state as _vs
+        monkeypatch.setattr(_vs, "_default_spy_price", lambda: None)
+    except ImportError:
+        pass

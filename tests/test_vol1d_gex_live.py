@@ -31,6 +31,10 @@ SPOT  = 6300.0
 def _cfg(**gex_over):
     cfg = vol1d_config.get_config()
     cfg["proxy"]["risk_free_rate"] = 0.0
+    # These tests pin the v1 gex_live path; the v2 gex_intraday layer
+    # (which takes grid precedence when enabled) is exercised in
+    # test_gex_intraday.py.
+    cfg["gex_intraday"]["enabled"] = False
     cfg["gex_live"].update({"min_contracts": 2, "neutral_band_b": 0.001,
                             "min_interval_secs": 60})
     cfg["gex_live"].update(gex_over)
