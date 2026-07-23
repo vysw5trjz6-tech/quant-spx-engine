@@ -2,10 +2,11 @@
 # Thin caching + parallel layer in front of the Alpaca bars/quote endpoints.
 #
 # Replaces the inline serial requests inside main.py's scan loop. Each series
-# has its own TTL: intraday bars roll every 5 min (cache 30s), daily once per
-# day (cache 1h), hourly bars roll on the hour (cache 30 min). Daily/hourly
-# series previously refetched every 5-min scan even though the underlying data
-# barely changes -- the cache cuts ~60% of HTTP volume.
+# has its own TTL: intraday bars roll every 5 min (cache 30s), daily bars cache
+# ~2 min (short enough that today's still-forming bar stays live for the
+# volatility read, long enough to absorb a scan's repeat reads), hourly bars
+# roll on the hour (cache 30 min). The caches cut most redundant HTTP volume
+# while keeping the forming daily/intraday bars fresh within the scan cadence.
 #
 # prefetch_symbols() runs all (symbol, series) pulls concurrently on a thread
 # pool so a full scan of N symbols takes roughly max(latency) instead of
@@ -54,7 +55,15 @@ STALE_PRICE_MAX_AGE_SECONDS = 60
 
 
 _INTRADAY_CACHE = TTLCache(maxsize=256, ttl=30)
-_DAILY_CACHE    = TTLCache(maxsize=256, ttl=3600)
+# Daily bars: the PRIOR sessions never change intraday, but TODAY's bar is
+# still FORMING — its high/low/last grow through the session. A 1h TTL froze
+# that forming bar for up to an hour, so volatility_score() (today's range vs
+# the average) graded signals on a stale intraday range — the "Vol ratio" that
+# sat unchanged for 70+ minutes in the market-open logs. Refresh comfortably
+# inside the 5-min scan cadence so each scan re-reads the live today bar; within
+# a single scan's burst of get_daily() calls the cache still absorbs the repeats.
+_DAILY_CACHE_TTL = int(os.getenv("DAILY_CACHE_TTL_SECS", "120"))
+_DAILY_CACHE    = TTLCache(maxsize=256, ttl=_DAILY_CACHE_TTL)
 _HR1_CACHE      = TTLCache(maxsize=256, ttl=1800)
 _HR4_CACHE      = TTLCache(maxsize=256, ttl=3600)
 _QUOTE_CACHE    = TTLCache(maxsize=256, ttl=5)

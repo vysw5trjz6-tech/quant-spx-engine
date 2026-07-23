@@ -249,3 +249,19 @@ def test_option_symbol_parse():
     assert p == {"root": "SPXW", "expiry": date(2026, 7, 8),
                  "type": "put", "strike": 6250.0}
     assert chain_source.parse_option_symbol("NOT_AN_OPTION") is None
+
+
+def test_log_throttled_dedupes_within_window(capsys):
+    # Identical diagnostics fired on the ~15s updater cadence must print once
+    # per throttle window, not on every pass (the market-open log flood).
+    proxy._last_logged.clear()
+    for _ in range(20):
+        proxy._log_throttled("[vol1d] proxy: near strip unusable (expiry X)")
+    out = capsys.readouterr().out
+    assert out.count("near strip unusable") == 1
+
+    # A distinct message is not suppressed by another's throttle entry.
+    proxy._log_throttled("[vol1d] proxy: negative interpolated variance")
+    out = capsys.readouterr().out
+    assert out.count("negative interpolated variance") == 1
+    proxy._last_logged.clear()

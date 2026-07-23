@@ -31,10 +31,15 @@ ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 # DATA FETCHERS
 # =============================================
 
-def _fetch_alpaca_extended_hours(symbol, start_iso, end_iso):
+def _fetch_alpaca_extended_hours(symbol, start_iso, end_iso, feed="iex"):
     """
     Fallback for futures: use SPY/QQQ extended hours bars from Alpaca.
     Less ideal than real ES/NQ data but workable for retail.
+
+    `feed` selects the Alpaca data feed: "iex" covers regular + pre/postmarket
+    (4:00 AM-8:00 PM ET); "boats" is the Blue Ocean ATS overnight session
+    (8:00 PM-4:00 AM ET). See _fetch_alpaca_overnight for how the two stitch
+    into a full overnight session.
     """
     headers = {
         "APCA-API-KEY-ID":     ALPACA_KEY,
@@ -47,13 +52,68 @@ def _fetch_alpaca_extended_hours(symbol, start_iso, end_iso):
             "start":     start_iso,
             "end":       end_iso,
             "limit":     10000,
-            "feed":      "iex",
+            "feed":      feed,
         }, timeout=12)
         if r.status_code != 200:
             return []
         return r.json().get("bars", []) or []
     except Exception:
         return []
+
+
+_ALPACA_PROXY_MAP = {"ES": "SPY", "NQ": "QQQ", "RTY": "IWM"}
+
+
+def _fetch_alpaca_overnight(contract, start_iso, end_iso):
+    """
+    Full overnight session for `contract`'s ETF proxy (ES→SPY, NQ→QQQ,
+    RTY→IWM), stitched from two Alpaca feeds:
+
+      * IEX extended-hours bars — prev-day postmarket (4:00-8:00 PM ET) and
+        today's premarket (4:00-9:30 AM ET), and
+      * Blue Ocean ATS overnight bars (feed=boats, 8:00 PM-4:00 AM ET).
+
+    The plain extended-hours proxy only prints during the 4:00-9:30 AM ET
+    premarket, so it structurally MISSES the real overnight high/low; the
+    boats leg fills that 8 PM-4 AM gap. Preferred over Yahoo because it rides
+    Alpaca's authenticated API, which — unlike Yahoo's scrape endpoints —
+    doesn't rate-limit datacenter (Railway) IPs.
+
+    Free-plan boats data is 15-min delayed, so bars newer than ~15 min don't
+    exist yet; we cap the request end 16 min back to both reflect that and
+    avoid Alpaca's "end must be at least 15 minutes old" rejection on delayed
+    overnight requests.
+
+    Returns raw Alpaca bar dicts (t/o/h/l/c/v) ascending, deduped by
+    timestamp, or [] on failure. Bars are in ETF dollars → source "etf_proxy".
+    """
+    proxy = _ALPACA_PROXY_MAP.get(contract, "SPY")
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return []
+
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt   = datetime.fromisoformat(end_iso)
+    except (ValueError, TypeError):
+        return []
+
+    now = datetime.now(pytz.timezone("America/New_York"))
+    safe_end = min(end_dt, now - timedelta(minutes=16))
+    if safe_end <= start_dt:
+        return []
+    end_capped = safe_end.isoformat()
+
+    iex   = _fetch_alpaca_extended_hours(proxy, start_iso, end_capped, feed="iex")
+    boats = _fetch_alpaca_extended_hours(proxy, start_iso, end_capped, feed="boats")
+
+    # Merge + dedupe by bar timestamp. The two feeds cover disjoint hours, so
+    # overlaps are only at session boundaries; keeping either is equivalent.
+    merged = {}
+    for b in (iex or []) + (boats or []):
+        t = b.get("t")
+        if t:
+            merged[t] = b
+    return [merged[t] for t in sorted(merged)]
 
 
 _YAHOO_FUTURES = {"ES": "ES=F", "NQ": "NQ=F", "RTY": "RTY=F", "YM": "YM=F"}
@@ -157,9 +217,14 @@ def overnight_window(target_date_et):
 def _get_overnight_bars(target_date_et, contract="ES"):
     """
     Get overnight bars. Provider priority:
-      1. Databento (real CME futures — best)
-      2. Yahoo Finance continuous futures (ES=F/NQ=F — free, full Globex)
-      3. Alpaca ETF proxy (SPY/QQQ/IWM extended hours — premarket only)
+      1. Databento (real CME futures — best, but only when the account can
+         read the full session; it defers premarket without a live license)
+      2. Alpaca overnight — IEX extended-hours + Blue Ocean ATS (feed=boats),
+         the full session in ETF dollars, served over an authenticated API
+         that (unlike Yahoo) isn't rate-limited from datacenter/Railway IPs
+      3. Yahoo Finance continuous futures (ES=F/NQ=F — real futures points,
+         full Globex, but flaky from cloud hosts)
+      4. Alpaca IEX extended-hours only (premarket coverage — last-ditch)
     Returns (bars, source) where bars is a list of {t, o, h, l, c, v} dicts
     and source is 'futures' or 'etf_proxy'. The source matters downstream:
     futures bars are in futures points, proxy bars in ETF dollars, and the
@@ -182,14 +247,18 @@ def _get_overnight_bars(target_date_et, contract="ES"):
 
     start_iso, end_iso = overnight_window(target_date_et)
 
-    # --- Path 2: Yahoo continuous futures (real overnight, futures points) ---
+    # --- Path 2: Alpaca overnight (IEX extended + Blue Ocean ATS) ---
+    bars = _fetch_alpaca_overnight(contract, start_iso, end_iso)
+    if bars:
+        return bars, "etf_proxy"
+
+    # --- Path 3: Yahoo continuous futures (real overnight, futures points) ---
     bars = _fetch_yahoo_futures(contract, start_iso, end_iso)
     if bars:
         return bars, "futures"
 
-    # --- Path 3: Alpaca ETF proxy fallback (premarket coverage only) ---
-    proxy_map = {"ES": "SPY", "NQ": "QQQ", "RTY": "IWM"}
-    proxy = proxy_map.get(contract, "SPY")
+    # --- Path 4: Alpaca IEX extended-hours proxy (premarket only, last-ditch) ---
+    proxy = _ALPACA_PROXY_MAP.get(contract, "SPY")
     return _fetch_alpaca_extended_hours(proxy, start_iso, end_iso), "etf_proxy"
 
 

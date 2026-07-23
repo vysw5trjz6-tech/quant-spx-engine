@@ -13,9 +13,37 @@
 # 3 calendar days).
 
 import math
+import time as _time
 
 from vol1d import config as vol1d_config
 from vol1d import daycount
+
+
+# These diagnostic prints ride the ~15s updater cadence, so a condition that
+# persists for a few minutes — most commonly the delayed 0DTE strip staying
+# degenerate right after the open ("near strip unusable"), which repeated ~20x
+# in the first five minutes of the market-open logs — would otherwise reprint
+# the same line every pass. Throttle identical messages to at most once per
+# window so the reason is still surfaced without flooding the log. This is
+# purely a print-side guard: the proxy math and every return value are
+# unaffected (the offline tests read returns, not stdout).
+_LOG_THROTTLE_SECS = 300
+_last_logged = {}
+
+
+def _log_throttled(msg):
+    now = _time.time()
+    last = _last_logged.get(msg)
+    if last is not None and now - last < _LOG_THROTTLE_SECS:
+        return
+    _last_logged[msg] = now
+    # Bound the dedup map so distinct daily messages (new expiry dates, level
+    # values) can't accumulate without limit in a long-lived process.
+    if len(_last_logged) > 64:
+        for k in [k for k, t in _last_logged.items()
+                  if now - t >= _LOG_THROTTLE_SECS]:
+            _last_logged.pop(k, None)
+    print(msg)
 
 
 def _mid(bid, ask):
@@ -195,7 +223,8 @@ def compute_vix1d(snapshot, now_et=None, cfg=None, holidays=frozenset()):
 
     near, nxt = select_term_expiries(quotes, now_et, p, holidays)
     if near is None or nxt is None:
-        print("[vol1d] proxy: need two live expiries, got near={} next={}".format(near, nxt))
+        _log_throttled("[vol1d] proxy: need two live expiries, got near={} "
+                       "next={}".format(near, nxt))
         return None
 
     r = p["risk_free_rate"]
@@ -209,7 +238,8 @@ def compute_vix1d(snapshot, now_et=None, cfg=None, holidays=frozenset()):
         tv = term_variance(table, r, t,
                            consecutive_no_bid_stop=p["consecutive_no_bid_stop"])
         if tv is None:
-            print("[vol1d] proxy: {} strip unusable (expiry {})".format(label, exp))
+            _log_throttled("[vol1d] proxy: {} strip unusable (expiry {})"
+                           .format(label, exp))
             return None
         tv["t"] = t
         terms[label] = tv
@@ -230,14 +260,15 @@ def compute_vix1d(snapshot, now_et=None, cfg=None, holidays=frozenset()):
     if total_var < 0:
         # Negative interpolated variance means a degenerate strip
         # (extrapolation weights + noisy quotes); refuse rather than emit NaN.
-        print("[vol1d] proxy: negative interpolated variance")
+        _log_throttled("[vol1d] proxy: negative interpolated variance")
         return None
 
     # Scale the 1-day variance back to annual terms: divide by the target
     # horizon (the business-time equivalent of the spec's N_365/N_1day).
     level = 100.0 * math.sqrt(total_var / tt)
     if not (p["level_lo"] <= level <= p["level_hi"]):
-        print("[vol1d] proxy: level {:.1f} outside sanity bounds".format(level))
+        _log_throttled("[vol1d] proxy: level {:.1f} outside sanity bounds"
+                       .format(level))
         return None
 
     return {

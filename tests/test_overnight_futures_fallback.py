@@ -1,8 +1,9 @@
 # Offline tests for the overnight-bars provider chain in overnight_context:
-# Databento → Yahoo continuous futures → Alpaca ETF proxy. The Yahoo path is
-# what keeps the premarket brief in REAL futures points (full Globex range)
-# when Databento is down, instead of silently degrading to SPY premarket
-# dollars that miss the true overnight high/low.
+# Databento → Alpaca overnight (IEX + Blue Ocean ATS) → Yahoo continuous
+# futures → Alpaca premarket-only proxy. Alpaca overnight is preferred over
+# Yahoo because Yahoo's scrape endpoints rate-limit datacenter (Railway) IPs;
+# the boats leg gives the full 8 PM-4 AM overnight session the plain
+# premarket proxy structurally misses.
 
 import sys
 import types
@@ -38,29 +39,49 @@ def _futures_bars():
 # Provider chain ordering
 # =============================================
 
-def test_yahoo_futures_preferred_over_etf_proxy(monkeypatch):
+def _overnight_proxy_bars():
+    return [{"t": "2026-07-14T02:00:00Z",
+             "o": 750.0, "h": 754.2, "l": 747.5, "c": 752.0, "v": 500}]
+
+
+def test_alpaca_overnight_preferred_over_yahoo(monkeypatch):
+    # New priority: Alpaca overnight (path 2) beats Yahoo (path 3), because
+    # Yahoo is unreliable from datacenter IPs.
     _no_databento(monkeypatch)
-    monkeypatch.setattr(overnight_context, "_fetch_yahoo_futures",
-                        lambda contract, s, e: _futures_bars())
+    monkeypatch.setattr(overnight_context, "_fetch_alpaca_overnight",
+                        lambda contract, s, e: _overnight_proxy_bars())
 
     def _boom(*a, **k):
-        raise AssertionError("Alpaca proxy must not be hit when Yahoo works")
-    monkeypatch.setattr(overnight_context, "_fetch_alpaca_extended_hours",
-                        _boom)
+        raise AssertionError("Yahoo must not be hit when Alpaca overnight works")
+    monkeypatch.setattr(overnight_context, "_fetch_yahoo_futures", _boom)
+
+    bars, source = overnight_context._get_overnight_bars(TARGET, "ES")
+    assert source == "etf_proxy"
+    assert max(b["h"] for b in bars) == 754.2
+
+
+def test_yahoo_used_when_alpaca_overnight_empty(monkeypatch):
+    _no_databento(monkeypatch)
+    monkeypatch.setattr(overnight_context, "_fetch_alpaca_overnight",
+                        lambda contract, s, e: [])
+    monkeypatch.setattr(overnight_context, "_fetch_yahoo_futures",
+                        lambda contract, s, e: _futures_bars())
 
     bars, source = overnight_context._get_overnight_bars(TARGET, "ES")
     assert source == "futures"
     assert max(b["h"] for b in bars) == 7611.0
 
 
-def test_falls_back_to_etf_proxy_when_yahoo_empty(monkeypatch):
+def test_falls_back_to_premarket_proxy_when_all_else_empty(monkeypatch):
     _no_databento(monkeypatch)
+    monkeypatch.setattr(overnight_context, "_fetch_alpaca_overnight",
+                        lambda contract, s, e: [])
     monkeypatch.setattr(overnight_context, "_fetch_yahoo_futures",
                         lambda contract, s, e: [])
     proxy_bars = [{"t": "2026-07-14T08:00:00Z",
                    "o": 750.0, "h": 753.9, "l": 748.1, "c": 752.0, "v": 500}]
     monkeypatch.setattr(overnight_context, "_fetch_alpaca_extended_hours",
-                        lambda symbol, s, e: proxy_bars)
+                        lambda symbol, s, e, feed="iex": proxy_bars)
 
     bars, source = overnight_context._get_overnight_bars(TARGET, "ES")
     assert source == "etf_proxy"
@@ -69,12 +90,61 @@ def test_falls_back_to_etf_proxy_when_yahoo_empty(monkeypatch):
 
 def test_overnight_range_carries_futures_source(monkeypatch):
     _no_databento(monkeypatch)
+    monkeypatch.setattr(overnight_context, "_fetch_alpaca_overnight",
+                        lambda contract, s, e: [])
     monkeypatch.setattr(overnight_context, "_fetch_yahoo_futures",
                         lambda contract, s, e: _futures_bars())
     on = overnight_context.overnight_range(TARGET, "ES")
     assert on["source"] == "futures"
     assert on["high"] == 7611.0
     assert on["low"] == 7570.0
+
+
+# =============================================
+# _fetch_alpaca_overnight: stitch IEX + boats, dedupe
+# =============================================
+
+def test_alpaca_overnight_stitches_and_dedupes(monkeypatch):
+    monkeypatch.setattr(overnight_context, "ALPACA_KEY", "k")
+    monkeypatch.setattr(overnight_context, "ALPACA_SECRET", "s")
+
+    postmarket = {"t": "2026-07-13T22:00:00Z",
+                  "o": 750.0, "h": 751.0, "l": 749.0, "c": 750.5, "v": 100}
+    boundary_iex = {"t": "2026-07-14T00:00:00Z",
+                    "o": 750.5, "h": 752.0, "l": 750.0, "c": 751.5, "v": 80}
+    overnight = {"t": "2026-07-14T03:00:00Z",
+                 "o": 751.5, "h": 756.0, "l": 748.0, "c": 749.0, "v": 60}
+    # boats returns the same boundary bar (dedupe) plus the deep overnight one.
+    boundary_boats = dict(boundary_iex)
+
+    def _fake(symbol, s, e, feed="iex"):
+        assert symbol == "SPY"
+        if feed == "iex":
+            return [postmarket, boundary_iex]
+        if feed == "boats":
+            return [boundary_boats, overnight]
+        raise AssertionError("unexpected feed")
+    monkeypatch.setattr(overnight_context, "_fetch_alpaca_extended_hours", _fake)
+
+    start_iso, end_iso = overnight_context.overnight_window(TARGET)
+    bars = overnight_context._fetch_alpaca_overnight("ES", start_iso, end_iso)
+    ts = [b["t"] for b in bars]
+    assert ts == sorted(ts)                      # ascending
+    assert len(bars) == 3                        # boundary deduped, not doubled
+    assert max(b["h"] for b in bars) == 756.0    # overnight high captured
+
+
+def test_alpaca_overnight_no_keys_returns_empty(monkeypatch):
+    monkeypatch.setattr(overnight_context, "ALPACA_KEY", "")
+    monkeypatch.setattr(overnight_context, "ALPACA_SECRET", "")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not call the API without credentials")
+    monkeypatch.setattr(overnight_context, "_fetch_alpaca_extended_hours",
+                        _boom)
+    start_iso, end_iso = overnight_context.overnight_window(TARGET)
+    assert overnight_context._fetch_alpaca_overnight("ES", start_iso,
+                                                     end_iso) == []
 
 
 # =============================================

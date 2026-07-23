@@ -142,13 +142,21 @@ _WINDOW_ERROR_MARKERS = (
     "data_start_after_available_end",
     "license_not_found",
     "live data license",
+    # GLBX/CME licensed datasets phrase the same "window reaches past what
+    # this account may read" rejection differently: a 422 dataset_unavailable_range
+    # whose body reads "requires a subscription and/or license to access.
+    # Try again with an end time before <cutoff>." Classify it as a window
+    # (not billing) error so the shared breaker never trips over it.
+    "dataset_unavailable_range",
 )
 
 # "has data available up to '2026-07-21 00:00:00+00:00'"  (422)
 # "access OPRA.PILLAR data after 2026-07-20T13:30:00.000000000Z"  (403)
+# "Try again with an end time before 2026-07-22T05:13:44.388091000Z." (422 GLBX)
 _CUTOFF_RES = (
     re.compile(r"available up to '([^']+)'"),
     re.compile(r"data after\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"),
+    re.compile(r"end time before\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"),
 )
 
 _HORIZON_TTL_SECS = 4 * 3600
@@ -190,6 +198,31 @@ def _horizon_end(dataset):
     if not h or time.time() - h["learned_at"] > _HORIZON_TTL_SECS:
         return None
     return h["end"]
+
+
+def _dataset_available_end(client, dataset):
+    """End of `dataset`'s readable range for THIS account as a naive-UTC
+    datetime, or None when it can't be determined.
+
+    Prefers a freshly-learned licensing horizon (populated when a prior pull
+    was rejected past the cutoff); otherwise asks the metadata endpoint — an
+    unmetered reference call, so probing it costs nothing — and caches the
+    answer under the same horizon store. Callers use it to decide, BEFORE
+    issuing a (billed, even when rejected) pull, whether the window they need
+    is readable at all."""
+    horizon = _horizon_end(dataset)
+    if horizon is not None:
+        return horizon
+    try:
+        rng = client.metadata.get_dataset_range(dataset)
+        raw = (rng.get("end") if isinstance(rng, dict)
+               else getattr(rng, "end", None))
+    except Exception:
+        return None
+    end_dt = _parse_when(raw) if raw is not None else None
+    if end_dt is not None:
+        _learn_horizon(dataset, end_dt)
+    return end_dt
 
 
 def _clamp_end(dataset, end):
@@ -881,13 +914,34 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         return []
 
     symbol = CONTRACT_MAP.get(contract, "ES.n.0")
+
+    # The overnight high/low/inventory read needs the COMPLETE Globex session.
+    # GLBX.MDP3 only serves data older than ~24h to accounts without a live CME
+    # license, so a premarket pull for a window ending at today's open sits
+    # partly inside the license-only horizon. This path therefore does NOT go
+    # through _get_range_clamped: clamping `end` to the horizon would return a
+    # TRUNCATED session and a silently wrong overnight range — worse than no
+    # data. Instead, when the horizon can't cover the whole window we skip
+    # Databento entirely so the caller's full-session fallback (Alpaca
+    # overnight / Yahoo futures) serves the read.
+    end_dt   = _parse_when(end_iso)
+    avail_end = _dataset_available_end(client, "GLBX.MDP3")
+    if avail_end is not None and end_dt is not None and avail_end < end_dt:
+        print("[databento] {} overnight deferred: GLBX available to {} "
+              "< window end {} (full session not licensed; using fallback)"
+              .format(contract, avail_end.isoformat(), end_iso))
+        _neg_cache_set(cache_key)
+        return []
+
     try:
-        df = _get_range_clamped(
-            client, "GLBX.MDP3", start_iso, end_iso,
+        df = _pull_with_retry(lambda: client.timeseries.get_range(
+            dataset  = "GLBX.MDP3",
+            start    = start_iso,
+            end      = end_iso,
             symbols  = [symbol],
             stype_in = "continuous",
             schema   = "ohlcv-1h",
-        )
+        ).to_df())
 
         if df is None or df.empty:
             print("[databento] {} overnight empty. Window: {} -> {}".format(
@@ -910,7 +964,18 @@ def get_overnight_bars(contract="ES", target_date_et=None):
         return bars
 
     except Exception as e:
-        if _is_billing_error(e):
+        # A window rejection here means the metadata pre-check missed (endpoint
+        # down, or the horizon moved under us): the full session isn't readable.
+        # Learn the cutoff so the next call's pre-check short-circuits, then fall
+        # back rather than clamp to a truncated, wrong overnight range.
+        if _is_window_error(e):
+            cutoff = _availability_cutoff(e)
+            if cutoff is not None:
+                _learn_horizon("GLBX.MDP3", cutoff)
+            print("[databento] {} overnight deferred: window past GLBX "
+                  "license horizon; using fallback".format(contract))
+            _neg_cache_set(cache_key)
+        elif _is_billing_error(e):
             _trip_billing_breaker("{} overnight".format(contract), e)
         else:
             _emit_error("databento.fetch_failed", source="overnight",
