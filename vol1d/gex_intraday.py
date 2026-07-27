@@ -40,7 +40,7 @@ from datetime import datetime, timedelta
 import pytz
 
 import db_utils
-from gamma_exposure import bs_gamma
+from gamma_exposure import bs_gamma, find_gamma_flip, net_gex_at_spot
 from vol1d import config as vol1d_config
 
 try:
@@ -80,6 +80,16 @@ def _connect(db_path=None):
             PRIMARY KEY (session_date, ts)
         )
     """)
+    # Added when `flip` switched from the cumulative-by-strike value to
+    # the spot-ladder solve. Banking both for a while makes the change
+    # auditable against the existing snapshot history instead of just
+    # discontinuous. Idempotent: existing DBs get the column once.
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(gex_intraday_snapshots)")}
+    if "flip_cumulative" not in cols:
+        conn.execute("ALTER TABLE gex_intraday_snapshots "
+                     "ADD COLUMN flip_cumulative REAL")
+        conn.commit()
     return conn
 
 
@@ -271,6 +281,11 @@ class DelayedGEX(object):
             if dte == 0:
                 net_0dte += gex_k
 
+        # Flip = the SPOT at which net gamma crosses zero, solved by
+        # re-pricing `curve` across a ladder of hypothetical spots. This is
+        # exactly what the curve rows were stored for. `flip_cumulative` is
+        # the old cumulative-by-strike number, kept as a diagnostic so the
+        # two can be compared on the persisted snapshot history.
         self.profile = {
             "built_at":     now_et,
             "chain_ts":     self.chain_ts,
@@ -279,7 +294,8 @@ class DelayedGEX(object):
             "gex_by_strike": by_strike,
             "net_gex_all":  net_all,
             "net_gex_0dte": net_0dte,
-            "flip":         _flip_strike(by_strike),
+            "flip":         find_gamma_flip(curve, spot_ref),
+            "flip_cumulative": _flip_strike(by_strike),
             "call_wall":    _call_wall(by_strike),
             "put_wall":     _put_wall(by_strike),
         }
@@ -304,12 +320,14 @@ class DelayedGEX(object):
         conn.execute("""
             INSERT OR REPLACE INTO gex_intraday_snapshots
             (session_date, ts, chain_ts, spot_ref, net_gex_all,
-             net_gex_0dte, flip, call_wall, put_wall, rows_blob)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             net_gex_0dte, flip, call_wall, put_wall, rows_blob,
+             flip_cumulative)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (self.session_date, now_et.isoformat(),
               p["chain_ts"].isoformat() if p["chain_ts"] else None,
               p["spot_ref"], p["net_gex_all"], p["net_gex_0dte"],
-              p["flip"], p["call_wall"], p["put_wall"], blob))
+              p["flip"], p["call_wall"], p["put_wall"], blob,
+              p.get("flip_cumulative")))
         cutoff = (now_et - timedelta(days=self.cfg["persist_days"]))
         conn.execute("DELETE FROM gex_intraday_snapshots "
                      "WHERE session_date < ?", (cutoff.strftime("%Y-%m-%d"),))
@@ -339,8 +357,16 @@ class DelayedGEX(object):
 
 
 def _flip_strike(by_strike):
-    """Zero-cross of cumulative GEX walking strikes upward, linearly
-    interpolated between the bracketing strikes."""
+    """LEGACY diagnostic: zero-cross of cumulative GEX walking strikes
+    upward at fixed spot, linearly interpolated between the bracketing
+    strikes.
+
+    This is NOT the gamma flip level — it is a running-sum crossing over
+    the strike axis, not a spot price where dealer gamma changes sign.
+    The profile's "flip" now comes from gamma_exposure.find_gamma_flip;
+    this value rides along as "flip_cumulative" only so the change can be
+    audited against snapshots built before the fix.
+    """
     strikes = sorted(by_strike)
     cum = 0.0
     prev_k, prev_cum = None, None
@@ -509,10 +535,9 @@ def evaluate(profile, spot_est, machine, now_et=None, chain_ts=None,
 
     net_live = None
     if live_est and spot_est and spot_est != profile["spot_ref"]:
-        # Positioning stale, spot live — clearly an estimate.
-        net_live = sum(
-            bs_gamma(spot_est, k, t, iv) * pos * 100 * spot_est ** 2 * 0.01
-            for k, t, iv, pos, _dte in profile["curve"])
+        # Positioning stale, spot live — clearly an estimate. Same
+        # re-pricing the flip ladder uses, so the two can never drift.
+        net_live = net_gex_at_spot(profile["curve"], spot_est)
 
     def _pct(a, b):
         return round((a - b) / spot_est * 100.0, 4) if (

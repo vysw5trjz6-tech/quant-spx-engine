@@ -7,6 +7,7 @@ import os
 import tempfile
 from datetime import date, datetime, timedelta
 
+from gamma_exposure import net_gex_at_spot
 from vol1d import config as vol1d_config
 from vol1d import gex_intraday, regime
 from vol1d import state as vol1d_state
@@ -203,11 +204,57 @@ def test_iv_clamp_and_gap_interpolation():
 
 
 def test_flip_interpolation_zero_cross():
+    # _flip_strike is now the LEGACY cumulative-by-strike diagnostic; it
+    # still rides along on the profile as flip_cumulative, so its own
+    # behaviour stays pinned.
     by_strike = {100.0: -10.0, 110.0: 30.0}
     # cum: -10 then +20 -> cross 1/3 into the gap
     flip = gex_intraday._flip_strike(by_strike)
     assert abs(flip - (100 + 10 / 3.0)) < 1e-6
     assert gex_intraday._flip_strike({100.0: 5.0, 110.0: 6.0}) is None
+
+
+def test_profile_flip_is_a_root_of_net_gex():
+    """The profile's headline flip is the spot where net gamma is zero,
+    not the cumulative-by-strike crossing."""
+    e = _engine()
+    e.on_snapshot(_snap(_two_sided_book()), now_et=NOW)
+    p = e.build_profile(SPOT, now_et=NOW)
+
+    # Net gamma changes sign within a cent of the reported level. Stated
+    # as a price bracket rather than a residual tolerance because this is
+    # a 0DTE book: gamma is steep enough that a sub-cent error in spot
+    # still moves net GEX by six figures.
+    flip = p["flip"]
+    assert net_gex_at_spot(p["curve"], flip - 0.01) < 0
+    assert net_gex_at_spot(p["curve"], flip + 0.01) > 0
+    # Short gamma below it, long gamma above it.
+    assert net_gex_at_spot(p["curve"], flip * 0.995) < 0
+    assert net_gex_at_spot(p["curve"], flip * 1.005) > 0
+
+
+def test_profile_carries_legacy_flip_for_audit():
+    e = _engine()
+    e.on_snapshot(_snap(_two_sided_book()), now_et=NOW)
+    p = e.build_profile(SPOT, now_et=NOW)
+    assert p["flip_cumulative"] == gex_intraday._flip_strike(p["gex_by_strike"])
+    # The two are distinct measures; the legacy one is not a root.
+    assert p["flip"] != p["flip_cumulative"]
+
+
+def test_snapshot_persists_both_flip_measures():
+    db = _db()
+    e = gex_intraday.DelayedGEX(cfg=_cfg(), db_path=db)
+    e.on_snapshot(_snap(_two_sided_book()), now_et=NOW)
+    p = e.build_profile(SPOT, now_et=NOW)
+    e.persist_snapshot(now_et=NOW)
+
+    conn = gex_intraday._connect(db)
+    row = conn.execute(
+        "SELECT flip, flip_cumulative FROM gex_intraday_snapshots").fetchone()
+    conn.close()
+    assert row[0] == p["flip"]
+    assert row[1] == p["flip_cumulative"]
 
 
 # ---------------------------------------------------------------------------
