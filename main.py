@@ -25,6 +25,13 @@ except ImportError as _e:
     print("[init] volume_truth unavailable: {}".format(_e))
 
 try:
+    import market_calendar
+    HAS_MARKET_CALENDAR = True
+except ImportError as _e:
+    HAS_MARKET_CALENDAR = False
+    print("[init] market_calendar unavailable: {}".format(_e))
+
+try:
     import safety_gates
     HAS_SAFETY_GATES = True
 except ImportError as _e:
@@ -1532,8 +1539,13 @@ def is_trading_day():
     Time-of-day independent: still True on a session day after the close,
     so scheduled jobs (morning GEX/OI sweeps, EOD IV/AI) fire on Friday
     but NOT on the weekend or on market holidays. Source is Alpaca's
-    calendar endpoint; falls back to a weekday check only if the API is
-    unreachable.
+    calendar endpoint; falls back to the offline market_calendar (NYSE
+    holiday rules, no network) when the API is unreachable.
+
+    The old fallback was `weekday() < 5`, which returns True on every
+    market holiday. A single Alpaca outage on Thanksgiving was therefore
+    enough to fire the premarket brief and — more expensively — the
+    Databento GEX/OI sweeps against a closed session.
     """
     et    = pytz.timezone("America/New_York")
     today = datetime.now(et).strftime("%Y-%m-%d")
@@ -1551,12 +1563,52 @@ def is_trading_day():
     except Exception as e:
         log_event("calendar.error", level="warn", error=str(e))
 
-    if val is None:  # API failure: weekday heuristic (misses holidays)
-        val = datetime.now(et).weekday() < 5
+    if val is None:  # API failure: offline NYSE calendar, holiday-aware
+        if HAS_MARKET_CALENDAR:
+            val = market_calendar.is_session()
+            log_event("calendar.fallback", level="warn",
+                      source=market_calendar.backend(), is_session=val)
+        else:
+            val = datetime.now(et).weekday() < 5
+            log_event("calendar.fallback", level="warn",
+                      source="weekday_heuristic", is_session=val)
 
     _trading_day_cache["date"] = today
     _trading_day_cache["val"]  = val
     return val
+
+
+def session_close_hour(d=None):
+    """Today's actual ET close as a float hour — 16.0, or 13.0 on a
+    half-day (July 3, the Friday after Thanksgiving, Christmas Eve).
+
+    Falls back to 16.0 when the calendar module is unavailable, which is
+    the behaviour every hardcoded gate in this file assumed before.
+    """
+    if not HAS_MARKET_CALENDAR:
+        return 16.0
+    return market_calendar.session_close_hour(d) or 16.0
+
+
+def close_shift(d=None):
+    """Hours to shift a 4:00-PM-relative scheduler gate by so it fires
+    relative to the ACTUAL close. 0.0 normally, -3.0 on a 1:00 PM
+    half-day.
+
+    Every post-close job (paper replay, IV snapshot, vol1d EOD, the
+    Friday AI run and digest) is written as a `16.xx` ET-hour gate. On a
+    half-day those sat three hours past the close, so the replay ran
+    against a session that had been over since 1 PM and the vol1d EOD
+    reconcile fired long after the official print.
+    """
+    if not HAS_MARKET_CALENDAR:
+        return 0.0
+    return market_calendar.close_shift(d)
+
+
+def is_early_close(d=None):
+    """True if today is a session that closes before 4:00 PM ET."""
+    return bool(HAS_MARKET_CALENDAR and market_calendar.is_early_close(d))
 
 
 def market_open():
@@ -1579,8 +1631,14 @@ def market_open():
                   status=r.status_code, body=r.text[:100])
     except Exception as e:
         log_event("market.clock_exception", level="warn", error=str(e))
-    et    = pytz.timezone("America/New_York")
-    now   = datetime.now(et)
+
+    # Clock API unreachable. The offline calendar knows holidays AND
+    # early closes; the old fallback (weekday + fixed 9:30-16:00) held
+    # the scanner "open" for three extra hours on every half-day.
+    et  = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if HAS_MARKET_CALENDAR:
+        return market_calendar.is_open_now(now)
     if now.weekday() >= 5:
         return False
     start = now.replace(hour=9,  minute=30, second=0, microsecond=0)
@@ -5928,6 +5986,14 @@ def background_scheduler():
     boot_hour = boot_now.hour + boot_now.minute / 60.0
     today_str = boot_now.strftime("%Y-%m-%d")
 
+    # Post-close gates below are written as 4:00-PM-relative hours. On a
+    # 1:00 PM half-day `_shift` is -3.0, sliding all of them to fire the
+    # same number of minutes after the ACTUAL close.
+    _shift = close_shift()
+    if _shift:
+        log("Early close today: session ends {:.2f} ET (gates shifted {:+.2f}h)"
+            .format(16.0 + _shift, _shift))
+
     log("Boot-time bootstrap @ {:.2f} ET (mode: {})".format(boot_hour, OPERATING_MODE))
     threading.Thread(target=_refresh_market_state, daemon=True).start()
     if boot_hour >= 8.0:
@@ -5942,14 +6008,14 @@ def background_scheduler():
     # Opening flow: no boot-time spawn -- the scheduler's 10:05-16:00 retry
     # loop fires on its first tick (the pull is idempotent per symbol/day,
     # so a re-attempt after an earlier success costs one metadata call).
-    if _is_session and boot_hour >= 16.25:
+    if _is_session and boot_hour >= 16.25 + _shift:
         threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
     # Paper replay on a late boot. The done-flag below is pre-marked for
     # post-16:05 boots, which used to mean a redeploy after the EOD replay
     # window silently lost the whole day's synthetic outcomes (no boot-time
     # spawn existed, unlike IV/GEX/OI). The replay dedupes on paper_key, so
     # re-running when the pre-redeploy process already covered today is free.
-    if _is_session and HAS_PAPER_TRADER and boot_hour >= 16.05:
+    if _is_session and HAS_PAPER_TRADER and boot_hour >= 16.05 + _shift:
         def _paper_boot_run():
             try:
                 paper_trader.run_paper_trader(DB_FILE, log_fn=log)
@@ -5988,16 +6054,16 @@ def background_scheduler():
     _daily_refresh_done["gex_1030"]   = boot_hour >= 11.5
     # gex/oi are governed by their own persistent success marker + retry
     # throttle (see _sweep_retry_due), not this in-memory done-flag.
-    _daily_refresh_done["iv"]         = boot_hour >= 16.25
-    _daily_refresh_done["paper"]      = boot_hour >= 16.05
+    _daily_refresh_done["iv"]         = boot_hour >= 16.25 + _shift
+    _daily_refresh_done["paper"]      = boot_hour >= 16.05 + _shift
     # vol1d EOD (baseline rebuild + official reconcile) runs at 16:30; on a
     # later boot mark it done — there are no fresh ticks to rebuild from.
-    _daily_refresh_done["vol1d_eod"]  = boot_hour >= 16.5
+    _daily_refresh_done["vol1d_eod"]  = boot_hour >= 16.5 + _shift
     # Only relevant on Fridays; pre-mark on non-Fridays so it never fires.
     _is_friday = datetime.now(et).weekday() == 4
-    _daily_refresh_done["friday_digest"] = (not _is_friday) or (boot_hour >= 16.25)
+    _daily_refresh_done["friday_digest"] = (not _is_friday) or (boot_hour >= 16.25 + _shift)
     _premarket_done["date"]           = today_str if boot_hour >= 9.4 else None
-    _overnight_done["date"]           = today_str if boot_hour >= 15.93 else None
+    _overnight_done["date"]           = today_str if boot_hour >= 15.93 + _shift else None
 
     while True:
         try:
@@ -6008,6 +6074,9 @@ def background_scheduler():
             now_et  = datetime.now(et)
             today   = now_et.strftime("%Y-%m-%d")
             et_hour = now_et.hour + now_et.minute / 60.0
+            # Recomputed every pass (cached per-date inside the calendar,
+            # so this is free) — the process outlives the day it booted on.
+            _shift  = close_shift()
 
             # --- Daily maintenance tasks ---
             # Pre-market (6 AM ET): reset the daily refresh flags
@@ -6053,7 +6122,7 @@ def background_scheduler():
             # OPRA historical availability can lag hours behind real time, so
             # the done-flag is only set on success (inside _pull_opening_flow)
             # and a deferred pull retries every 30 min until the close.
-            if (_session and 10.08 <= et_hour < 16.0
+            if (_session and 10.08 <= et_hour < 16.0 + _shift
                     and not _daily_refresh_done.get("flow")
                     and time.time() - _daily_refresh_done.get("flow_attempt", 0)
                     > 1800):
@@ -6076,7 +6145,7 @@ def background_scheduler():
             # violent and fires the COMPRESSED unlock once, so running it
             # repeatedly catches an afternoon vol spike the old 10:30 one-shot
             # would have missed.
-            if _session and 10.0 <= et_hour < 15.92:
+            if _session and 10.0 <= et_hour < 15.92 + _shift:
                 threading.Thread(target=_intraday_regime_recheck, daemon=True).start()
 
             # --- The following are INTRADAY refreshes ---
@@ -6089,7 +6158,7 @@ def background_scheduler():
                     threading.Thread(target=_refresh_market_state, daemon=True).start()
 
                 # 3:45–3:55 PM ET: overnight gamma reversal check
-                if (et_hour >= 15.75 and et_hour < 15.93
+                if (et_hour >= 15.75 + _shift and et_hour < 15.93 + _shift
                         and _overnight_done.get("date") != today):
                     _overnight_done["date"] = today
                     threading.Thread(target=_check_overnight_gamma_reversal, daemon=True).start()
@@ -6123,7 +6192,7 @@ def background_scheduler():
             # 4:30 PM ET: vol1d EOD — reconcile today's proxy close vs the
             # official VIX1D print and rebuild the minute-of-day baseline
             # with today's ticks included.
-            if (_session and HAS_VOL1D and et_hour >= 16.5
+            if (_session and HAS_VOL1D and et_hour >= 16.5 + _shift
                     and not _daily_refresh_done.get("vol1d_eod")):
                 _daily_refresh_done["vol1d_eod"] = True
                 def _vol1d_eod():
@@ -6134,14 +6203,15 @@ def background_scheduler():
                         log("vol1d EOD error: {}".format(_e))
                 threading.Thread(target=_vol1d_eod, daemon=True).start()
 
-            if _session and et_hour >= 16.25 and not _daily_refresh_done.get("iv"):
+            if (_session and et_hour >= 16.25 + _shift
+                    and not _daily_refresh_done.get("iv")):
                 threading.Thread(target=_refresh_iv_snapshots, daemon=True).start()
                 _daily_refresh_done["iv"] = True
 
             # 0. Paper trader: replay today's signals at 4:04 PM ET so the
             #    AI improvement step below sees synthetic outcomes alongside
             #    any manually-logged real trades. Runs once per day.
-            if (_session and HAS_PAPER_TRADER and et_hour >= 16.05
+            if (_session and HAS_PAPER_TRADER and et_hour >= 16.05 + _shift
                     and not _daily_refresh_done.get("paper")):
                 _daily_refresh_done["paper"] = True
                 def _paper_run():
@@ -6155,7 +6225,7 @@ def background_scheduler():
             #    close. weekday()==4 is Friday; _ai_last_run_date != today
             #    keeps it to a single run that day. The Friday digest below
             #    fires ~17 min later so it reports the fresh analysis.
-            if (_session and et_hour >= 16.08
+            if (_session and et_hour >= 16.08 + _shift
                     and datetime.now(et).weekday() == 4
                     and _ai_last_run_date != today):
                 log("AI: Weekly Friday trigger")
@@ -6167,7 +6237,7 @@ def background_scheduler():
 
             # 1b. Friday weekly upgrade digest: ~10 min after EOD AI so the
             #     latest analysis is committed. Opus-generated, Telegram-sent.
-            if (_session and et_hour >= 16.25
+            if (_session and et_hour >= 16.25 + _shift
                     and datetime.now(et).weekday() == 4
                     and not _daily_refresh_done.get("friday_digest")):
                 _daily_refresh_done["friday_digest"] = True
@@ -7854,6 +7924,8 @@ def db_status():
             "db_file": DB_FILE,
             "data_dir_env": os.getenv("DATA_DIR", "(not set, using /tmp)"),
             "storage": _storage_status(),
+            "calendar": (market_calendar.status() if HAS_MARKET_CALENDAR
+                         else {"backend": "unavailable"}),
             "trades": {
                 "total": total_count,
                 "open": open_count,

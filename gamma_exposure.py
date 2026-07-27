@@ -107,6 +107,138 @@ def _prep_contract(c, spot_price, today):
 
 
 # =============================================
+# GAMMA FLIP — SPOT LADDER
+# =============================================
+#
+# The zero-gamma / "gamma flip" level is the SPOT PRICE at which dealers'
+# net gamma crosses zero: solve  net_GEX(S) = 0  for S.
+#
+# This module used to report something different: the zero-crossing of the
+# cumulative per-strike dollar gamma, walking strikes upward with spot held
+# fixed at today's price. That quantity has no standard interpretation --
+# it answers "how far up the strike ladder do I have to sum before the
+# running total flips sign", which is not a price level the tape responds
+# to. Everything downstream (the regime state machine's spot_vs_flip test,
+# the premarket brief's "Zero-gamma:" line) was reading it as a spot level.
+#
+# The correct computation re-prices the WHOLE book at a ladder of
+# hypothetical spot levels and finds where the total crosses zero. Method
+# per the public reference implementations (jensolson/SPX-Gamma-Exposure's
+# sensitivity table, Matteo-Ferrara/gex-tracker) -- both read for method
+# only, neither carries a license.
+#
+# Assumption, and it is the standard one: a FROZEN SMILE. Each strike keeps
+# the IV it has today while spot is walked. Re-solving the smile at every
+# hypothetical spot needs a model of how the surface moves (sticky-strike
+# vs sticky-delta) that we have no way to calibrate here, and the flip
+# level is not very sensitive to it.
+
+# Search window as a fraction of spot, and the ladder resolution over it.
+# +/-15% at 0.25% granularity: wide enough to bracket the flip on a
+# short-gamma day, fine enough that the initial bracket is always tight.
+FLIP_SEARCH_BAND  = 0.15
+FLIP_SEARCH_STEPS = 120
+
+
+def net_gex_at_spot(curve, spot, r=_RISK_FREE):
+    """Total dealer dollar gamma (per 1% move) if spot were `spot`.
+
+    `curve` rows are (strike, t_years, iv, signed_position, ...) -- any
+    extra trailing fields are ignored, so a caller can carry DTE or other
+    per-row metadata along. `signed_position` already carries the dealer
+    sign convention (calls +, puts -).
+    """
+    if not curve or spot is None or spot <= 0:
+        return 0.0
+    total = 0.0
+    scale = 100.0 * spot * spot * 0.01
+    for row in curve:
+        strike, t_years, iv, pos = row[0], row[1], row[2], row[3]
+        total += bs_gamma(spot, strike, t_years, iv, r) * pos * scale
+    return total
+
+
+def find_gamma_flip(curve, spot_ref, r=_RISK_FREE,
+                    band=FLIP_SEARCH_BAND, steps=FLIP_SEARCH_STEPS):
+    """Spot level where net dealer gamma crosses zero, or None.
+
+    Scans a ladder of hypothetical spot levels spanning spot_ref*(1±band),
+    takes the sign change NEAREST spot_ref (a book can cross more than
+    once; the near one is the level that decides which regime we are
+    currently in), then bisects it to convergence.
+
+    Returns None when the book never changes sign in the window -- an
+    all-one-way book genuinely has no flip, and reporting a fabricated
+    level would be worse than reporting nothing.
+    """
+    if not curve or spot_ref is None or spot_ref <= 0:
+        return None
+
+    lo   = spot_ref * (1.0 - band)
+    hi   = spot_ref * (1.0 + band)
+    step = (hi - lo) / steps
+    levels = [lo + i * step for i in range(steps + 1)]
+    values = [net_gex_at_spot(curve, s, r) for s in levels]
+
+    brackets = []
+    for i in range(len(levels) - 1):
+        a, b = values[i], values[i + 1]
+        if a == 0.0:
+            brackets.append((levels[i], levels[i]))
+        elif a * b < 0:
+            brackets.append((levels[i], levels[i + 1]))
+    if not brackets:
+        return None
+
+    x0, x1 = min(brackets,
+                 key=lambda br: min(abs(br[0] - spot_ref),
+                                    abs(br[1] - spot_ref)))
+    if x0 == x1:
+        return x0
+
+    # Bisect the bracket (one ladder step, 0.25% of spot) down to ~1e-7 of
+    # spot — well under a cent on SPX. Returned unrounded: callers round at
+    # the display boundary, and the regime machine's |spot - flip| band
+    # wants the full precision.
+    tol = max(spot_ref * 1e-7, 1e-6)
+    f0  = net_gex_at_spot(curve, x0, r)
+    for _ in range(60):
+        if (x1 - x0) < tol:
+            break
+        mid = 0.5 * (x0 + x1)
+        fm  = net_gex_at_spot(curve, mid, r)
+        if fm == 0.0:
+            return mid
+        if (f0 < 0) != (fm < 0):
+            x1 = mid
+        else:
+            x0, f0 = mid, fm
+    return 0.5 * (x0 + x1)
+
+
+def cumulative_flip_strike(by_strike):
+    """LEGACY: zero-cross of cumulative per-strike gamma walking strikes
+    upward at fixed spot.
+
+    Retained only as a diagnostic so the new ladder flip can be compared
+    against the value historical snapshots were built with. Do not route
+    this into strategy logic -- see the note above.
+    """
+    if not by_strike:
+        return None
+    strikes = sorted(by_strike)
+    cum, prev_k, prev_cum = 0.0, None, None
+    for k in strikes:
+        cum += by_strike[k]
+        if (prev_cum is not None and prev_cum != cum
+                and (prev_cum < 0 <= cum or prev_cum > 0 >= cum)):
+            frac = abs(prev_cum) / abs(cum - prev_cum)
+            return prev_k + frac * (k - prev_k)
+        prev_k, prev_cum = k, cum
+    return None
+
+
+# =============================================
 # GEX CALCULATION
 # =============================================
 #
@@ -127,7 +259,10 @@ def compute_gex_from_chain(chain_data, spot_price):
     Returns dict:
       total_gex: aggregate dollar gamma
       gex_by_strike: dict of strike -> gex (top concentration zones)
-      zero_gamma_strike: strike at which GEX flips sign (the "flip level")
+      zero_gamma_strike: SPOT LEVEL at which net dealer gamma crosses zero
+                         (solved on a spot ladder — see find_gamma_flip)
+      zero_gamma_cumulative: the legacy cumulative-by-strike value, kept
+                         for comparison against historical snapshots
       call_wall: highest positive GEX strike above spot (resistance)
       put_wall:  highest negative GEX strike below spot (support)
     """
@@ -138,6 +273,7 @@ def compute_gex_from_chain(chain_data, spot_price):
     today = datetime.now(et).date()
 
     by_strike = {}
+    curve = []          # (strike, t_years, iv, signed_oi) — re-priceable
     total = 0.0
 
     for c in chain_data:
@@ -163,25 +299,16 @@ def compute_gex_from_chain(chain_data, spot_price):
 
         by_strike[strike] = by_strike.get(strike, 0.0) + dollar_gamma
         total += dollar_gamma
+        curve.append((strike, dte_years, iv, oi * sign))
 
     if not by_strike:
         return None
 
-    # Find zero-gamma flip strike (cumulative GEX crosses zero)
-    sorted_strikes = sorted(by_strike.keys())
-    cumulative = 0.0
-    flip_strike = None
-    prev_strike = sorted_strikes[0]
-    for k in sorted_strikes:
-        prev_cum = cumulative
-        cumulative += by_strike[k]
-        if prev_cum < 0 and cumulative >= 0:
-            flip_strike = (prev_strike + k) / 2.0
-            break
-        if prev_cum > 0 and cumulative <= 0:
-            flip_strike = (prev_strike + k) / 2.0
-            break
-        prev_strike = k
+    # Zero-gamma level: the spot at which the book's net gamma flips sign.
+    flip_strike = find_gamma_flip(curve, spot_price)
+    # Legacy cumulative-by-strike value, reported alongside so the two can
+    # be diffed on live books before the old one is retired for good.
+    flip_cumulative = cumulative_flip_strike(by_strike)
 
     # Call wall: largest positive GEX strike above spot
     call_wall = None
@@ -204,6 +331,8 @@ def compute_gex_from_chain(chain_data, spot_price):
         "total_gex_billions": round(total / 1e9, 2),
         "regime":             "LONG_GAMMA" if total > 0 else "SHORT_GAMMA",
         "zero_gamma_strike":  round(flip_strike, 2) if flip_strike else None,
+        "zero_gamma_cumulative": (round(flip_cumulative, 2)
+                                  if flip_cumulative else None),
         "call_wall":          round(call_wall, 2) if call_wall else None,
         "put_wall":           round(put_wall, 2) if put_wall else None,
         "spot":               spot_price,
